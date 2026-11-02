@@ -1,7 +1,10 @@
 import asyncio
 import hmac
+import json
 import logging
+import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,12 +12,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import Settings
 from app.health import HealthRegistry, Metrics
 from app.listener import PumpPortalListener
-from app.logging_config import configure_logging
 from app.models import TokenRecord
 from app.processor import TokenProcessor
 from app.repository import Repository, build_repository
 
 log = logging.getLogger("tosh.app")
+
+_STANDARD = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD and not key.startswith("_"):
+                payload[key] = value
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+def configure_logging(level: str = "INFO") -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(level.upper())
 
 
 async def require_api_key(request: Request, x_api_key: str | None = Header(default=None)) -> None:
