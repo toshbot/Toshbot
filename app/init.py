@@ -1,1 +1,1 @@
-# Tosh Bot application package
+# Tosh Bot tests
