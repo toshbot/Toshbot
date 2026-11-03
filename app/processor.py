@@ -12,9 +12,10 @@ class TokenProcessor:
     """Consumes launch events from the queue: record event, register token once, create analysis job."""
 
     def __init__(self, repo: Repository, queue: asyncio.Queue, health: HealthRegistry, metrics: Metrics,
-                 *, max_attempts: int = 3, sleep=asyncio.sleep) -> None:
+                 *, max_attempts: int = 3, sleep=asyncio.sleep, analysis_queue: asyncio.Queue | None = None) -> None:
         self.repo, self.queue, self.health, self.metrics = repo, queue, health, metrics
         self.max_attempts, self._sleep = max_attempts, sleep
+        self.analysis_queue = analysis_queue
 
     async def handle(self, event: LaunchEvent) -> bool:
         """Idempotent: safe to retry and safe for duplicate / delayed / out-of-order events."""
@@ -23,6 +24,11 @@ class TokenProcessor:
         await self.repo.create_analysis_job(event.mint)  # always attempted so a retry can finish a half-done earlier attempt
         if created:
             self.metrics.stored += 1
+            if self.analysis_queue is not None:
+                try:
+                    self.analysis_queue.put_nowait(event.mint)
+                except asyncio.QueueFull:  # the job stays 'pending' in storage and is re-queued on restart
+                    log.error("analysis queue full", extra={"mint": event.mint})
             log.info("token detected", extra={"mint": event.mint, "symbol": event.symbol})
         else:
             self.metrics.duplicates += 1

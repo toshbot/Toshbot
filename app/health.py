@@ -14,6 +14,8 @@ class Metrics:
     stored: int = 0
     duplicates: int = 0
     failed_jobs: int = 0
+    analyses: int = 0
+    failed_analyses: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
