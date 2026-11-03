@@ -1391,6 +1391,8 @@ pre{background:#09090b;border-radius:8px;padding:10px;overflow:auto;max-height:2
 .kv dt{color:var(--dim)}.kv dd{margin:0;text-align:right}
 .two{display:grid;grid-template-columns:2fr 1fr;gap:16px}
 @media(max-width:820px){.two{grid-template-columns:1fr}}
+.why{font-size:12px;color:var(--dim);max-width:min(340px,58vw);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:700px){table{min-width:0}.hide-m{display:none}}
 footer{color:#52525b;font-size:12px;margin-top:30px}
 </style>
 </head>
@@ -1467,12 +1469,12 @@ function tokenTable(tokens, showReason) {
   const rows = tokens.map((t) => h("tr", {},
     h("td", {}, h("a", {href: "#/token/" + t.mint},
       h("b", {}, t.symbol || "—"), " ", h("span", {class: "mute"}, t.name || "Unnamed"),
-      h("div", {class: "mono dim"}, short(t.mint, 5)))),
+      h("div", {class: "mono dim"}, short(t.mint, 5))),
+      showReason ? h("div", {class: "why", title: t.status_reason || ""}, t.status_reason || "") : null),
     h("td", {}, badge(t.status)),
     h("td", {class: "mute", style: "white-space:nowrap"}, ago(t.detected_at)),
-    h("td", {class: "mono mute"}, short(t.creator)),
-    showReason ? h("td", {class: "dim", style: "max-width:380px"}, (t.status_reason || "").slice(0, 160)) : null));
-  return h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Token"), h("th", {}, "Status"), h("th", {}, "Detected"), h("th", {}, "Creator"), showReason ? h("th", {}, "Why") : null)), h("tbody", {}, rows));
+    h("td", {class: "mono mute hide-m"}, short(t.creator))));
+  return h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Token"), h("th", {}, "Status"), h("th", {}, "Detected"), h("th", {class: "hide-m"}, "Creator"))), h("tbody", {}, rows));
 }
 
 function sparkline(tokens) {
