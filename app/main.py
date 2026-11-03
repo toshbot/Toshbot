@@ -100,7 +100,11 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     app.state.settings = settings
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_methods=["GET"], allow_headers=["X-API-Key"])
 
-    @app.get("/health")
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+    async def root() -> dict:
+        return {"service": "toshbot", "status": "ok", "health": "/health"}
+
+    @app.api_route("/health", methods=["GET", "HEAD"])
     async def liveness() -> dict:
         return {"status": "ok"}
 
