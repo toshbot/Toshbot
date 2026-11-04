@@ -1544,7 +1544,7 @@ def live_state(stats: TradeStats | None, fall_change_pct: float, max_drawdown_pc
             "window_seconds": stats.window_seconds, "last_trade_age": r(stats.last_trade_age), "mcap_sol": r(stats.mcap_now)}
 
 
-PICK_OK_STATES = {"rising", "steady"}
+STATE_RANK = {"rising": 4, "steady": 3, "new": 2, "quiet": 1, "unwatched": 0}  # "falling" is never listed as a pick
 
 
 def enrich_live(rows: list, tracker: "TradeTracker | None", cfg: Settings) -> list:
@@ -1552,6 +1552,7 @@ def enrich_live(rows: list, tracker: "TradeTracker | None", cfg: Settings) -> li
     out = []
     for t in rows:
         live = live_state(tracker.snapshot(t.mint), cfg.pick_fall_change_pct, cfg.pick_max_drawdown_pct, cfg.pick_quiet_seconds) if tracker else None
+        live = live or {"state": "unwatched", "change_pct": None}  # no live trades for it (restart, or it went dead)
         out.append(t.model_copy(update={"live": live}))
     return out
 
@@ -1559,7 +1560,7 @@ def enrich_live(rows: list, tracker: "TradeTracker | None", cfg: Settings) -> li
 def pick_rank(t) -> tuple:
     """BUY first, then the strongest live climb (capped so a one-candle spike does not outrank steady buying), then score."""
     chg = (t.live or {}).get("change_pct") or 0.0
-    return (1 if t.status == "QUALIFIED" else 0, min(max(chg, 0.0), 150.0), t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at)
+    return (1 if t.status == "QUALIFIED" else 0, STATE_RANK.get((t.live or {}).get("state"), 0), min(max(chg, 0.0), 150.0), t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at)
 
 
 @dataclass
@@ -3307,7 +3308,7 @@ function tokRow(t, withReason, extra) {
       h("div", {class: "tt"}, h("b", {}, t.symbol || "—"), h("span", {}, t.name || "Unnamed")),
       h("div", {class: "ts"}, short(t.mint, 5) + " · " + ago(t.detected_at)),
       withReason && t.status_reason ? h("div", {class: "why"}, t.status_reason) : null),
-    h("div", {class: "tr"}, h("div", {class: "trr"}, t.live && t.live.change_pct != null ? h("span", {class: "score", style: "--c:" + (t.live.state === "falling" ? "#f6465d" : t.live.change_pct > 0 ? "#34d399" : "#8b95a7"), title: "Price change over the last " + t.live.window_seconds + "s"}, (t.live.change_pct > 0 ? "+" : "") + t.live.change_pct + "%") : null, t.status === "QUALIFIED" && t.status_updated_at && (Date.now() - new Date(t.status_updated_at).getTime()) < 180000 ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
+    h("div", {class: "tr"}, h("div", {class: "trr"}, t.live && t.live.change_pct == null && t.live.state && t.live.state !== "rising" ? h("span", {class: "score", style: "--c:#8b97aa", title: "No recent live trades for this token"}, t.live.state === "unwatched" ? "no live data" : t.live.state) : t.live && t.live.change_pct != null ? h("span", {class: "score", style: "--c:" + (t.live.state === "falling" ? "#f6465d" : t.live.change_pct > 0 ? "#34d399" : "#8b95a7"), title: "Price change over the last " + t.live.window_seconds + "s"}, (t.live.change_pct > 0 ? "+" : "") + t.live.change_pct + "%") : null, t.status === "QUALIFIED" && t.status_updated_at && (Date.now() - new Date(t.status_updated_at).getTime()) < 180000 ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
 }
 const skeleton = (n) => h("div", {class: "card list"}, Array.from({length: n || 6}, () => h("div", {class: "skrow"})));
 const empty = (iconName, title, text) => h("div", {class: "card empty"}, h("div", {class: "eic"}, icon(iconName, 26)), h("b", {}, title), text || "");
@@ -4109,7 +4110,7 @@ def build_api_router(auth) -> APIRouter:
         if live or hide_falling:
             rows = enrich_live(rows, getattr(st, "tracker", None), st.settings)
         if hide_falling:
-            rows = [t for t in rows if t.live and t.live["state"] in PICK_OK_STATES][:limit]
+            rows = [t for t in rows if (t.live or {}).get("state") != "falling"][:limit]
         if sort == "live":
             rows = sorted(rows, key=pick_rank, reverse=True)
         elif sort == "score":
@@ -4278,6 +4279,14 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 analysis_tasks.append(asyncio.create_task(
                     ReviewScheduler(tracker, analysis_queue, interval=settings.signal_review_seconds,
                                     idle_drop_seconds=settings.signal_idle_drop_seconds if settings.fast_track_enabled else 0.0).run(), name="signal-reviews"))
+            if tracker is not None:  # after a restart, start watching the recent WATCH tokens again right away
+                try:
+                    cutoff = utcnow() - timedelta(minutes=settings.signal_window_minutes)
+                    for t in await repo.list_recent_tokens(200, ["WATCH", "QUALIFIED"]):
+                        if t.detected_at >= cutoff and tracker.track(t.mint, t.creator):
+                            analysis_queue.put_nowait(t.mint)
+                except Exception as exc:
+                    log.warning("could not re-watch recent picks", extra={"error": str(exc)})
             try:  # resume jobs left pending by a restart (only possible when jobs are stored)
                 for mint in (await repo.list_pending_jobs(500) if settings.store_jobs else []):
                     analysis_queue.put_nowait(mint)
