@@ -1737,6 +1737,23 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 .verdict .big{position:relative;display:flex;align-items:center;gap:12px}
 .verdict h2{position:relative;margin:0;font-size:26px;font-weight:800;letter-spacing:-.035em;color:var(--c)}
 .verdict p{position:relative;margin:10px 0 0}
+.axbtn{margin-left:auto;flex:none;align-self:flex-start;background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff!important;box-shadow:0 6px 18px rgba(59,130,246,.35)}
+.axbtn::before{display:none}
+.action{padding:18px 22px;border-radius:30px;margin-top:12px;background:radial-gradient(130% 120% at 0% 0%,color-mix(in srgb,var(--c) 18%,transparent),transparent 62%),var(--g-bg)}
+.action .k{position:relative;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);font-weight:700}
+.action .a{position:relative;margin-top:4px;font-size:22px;font-weight:800;letter-spacing:-.03em;color:var(--c)}
+.action p{position:relative;margin:6px 0 0;font-size:13.5px}
+.board{position:relative;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0 4px}
+.board .lt{padding:12px 0;border-radius:18px;text-align:center;font-weight:800;font-size:15px;letter-spacing:.04em;color:var(--dim);border:1px solid var(--line);opacity:.55}
+.board .lt.on{opacity:1;color:#fff;border-color:transparent}
+.board .lt.on.buy{background:#2ebd85;animation:pbuy 1.2s ease-in-out infinite}
+.board .lt.on.sell{background:#f6465d;animation:psell 1.2s ease-in-out infinite}
+.board .lt.on.wait{background:#6b7686}
+@keyframes pbuy{0%,100%{box-shadow:0 0 0 0 rgba(46,189,133,.7)}50%{box-shadow:0 0 0 12px rgba(46,189,133,0)}}
+@keyframes psell{0%,100%{box-shadow:0 0 0 0 rgba(246,70,93,.7)}50%{box-shadow:0 0 0 12px rgba(246,70,93,0)}}
+.buychip{display:inline-block;margin-right:6px;padding:3px 9px;border-radius:999px;background:#2ebd85;color:#fff;font-weight:800;font-size:11px;letter-spacing:.05em;animation:pbuy 1.2s ease-in-out infinite}
+@media (prefers-reduced-motion:reduce){.board .lt.on,.buychip{animation:none}}
+.action .sell{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
 .facts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
 .fact{padding:13px 16px;border-radius:24px}
 .fact .k{position:relative;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);font-weight:700}
@@ -1982,7 +1999,7 @@ function tokRow(t, withReason, extra) {
       h("div", {class: "tt"}, h("b", {}, t.symbol || "—"), h("span", {}, t.name || "Unnamed")),
       h("div", {class: "ts"}, short(t.mint, 5) + " · " + ago(t.detected_at)),
       withReason && t.status_reason ? h("div", {class: "why"}, t.status_reason) : null),
-    h("div", {class: "tr"}, h("div", {class: "trr"}, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
+    h("div", {class: "tr"}, h("div", {class: "trr"}, t.status === "QUALIFIED" ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
 }
 const skeleton = (n) => h("div", {class: "card list"}, Array.from({length: n || 6}, () => h("div", {class: "skrow"})));
 const empty = (iconName, title, text) => h("div", {class: "card empty"}, h("div", {class: "eic"}, icon(iconName, 26)), h("b", {}, title), text || "");
@@ -2160,6 +2177,31 @@ function chartCard(mint) {
   return h("div", {}, sec("Price chart"), h("div", {class: "card"}, body));
 }
 
+const axiomUrl = (t) => t.bonding_curve ? "https://axiom.trade/meme/" + t.bonding_curve : "https://axiom.trade/t/" + t.mint;
+
+// Plain-language action derived ONLY from the verdict. The bot has no price/momentum/sell-simulation data yet,
+// so it never says "buy now" for WATCH; only QUALIFIED is a buy candidate. It does not track your positions.
+function actionFor(status, hist) {
+  const r = actionBase(status, hist);
+  const prev = hist && hist.length > 1 ? hist[1].status : null;
+  if (prev && ["WATCH", "QUALIFIED"].includes(prev) && ["REJECTED", "REVOKED", "HOLD"].includes(status)) r.light = "sell";
+  return r;
+}
+function actionBase(status, hist) {
+  const prev = hist && hist.length > 1 ? hist[1].status : null;
+  const downgraded = prev && ["WATCH", "QUALIFIED"].includes(prev) && ["REJECTED", "REVOKED", "HOLD"].includes(status);
+  const SELL_BAD = downgraded
+    ? "Downgraded: this token was " + LABEL[prev] + " earlier and is now " + LABEL[status] + ". Do not buy."
+    : null;
+  switch (status) {
+    case "QUALIFIED": return {light: "buy", c: "#2ebd85", a: "BUY CANDIDATE", why: "Passed every check. Confirm the chart and price on Axiom, then size your own entry.", sell: SELL_BAD};
+    case "WATCH": return {light: "wait", c: "#3b82f6", a: "WAIT: not a buy yet", why: "Security checks passed, but sell simulation and momentum checks do not exist yet, so the bot cannot call a buy. Open Axiom and judge the chart yourself.", sell: SELL_BAD};
+    case "HOLD": return {light: "wait", c: "#f5a524", a: "WAIT: do not buy", why: "Something suspicious is unresolved.", sell: SELL_BAD};
+    case "REJECTED": case "REVOKED": return {light: "sell", c: "#f6465d", a: "AVOID: do not buy", why: "A verified serious problem was found.", sell: SELL_BAD};
+    default: return {light: "wait", c: "#6b7686", a: "WAIT: not enough data", why: "The security engine has not finished. Do not buy yet.", sell: null};
+  }
+}
+
 function tokenView(mint) {
   const top = h("div"), bottom = h("div");
   top.append(skeleton(3));
@@ -2177,16 +2219,24 @@ function tokenView(mint) {
     const fact = (k, v, copy) => h("div", {class: "fact"}, h("div", {class: "k"}, k), h("div", {class: "v" + (copy ? " mono" : "")}, v));
     top.replaceChildren(...[
       h("div", {class: "thead"}, avatar(t, 58), h("div", {style: "min-width:0"}, h("h1", {}, t.symbol || "Token"), h("div", {class: "mute"}, t.name || "Unnamed"),
-        h("button", {class: "copy", onclick: () => copyText(t.mint)}, short(t.mint, 8), icon("copy", 13)))),
+        h("button", {class: "copy", onclick: () => copyText(t.mint)}, short(t.mint, 8), icon("copy", 13))),
+        h("a", {class: "btn axbtn", href: axiomUrl(t), target: "_blank", rel: "noopener noreferrer"}, "Axiom", icon("ext", 15))),
       h("section", {class: "verdict", style: "--c:" + COLOR[t.status]},
         h("div", {class: "big"}, pill(t.status), h("span", {class: "dim", style: "font-size:12.5px"}, "Security verdict")),
         h("h2", {style: "margin-top:12px"}, LABEL[t.status]), h("p", {class: "mute", style: "margin-top:4px"}, STATUS_HELP[t.status] || ""),
         h("p", {}, r ? r.reason : t.status_reason),
         r && r.warnings.length ? h("ul", {class: "warns"}, r.warnings.map((x) => h("li", {}, x))) : null,
         r ? h("p", {class: "dim", style: "font-size:12px"}, "Analysed " + ago(r.analyzed_at) + " · logic " + r.analysis_version + (r.next_review_at ? " · next review " + fmt(r.next_review_at) : "")) : null),
+      (() => { const a = actionFor(t.status, hist); return h("section", {class: "action", style: "--c:" + a.c},
+        h("div", {class: "k"}, "Signal board"),
+        h("div", {class: "board"}, [["buy", "BUY"], ["wait", "WAIT"], ["sell", "AVOID"]].map(([k, l]) => h("div", {class: "lt " + k + (a.light === k ? " on" : "")}, l))),
+        h("div", {class: "a"}, a.a), h("p", {class: "mute"}, a.why),
+        a.sell ? h("p", {class: "sell", style: "font-weight:650"}, a.sell) : null,
+        h("p", {class: "dim", style: "font-size:12px"}, "The BUY light only turns on for Qualified, which needs price, momentum and sell checks that are not built yet, so it stays off for now. AVOID lights when a token is rejected or downgraded. Not financial advice.")); })(),
       r && r.opportunity ? evidenceCard(r.opportunity) : null,
       h("div", {class: "facts"}, fact("Detected", fmt(t.detected_at)), fact("Launch time", t.launch_timestamp ? fmt(t.launch_timestamp) : "Not supplied"), fact("Creator", short(t.creator, 6), true), fact("Bonding curve", short(t.bonding_curve, 6), true)),
       h("div", {class: "btns"},
+        h("a", {class: "btn", href: axiomUrl(t), target: "_blank", rel: "noopener noreferrer"}, "Axiom", icon("ext", 15)),
         h("a", {class: "btn", href: "https://solscan.io/token/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Solscan", icon("ext", 15)),
         h("a", {class: "btn", href: "https://pump.fun/coin/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Pump.fun", icon("ext", 15))),
     ].filter(Boolean));
