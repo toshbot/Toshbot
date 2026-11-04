@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     store_launch_events: bool = False      # raw launch event documents (1 extra write per token)
     store_jobs: bool = False               # analysis job documents (2 extra writes per token; only needed to resume after a restart)
     save_all_attempts: bool = False        # False = save only the final analysis report instead of every retry
+    persist_statuses: str = "WATCH,HOLD,QUALIFIED,REVOKED"  # lean database writes: only these verdicts are saved (others stay in memory). Empty = save everything
     max_new_tokens_per_day: int = 0        # 0 = unlimited. Set e.g. 5000 to stay inside the free write quota
 
     # Solana RPC (use a dedicated provider URL, e.g. Helius, for real use; keep the key only in env vars)
@@ -98,6 +99,11 @@ class Settings(BaseSettings):
     max_transfer_fee_bps: int = 500
     creator_max_launches_24h: int = 5
     min_curve_reserve_sol: float = 0.1
+
+    @property
+    def persist_status_set(self) -> set[str] | None:
+        items = {x.strip().upper() for x in self.persist_statuses.split(",") if x.strip()}
+        return items or None
 
     @property
     def retry_delay_list(self) -> list[float]:
@@ -186,6 +192,7 @@ class TokenRecord(BaseModel):
     status_reason: str = "Security analysis has not been performed yet (Phase 1 detection only)."
     status_updated_at: datetime = Field(default_factory=utcnow)
     latest_report_id: str | None = None
+    opportunity_score: float | None = None  # PARTIAL evidence score 0-100 (see security report); None = not computed
     schema_version: int = 1
 
     @classmethod
@@ -236,6 +243,7 @@ class SecurityReport(BaseModel):
     not_evaluated: list[str] = Field(default_factory=list)
     next_review_at: datetime | None = None
     policy: dict[str, Any] = Field(default_factory=dict)
+    opportunity: dict[str, Any] | None = None
 
 
 # ============================================================================
@@ -586,7 +594,7 @@ class Repository(ABC):
     async def get_token(self, mint: str) -> TokenRecord | None: ...
 
     @abstractmethod
-    async def update_token_decision(self, mint: str, status: str, reason: str, report_id: str, at: datetime) -> None: ...
+    async def update_token_decision(self, mint: str, status: str, reason: str, report_id: str, at: datetime, score: float | None = None) -> None: ...
 
     @abstractmethod
     async def save_security_report(self, report: SecurityReport) -> str:
@@ -660,9 +668,9 @@ class InMemoryRepository(Repository):
     async def get_token(self, mint: str) -> TokenRecord | None:
         return self.tokens.get(mint)
 
-    async def update_token_decision(self, mint, status, reason, report_id, at) -> None:
+    async def update_token_decision(self, mint, status, reason, report_id, at, score=None) -> None:
         self.tokens[mint] = self.tokens[mint].model_copy(
-            update={"status": status, "status_reason": reason, "latest_report_id": report_id, "status_updated_at": at})
+            update={"status": status, "status_reason": reason, "latest_report_id": report_id, "status_updated_at": at, "opportunity_score": score})
 
     async def save_security_report(self, report: SecurityReport) -> str:
         items = self.reports.setdefault(report.mint, [])
@@ -696,22 +704,34 @@ class CachedRepository(Repository):
     """Wraps a real repository and answers the dashboard's reads from memory.
 
     Keeps the newest N tokens, status counts and per-creator launch times in RAM, so refreshing the dashboard
-    costs zero database reads. Writes still go to the real database. Limits: only the newest N tokens are
-    listable, and creator launch counts cover launches since the last restart plus the cached tokens."""
+    costs zero database reads.
 
-    def __init__(self, inner: Repository, size: int = 1000) -> None:
+    LEAN MODE (persist_statuses set): new tokens and their reports live in memory only, and are written to the
+    database once, only when the final verdict is one of persist_statuses (for example WATCH or HOLD). That cuts
+    writes from ~7 per token to ~2 for the interesting few percent, which fits the free database plan.
+    Trade-offs: tokens with other verdicts (e.g. rejected) disappear on restart, and only the newest N are listable."""
+
+    def __init__(self, inner: Repository, size: int = 1000, persist_statuses=None) -> None:
         self.inner, self.size = inner, size
+        self.persist = frozenset(persist_statuses) if persist_statuses else None
         self.recent: dict[str, TokenRecord] = {}  # oldest first
         self.counts: dict[str, int] = {}
         self.creator_log: dict[str, list[datetime]] = {}
+        self.mem_reports: dict[str, list[SecurityReport]] = {}
+        self.persisted: set[str] = set()
+        self.seen: dict[str, None] = {}
         self.warm_ok = False
+
+    @property
+    def lean(self) -> bool:
+        return self.persist is not None
 
     async def warm(self) -> None:
         tokens = await self.inner.list_recent_tokens(self.size)
         counts = await self.inner.count_tokens_by_status()
         self.recent = {t.mint: t for t in reversed(tokens)}
         self.counts = dict(counts)
-        self.creator_log = {}
+        self.creator_log, self.persisted = {}, {t.mint for t in tokens}
         for t in tokens:
             if t.creator:
                 self.creator_log.setdefault(t.creator, []).append(t.detected_at)
@@ -720,21 +740,34 @@ class CachedRepository(Repository):
     def _bump(self, status: str, delta: int) -> None:
         self.counts[status] = max(0, self.counts.get(status, 0) + delta)
 
+    def _insert(self, token: TokenRecord) -> None:
+        self.recent[token.mint] = token
+        while len(self.recent) > self.size:
+            gone = self.recent.pop(next(iter(self.recent)))
+            self.mem_reports.pop(gone.mint, None)
+        self._bump(token.status, 1)
+        if token.creator:
+            log_ = self.creator_log.setdefault(token.creator, [])
+            log_.append(token.detected_at)
+            if len(log_) > 300:
+                del log_[:-300]
+
     async def record_launch_event(self, event: LaunchEvent) -> bool:
         return await self.inner.record_launch_event(event)
 
     async def create_token_if_absent(self, token: TokenRecord) -> bool:
+        if self.lean and self.warm_ok:  # memory only: no database write until the verdict is interesting
+            if token.mint in self.seen or token.mint in self.recent:
+                return False
+            self.seen[token.mint] = None
+            while len(self.seen) > 50000:
+                self.seen.pop(next(iter(self.seen)))
+            self._insert(token)
+            return True
         created = await self.inner.create_token_if_absent(token)
         if created and self.warm_ok:
-            self.recent[token.mint] = token
-            while len(self.recent) > self.size:
-                self.recent.pop(next(iter(self.recent)))
-            self._bump(token.status, 1)
-            if token.creator:
-                log_ = self.creator_log.setdefault(token.creator, [])
-                log_.append(token.detected_at)
-                if len(log_) > 300:
-                    del log_[:-300]
+            self.persisted.add(token.mint)
+            self._insert(token)
         return created
 
     async def create_analysis_job(self, mint: str) -> bool:
@@ -752,24 +785,43 @@ class CachedRepository(Repository):
     async def get_token(self, mint: str) -> TokenRecord | None:
         return self.recent.get(mint) or await self.inner.get_token(mint)
 
-    async def update_token_decision(self, mint, status, reason, report_id, at) -> None:
+    async def update_token_decision(self, mint, status, reason, report_id, at, score=None) -> None:
         old = self.recent.get(mint)
         if old is None and self.warm_ok:
             old = await self.inner.get_token(mint)  # rare: token older than the cache window
-        await self.inner.update_token_decision(mint, status, reason, report_id, at)
+        fields = {"status": status, "status_reason": reason, "latest_report_id": report_id, "status_updated_at": at, "opportunity_score": score}
+        new = old.model_copy(update=fields) if old is not None else None
+        if self.lean and self.warm_ok:
+            if new is not None and (status in self.persist or mint in self.persisted):
+                reports = self.mem_reports.get(mint)
+                real_id = await self.inner.save_security_report(reports[-1]) if reports else report_id
+                new = new.model_copy(update={"latest_report_id": real_id})
+                if not await self.inner.create_token_if_absent(new):
+                    await self.inner.update_token_decision(mint, status, reason, real_id, at, score)
+                self.persisted.add(mint)
+        else:
+            await self.inner.update_token_decision(mint, status, reason, report_id, at, score)
         if self.warm_ok and old is not None:
             self._bump(old.status, -1)
             self._bump(status, 1)
             if mint in self.recent:
-                self.recent[mint] = old.model_copy(update={"status": status, "status_reason": reason, "latest_report_id": report_id, "status_updated_at": at})
+                self.recent[mint] = new
 
     async def save_security_report(self, report: SecurityReport) -> str:
+        if self.lean and self.warm_ok:
+            items = self.mem_reports.setdefault(report.mint, [])
+            items.append(report.model_copy(deep=True))
+            return f"mem-{report.mint[:6]}-{len(items)}"
         return await self.inner.save_security_report(report)
 
     async def get_latest_report(self, mint: str) -> SecurityReport | None:
+        if self.lean and mint not in self.persisted and self.mem_reports.get(mint):
+            return self.mem_reports[mint][-1]
         return await self.inner.get_latest_report(mint)
 
     async def list_reports(self, mint: str, limit: int) -> list[SecurityReport]:
+        if self.lean and mint not in self.persisted and self.mem_reports.get(mint):
+            return list(reversed(self.mem_reports[mint]))[:limit]
         return await self.inner.list_reports(mint, limit)
 
     async def list_pending_jobs(self, limit: int) -> list[str]:
@@ -846,9 +898,9 @@ class FirestoreRepository(Repository):
         doc = await self._tokens.document(mint).get()
         return TokenRecord.model_validate(doc.to_dict()) if doc.exists else None
 
-    async def update_token_decision(self, mint, status, reason, report_id, at) -> None:
+    async def update_token_decision(self, mint, status, reason, report_id, at, score=None) -> None:
         await self._tokens.document(mint).update(
-            {"status": status, "status_reason": reason, "latest_report_id": report_id, "status_updated_at": at})
+            {"status": status, "status_reason": reason, "latest_report_id": report_id, "status_updated_at": at, "opportunity_score": score})
 
     def _reports(self, mint: str):
         return self._tokens.document(mint).collection("security_reports")
@@ -1136,6 +1188,42 @@ def decide(results: list[CheckResult], now: datetime, policy: SecurityPolicy) ->
             [], now + timedelta(seconds=policy.review_seconds_watch))
 
 
+OPP_WEIGHTS = {"liquidity_quality": 20, "holder_distribution": 15, "wallet_intelligence": 15, "developer_history": 10}
+OPP_MISSING = ["trading_momentum (weight 20)", "independent_buyer_growth (weight 10)", "volume_authenticity (weight 10)"]
+
+
+def _clamp(x: float) -> float:
+    return max(0.0, min(100.0, x))
+
+
+def opportunity_score(results: list[CheckResult]) -> dict | None:
+    """PARTIAL evidence-quality score from the inputs that exist today (60% of the planned weights).
+    It is NOT a profit probability. Returns None when any input is unavailable (never guesses a neutral value)."""
+    by = {r.name: r for r in results}
+    for need in ("liquidity", "holder_concentration", "creator_wallet"):
+        if need not in by or by[need].status == "UNAVAILABLE":
+            return None
+    liq, hold, cre = by["liquidity"].evidence, by["holder_concentration"].evidence, by["creator_wallet"].evidence
+    sol = float(liq["curve_sol"])
+    top1, top10 = float(hold["top1_pct"]), float(hold["top10_pct"])
+    creator_pct = float(hold.get("creator_pct") or 0.0)
+    launches = int(cre["launches_seen_by_tosh_bot_24h"])
+    comps = [
+        {"name": "liquidity_quality", "weight": OPP_WEIGHTS["liquidity_quality"], "score": round(_clamp((sol - 0.1) / (30 - 0.1) * 100), 1),
+         "detail": f"{sol:.2f} SOL in the bonding curve (full marks at 30 SOL)"},
+        {"name": "holder_distribution", "weight": OPP_WEIGHTS["holder_distribution"], "score": round(_clamp(100 - 2 * top1 - top10), 1),
+         "detail": f"top wallet {top1:.1f}%, top 10 wallets {top10:.1f}% of supply"},
+        {"name": "wallet_intelligence", "weight": OPP_WEIGHTS["wallet_intelligence"], "score": round(_clamp(100 - 15 * max(0, launches - 1) - 3 * creator_pct), 1),
+         "detail": f"creator holds {creator_pct:.1f}% and launched {launches} token(s) in 24h"},
+        {"name": "developer_history", "weight": OPP_WEIGHTS["developer_history"], "score": round(_clamp(100 - 25 * max(0, launches - 1)), 1),
+         "detail": f"{launches} launch(es) by this creator seen in 24h"},
+    ]
+    total_w = sum(c["weight"] for c in comps)
+    score = round(sum(c["weight"] * c["score"] for c in comps) / total_w, 1)
+    return {"score": score, "available_weight": total_w, "complete": False, "components": comps, "missing": OPP_MISSING,
+            "note": "Partial evidence score from the inputs available today. Not a prediction and not a recommendation."}
+
+
 class SecurityAnalyzer:
     def __init__(self, rpc: SolanaRPC, repo: Repository, policy: SecurityPolicy) -> None:
         self.rpc, self.repo, self.policy = rpc, repo, policy
@@ -1178,9 +1266,10 @@ class SecurityAnalyzer:
         now = utcnow()
         status, reason, reasons, next_review = decide(results, now, self.policy)
         warnings = sorted({w for r in results for w in r.warnings})
+        opp = opportunity_score(results) if status in ("WATCH", "HOLD") else None
         return SecurityReport(mint=token.mint, analysis_version=ANALYSIS_VERSION, analyzed_at=now, status=status, reason=reason,
                               reasons=reasons, warnings=warnings, checks=results, not_evaluated=NOT_EVALUATED,
-                              next_review_at=next_review, policy=self.policy.model_dump())
+                              next_review_at=next_review, policy=self.policy.model_dump(), opportunity=opp)
 
 
 async def _wrap(fn, *args):
@@ -1212,7 +1301,8 @@ class AnalysisWorker:
         # Lean mode: skip saving intermediate "insufficient data" retries (each save is a billable write).
         if self.save_all_attempts or final or report.status != "INSUFFICIENT_DATA":
             report_id = await self.repo.save_security_report(report)
-            await self.repo.update_token_decision(mint, report.status, report.reason, report_id, report.analyzed_at)
+            score = report.opportunity["score"] if report.opportunity else None
+            await self.repo.update_token_decision(mint, report.status, report.reason, report_id, report.analyzed_at, score)
             log.info("analysis complete", extra={"mint": mint, "status": report.status, "report_id": report_id})
         return report
 
@@ -1598,6 +1688,9 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 .ts{font-size:12px;color:var(--dim);font-family:var(--mono);margin-top:1px}
 .why{font-size:12.5px;color:var(--mute);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tr{display:flex;flex-direction:column;align-items:flex-end;gap:6px;color:var(--dim);flex:none}
+.trr{display:flex;align-items:center;gap:8px}
+.score{--c:var(--blue);display:inline-grid;place-items:center;min-width:32px;height:24px;padding:0 8px;border-radius:999px;font-size:12px;font-weight:800;color:var(--c);background:rgba(128,128,128,.18);background:color-mix(in srgb,var(--c) 18%,transparent);box-shadow:inset 0 1px 0 rgba(255,255,255,.25),inset 0 0 0 .5px color-mix(in srgb,var(--c) 45%,transparent)}
+.tok.pick::after{content:"";position:absolute;left:0;top:12px;bottom:12px;width:3px;border-radius:0 3px 3px 0;background:var(--green);box-shadow:0 0 12px var(--green)}
 .pill{--c:var(--gray);display:inline-flex;align-items:center;gap:6px;white-space:nowrap;padding:4px 11px 4px 9px;border-radius:999px;font-size:12px;font-weight:700;color:var(--c);
   background:rgba(128,128,128,.18);background:color-mix(in srgb,var(--c) 18%,transparent);box-shadow:inset 0 1px 0 rgba(255,255,255,.22),inset 0 0 0 .5px color-mix(in srgb,var(--c) 40%,transparent)}
 .pill i{width:6px;height:6px;border-radius:50%;background:var(--c);box-shadow:0 0 8px var(--c)}
@@ -1815,9 +1908,9 @@ function setNum(el, n) {
   })(t0);
 }
 let toastTimer;
-function toast(msg) {
+function toast(msg, ms) {
   const t = document.getElementById("toast"); t.textContent = msg; t.classList.add("show");
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 1600);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), ms || 1600);
 }
 async function copyText(txt) {
   try { await navigator.clipboard.writeText(txt); toast("Copied"); }
@@ -1830,13 +1923,18 @@ function avatar(t, size) {
   const hue = n % 360;
   return h("span", {class: "av", style: "width:" + size + "px;height:" + size + "px;font-size:" + Math.round(size * 0.36) + "px;background:linear-gradient(135deg,hsl(" + hue + " 68% 56%),hsl(" + ((hue + 45) % 360) + " 68% 38%))"}, sym);
 }
-function tokRow(t, withReason) {
-  return h("a", {class: "tok", href: "#/token/" + t.mint}, avatar(t, 44),
+function scoreChip(sc) {
+  if (sc == null) return null;
+  const c = sc >= 70 ? "#34d399" : sc >= 50 ? "#4c9bff" : "#ffb340";
+  return h("span", {class: "score", style: "--c:" + c, title: "Partial evidence score, not a prediction"}, Math.round(sc));
+}
+function tokRow(t, withReason, extra) {
+  return h("a", {class: "tok" + (extra ? " " + extra : ""), href: "#/token/" + t.mint}, avatar(t, 44),
     h("div", {class: "tmain"},
       h("div", {class: "tt"}, h("b", {}, t.symbol || "—"), h("span", {}, t.name || "Unnamed")),
       h("div", {class: "ts"}, short(t.mint, 5) + " · " + ago(t.detected_at)),
       withReason && t.status_reason ? h("div", {class: "why"}, t.status_reason) : null),
-    h("div", {class: "tr"}, pill(t.status), icon("chev", 16)));
+    h("div", {class: "tr"}, h("div", {class: "trr"}, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
 }
 const skeleton = (n) => h("div", {class: "card list"}, Array.from({length: n || 6}, () => h("div", {class: "skrow"})));
 const empty = (iconName, title, text) => h("div", {class: "card empty"}, h("div", {class: "eic"}, icon(iconName, 26)), h("b", {}, title), text || "");
@@ -1884,21 +1982,24 @@ function areaChart(tokens) {
 function homeView() {
   const num = h("div", {class: "bignum"}, "0"), rate = h("div", {class: "mute"}), donutBox = h("div"), legend = h("div", {class: "legend"});
   const mkChip = (label, route, color, ic) => { const n = h("div", {class: "cn"}, "0"); const a = h("a", {class: "chip", href: "#/" + route, style: "--c:" + color}, h("span", {class: "ci"}, icon(ic, 18)), h("div", {class: "cl"}, label), n); a._n = n; return a; };
-  const cPassed = mkChip("Passed checks", "passed", "#3b82f6", "shield"), cReview = mkChip("In review", "review", "#f5a524", "eye"), cRej = mkChip("Rejected", "rejected", "#f6465d", "ban");
-  const chart = h("div"), latest = h("div"), sys = h("div");
-  latest.append(skeleton(5));
+  const cPassed = mkChip("Top picks", "passed", "#3b82f6", "shield"), cReview = mkChip("In review", "review", "#f5a524", "eye"), cRej = mkChip("Rejected", "rejected", "#f6465d", "ban");
+  const chart = h("div"), latest = h("div"), sys = h("div"), picks = h("div");
+  latest.append(skeleton(5)); picks.append(skeleton(2));
   const root = h("div", {},
     h("section", {class: "hero"},
       h("div", {class: "hero-row"},
         h("div", {}, h("span", {class: "live"}, h("span", {class: "dot ok"}), "Live scan · Solana"), num, h("div", {style: "font-weight:600"}, "tokens detected"), rate),
         h("div", {class: "donutbox"}, donutBox, legend))),
     h("div", {class: "grid3", style: "margin-top:14px"}, cPassed, cReview, cRej),
+    sec("Top picks right now", "See all", "#/passed"), picks,
     h("div", {class: "grid2", style: "margin-top:2px"},
       h("div", {}, sec("Launches per minute"), h("div", {class: "card pad"}, chart)),
       h("div", {}, sec("System", "Details", "#/system"), h("div", {class: "card pad"}, sys))),
     sec("Latest launches", "See all", "#/scanner"), latest);
   async function refresh() {
-    const [s, recent, hl] = await Promise.all([api("/stats"), api("/tokens/recent?limit=200"), api("/system/health")]);
+    const [s, recent, hl, pk] = await Promise.all([api("/stats"), api("/tokens/recent?limit=200"), api("/system/health"), api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=score")]);
+    const fresh = pk.filter((t) => Date.now() - new Date(t.detected_at).getTime() < 2 * 3600 * 1000).slice(0, 3);
+    picks.replaceChildren(fresh.length ? h("div", {class: "card list"}, fresh.map((t) => tokRow(t, false, "pick"))) : empty("shield", "No picks in the last 2 hours", "A pick is a token that passed every security check built so far. Best evidence score first. Not a buy signal."));
     const c = s.counts;
     setNum(num, s.total);
     setNum(cPassed._n, c.WATCH + c.QUALIFIED); setNum(cReview._n, c.INSUFFICIENT_DATA + c.HOLD); setNum(cRej._n, c.REJECTED + c.REVOKED);
@@ -1915,21 +2016,22 @@ function homeView() {
 }
 
 function listView(o) {
-  let all = [], q = "", group = o.group || "all";
+  let all = [], q = "", group = o.group || "all", win = o.windows ? 120 : 0;
   const list = h("div"), chips = h("div", {class: "filters"});
   list.append(skeleton(7));
   const input = h("input", {type: "search", placeholder: "Search name, symbol, mint or creator", autocomplete: "off", autocapitalize: "off", spellcheck: "false", oninput: (e) => { q = e.target.value.trim().toLowerCase(); draw(); }});
-  const bar = o.search ? h("div", {class: "searchbar"}, h("label", {class: "search"}, icon("search", 18), input), chips) : null;
+  const bar = (o.search || o.windows) ? h("div", {class: "searchbar"}, o.search ? h("label", {class: "search"}, icon("search", 18), input) : null, chips) : null;
   const count = (g) => GROUPS[g] ? all.filter((t) => GROUPS[g].includes(t.status)).length : all.length;
   function drawChips() {
+    if (o.windows) { chips.replaceChildren(...[[30, "30 min"], [120, "2 hours"], [360, "6 hours"], [0, "All"]].map(([m, lbl]) => h("button", {class: "fchip" + (win === m ? " on" : ""), onclick: () => { win = m; draw(); }}, lbl))); return; }
     if (!o.search) return;
     chips.replaceChildren(...[["all", "All"], ["review", "In review"], ["passed", "Passed"], ["rejected", "Rejected"]].map(([g, lbl]) =>
       h("button", {class: "fchip" + (group === g ? " on" : ""), onclick: () => { group = g; draw(); }}, lbl, h("em", {}, count(g)))));
   }
   function draw() {
     drawChips();
-    const rows = all.filter((t) => (!GROUPS[group] || GROUPS[group].includes(t.status)) && (!q || [t.name, t.symbol, t.mint, t.creator].some((v) => v && v.toLowerCase().includes(q))));
-    list.replaceChildren(rows.length ? h("div", {class: "card list"}, rows.map((t) => tokRow(t, true))) : (all.length ? empty("search", "No matches", "Try a different search or filter.") : empty(o.icon, o.emptyTitle, o.emptyText)));
+    const rows = all.filter((t) => (!GROUPS[group] || GROUPS[group].includes(t.status)) && (!q || [t.name, t.symbol, t.mint, t.creator].some((v) => v && v.toLowerCase().includes(q))) && (!win || Date.now() - new Date(t.detected_at).getTime() < win * 60000));
+    list.replaceChildren(rows.length ? h("div", {class: "card list"}, rows.map((t) => tokRow(t, !o.windows, o.windows ? "pick" : null))) : (all.length ? empty("search", "No matches", "Try a different search or filter.") : empty(o.icon, o.emptyTitle, o.emptyText)));
   }
   const root = h("div", {}, h("h1", {class: "large"}, o.title), h("p", {class: "sub"}, o.subtitle), bar, list);
   async function refresh() { all = await api(o.url); draw(); }
@@ -1969,6 +2071,18 @@ function holdersBlock(c) {
   return h("div", {style: "margin:8px 0 4px"}, h("div", {class: "stack"}, segs),
     hs.map((x, i) => h("div", {class: "hrow"}, h("span", {}, h("i", {style: "display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:8px;background:" + palette[i % palette.length]}), h("span", {class: "mono"}, short(x.owner, 6)), x.is_creator ? "  · creator" : ""), h("b", {style: "color:var(--text)"}, Number(x.pct_of_supply).toFixed(2) + "%"))),
     ex.length ? h("div", {class: "hrow dim"}, h("span", {}, "Excluded (" + ex.map((x) => x.reason).join(", ") + ")"), h("span", {}, ex.reduce((a, x) => a + x.pct_of_supply, 0).toFixed(2) + "%")) : null);
+}
+
+function evidenceCard(o) {
+  const c = o.score >= 70 ? "#34d399" : o.score >= 50 ? "#4c9bff" : "#ffb340";
+  return h("div", {class: "card pad", style: "margin-top:12px"},
+    h("div", {style: "display:flex;align-items:baseline;justify-content:space-between"}, h("b", {}, "Evidence score"), h("span", {class: "dim", style: "font-size:12px"}, "partial · " + o.available_weight + "% of planned inputs")),
+    h("div", {style: "font-size:44px;font-weight:800;letter-spacing:-.04em;color:" + c}, o.score.toFixed(1), h("span", {class: "dim", style: "font-size:16px;font-weight:600"}, " / 100")),
+    o.components.map((x) => h("div", {style: "margin:12px 0"},
+      h("div", {class: "hrow"}, h("span", {}, x.name.replace(/_/g, " ") + " (weight " + x.weight + ")"), h("b", {style: "color:var(--text)"}, x.score.toFixed(0))),
+      h("div", {class: "stack", style: "height:8px;margin:4px 0"}, h("span", {style: "width:" + Math.max(1, x.score) + "%;background:" + c})),
+      h("div", {class: "dim", style: "font-size:12px"}, x.detail))),
+    h("p", {class: "dim", style: "font-size:12px;margin:10px 0 0"}, "Not scored yet (never guessed): " + o.missing.join(", ") + ". " + o.note));
 }
 
 function checkRow(c) {
@@ -2013,7 +2127,7 @@ function tokenView(mint) {
     if (key === lastKey) return;   // nothing new: leave the page (and any opened sections) untouched
     lastKey = key;
     const fact = (k, v, copy) => h("div", {class: "fact"}, h("div", {class: "k"}, k), h("div", {class: "v" + (copy ? " mono" : "")}, v));
-    top.replaceChildren(
+    top.replaceChildren(...[
       h("div", {class: "thead"}, avatar(t, 58), h("div", {style: "min-width:0"}, h("h1", {}, t.symbol || "Token"), h("div", {class: "mute"}, t.name || "Unnamed"),
         h("button", {class: "copy", onclick: () => copyText(t.mint)}, short(t.mint, 8), icon("copy", 13)))),
       h("section", {class: "verdict", style: "--c:" + COLOR[t.status]},
@@ -2022,10 +2136,12 @@ function tokenView(mint) {
         h("p", {}, r ? r.reason : t.status_reason),
         r && r.warnings.length ? h("ul", {class: "warns"}, r.warnings.map((x) => h("li", {}, x))) : null,
         r ? h("p", {class: "dim", style: "font-size:12px"}, "Analysed " + ago(r.analyzed_at) + " · logic " + r.analysis_version + (r.next_review_at ? " · next review " + fmt(r.next_review_at) : "")) : null),
+      r && r.opportunity ? evidenceCard(r.opportunity) : null,
       h("div", {class: "facts"}, fact("Detected", fmt(t.detected_at)), fact("Launch time", t.launch_timestamp ? fmt(t.launch_timestamp) : "Not supplied"), fact("Creator", short(t.creator, 6), true), fact("Bonding curve", short(t.bonding_curve, 6), true)),
       h("div", {class: "btns"},
         h("a", {class: "btn", href: "https://solscan.io/token/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Solscan", icon("ext", 15)),
-        h("a", {class: "btn", href: "https://pump.fun/coin/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Pump.fun", icon("ext", 15))));
+        h("a", {class: "btn", href: "https://pump.fun/coin/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Pump.fun", icon("ext", 15))),
+    ].filter(Boolean));
     bottom.replaceChildren(...[
       sec("Security checks"),
       r ? h("div", {class: "card list"}, r.checks.map(checkRow)) : empty("pulse", "Analysis has not completed yet", "The security engine runs shortly after detection. This page refreshes automatically."),
@@ -2037,7 +2153,7 @@ function tokenView(mint) {
 }
 
 /* ---------- router ---------- */
-const NAV = [["", "Home", "home"], ["scanner", "Scanner", "radar"], ["passed", "Passed", "shield"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
+const NAV = [["", "Home", "home"], ["scanner", "Scanner", "radar"], ["passed", "Picks", "shield"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
 function buildNav() {
   const mk = (cls) => (r, l, ic) => h("a", {href: "#/" + r, "data-r": r}, icon(ic, cls === "rail" ? 20 : 22), cls === "rail" ? l : h("span", {}, l));
   document.getElementById("railnav").replaceChildren(...NAV.map(([r, l, ic]) => mk("rail")(r, l, ic)));
@@ -2063,7 +2179,7 @@ let timer = null, gen = 0;
 function build(name, arg) {
   switch (name) {
     case "scanner": return listView({title: "Scanner", subtitle: "Every new launch, newest first. Search or filter by security status.", url: "/tokens/recent?limit=200", search: true, icon: "radar", emptyTitle: "No tokens detected yet", emptyText: "If the backend is running, open System health to confirm the feed is connected."});
-    case "passed": return listView({title: "Passed checks", subtitle: "Tokens whose implemented security checks passed. Not a recommendation, and not a guarantee of safety.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH", icon: "shield", emptyTitle: "No tokens have passed yet", emptyText: "Watch means the checks built so far passed. Qualified needs sell simulation and the opportunity score, which are not built yet."});
+    case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check built so far, best evidence score first. A pick is not a buy signal and not a guarantee of safety.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=score", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes all checks. Qualified is not possible until sell simulation and market scoring exist."});
     case "review": case "investigating": return listView({title: "In review", subtitle: "Required evidence is missing, or something suspicious is unresolved.", url: "/tokens/recent?limit=200&status=INSUFFICIENT_DATA,HOLD", icon: "eye", emptyTitle: "Nothing in review", emptyText: "Tokens land here while data is being collected, or when something looks suspicious but is not proven."});
     case "rejected": return listView({title: "Rejected", subtitle: "A verified, serious security problem was found. Open a token to see the exact evidence.", url: "/tokens/recent?limit=200&status=REJECTED,REVOKED", icon: "ban", emptyTitle: "No rejected tokens", emptyText: "Rejections appear here with the on-chain evidence behind them."});
     case "system": return systemView();
@@ -2071,11 +2187,23 @@ function build(name, arg) {
     default: return homeView();
   }
 }
+let seenPicks = null, newPicks = 0;
+function updateTitle() { document.title = (newPicks ? "(" + newPicks + ") " : "") + "Tosh Bot"; }
+async function pickWatcher() {
+  try {
+    const rows = await api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=score");
+    if (seenPicks === null) { seenPicks = new Set(rows.map((t) => t.mint)); return; }
+    const fresh = rows.filter((t) => !seenPicks.has(t.mint));
+    fresh.forEach((t) => seenPicks.add(t.mint));
+    if (fresh.length) { newPicks += fresh.length; toast("New pick: " + (fresh[0].symbol || "token") + (fresh.length > 1 ? " +" + (fresh.length - 1) + " more" : ""), 5000); updateTitle(); }
+  } catch (e) { /* the banner already reports connection problems */ }
+}
 function route() {
   clearInterval(timer);
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   let name = parts[0] || "", arg = decodeURIComponent(parts[1] || "");
   if (name === "investigating") name = "review";
+  if (name === "passed") { newPicks = 0; updateTitle(); }
   document.querySelectorAll("[data-r]").forEach((a) => a.classList.toggle("on", a.dataset.r === name || (name === "token" && a.dataset.r === "scanner")));
   const view = build(name, arg), my = ++gen;
   app.replaceChildren(view.root); banner.style.display = "none"; window.scrollTo(0, 0);
@@ -2097,7 +2225,7 @@ async function pill2() {
 }
 buildNav(); themeIcon();
 window.addEventListener("hashchange", route);
-route(); pill2(); setInterval(pill2, 10000);
+route(); pill2(); setInterval(pill2, 10000); pickWatcher(); setInterval(pickWatcher, 15000);
 </script>
 </body>
 </html>
@@ -2109,11 +2237,15 @@ def build_api_router(auth) -> APIRouter:
 
     @router.get("/tokens/recent", response_model=list[TokenRecord])
     async def recent_tokens(request: Request, limit: int = Query(50, ge=1, le=200),
-                            status: str | None = Query(None, description="Comma-separated statuses")):
+                            status: str | None = Query(None, description="Comma-separated statuses"),
+                            sort: str | None = Query(None, description="'score' = best evidence score first")):
         statuses = [x.strip().upper() for x in status.split(",") if x.strip()] if status else None
         if statuses and any(x not in VALID_STATUSES for x in statuses):
             raise HTTPException(status_code=422, detail="Unknown status")
-        return await request.app.state.repo.list_recent_tokens(limit, statuses)
+        rows = await request.app.state.repo.list_recent_tokens(limit, statuses)
+        if sort == "score":
+            rows = sorted(rows, key=lambda t: (t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at), reverse=True)
+        return rows
 
     @router.get("/stats")
     async def stats(request: Request) -> dict:
@@ -2171,7 +2303,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             log.warning("API_KEY is empty: API is unauthenticated (development only)")
         repo = repository or build_repository(settings)
         if repository is None and settings.storage_backend != "memory" and settings.cache_recent_tokens > 0:
-            repo = CachedRepository(repo, settings.cache_recent_tokens)
+            repo = CachedRepository(repo, settings.cache_recent_tokens, settings.persist_status_set)
             try:
                 await repo.warm()
                 log.info("memory cache ready", extra={"tokens": len(repo.recent)})

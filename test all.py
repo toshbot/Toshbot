@@ -713,6 +713,61 @@ async def test_lean_worker_saves_only_the_final_report_when_data_is_unavailable(
     assert len(await repo.list_reports(token.mint, 10)) == 1  # but only one billable save
 
 
+@pytest.mark.asyncio
+async def test_lean_mode_keeps_uninteresting_tokens_in_memory_only():
+    inner = InMemoryRepository()
+    repo = CachedRepository(inner, size=10, persist_statuses={"WATCH", "HOLD"})
+    await repo.warm()
+    t = fixture_token(1)
+    assert await repo.create_token_if_absent(t) is True
+    assert await repo.create_token_if_absent(t) is False          # de-duplicated in memory
+    assert not inner.tokens                                        # nothing written yet
+    await repo.save_security_report(_fake_report(t.mint, "REJECTED"))
+    await repo.update_token_decision(t.mint, "REJECTED", "fixture", "mem", utcnow(), None)
+    assert not inner.tokens and not inner.reports                  # rejected: still memory only
+    assert (await repo.get_latest_report(t.mint)).status == "REJECTED"   # but the dashboard can still show it
+    assert [x.status for x in await repo.list_recent_tokens(10)] == ["REJECTED"]
+
+
+@pytest.mark.asyncio
+async def test_lean_mode_saves_interesting_tokens_once_with_their_report():
+    inner = InMemoryRepository()
+    repo = CachedRepository(inner, size=10, persist_statuses={"WATCH", "HOLD"})
+    await repo.warm()
+    t = fixture_token(2)
+    await repo.create_token_if_absent(t)
+    await repo.save_security_report(_fake_report(t.mint, "WATCH"))
+    await repo.update_token_decision(t.mint, "WATCH", "fixture", "mem", utcnow(), 61.5)
+    assert inner.tokens[t.mint].status == "WATCH" and inner.tokens[t.mint].opportunity_score == 61.5
+    assert len(inner.reports[t.mint]) == 1
+    assert inner.tokens[t.mint].latest_report_id != "mem"          # points at the real saved report
+
+
+def _fake_report(mint, status):
+    from datetime import timezone
+    return SecurityReport(mint=mint, analysis_version="fixture", analyzed_at=utcnow().astimezone(timezone.utc), status=status, reason="fixture")
+
+
+@pytest.mark.asyncio
+async def test_partial_evidence_score_is_computed_and_marked_incomplete():
+    repo = InMemoryRepository()
+    token = fixture_token(3)
+    await repo.create_token_if_absent(token)
+    report = await SecurityAnalyzer(FakeRPC(), repo, SecurityPolicy()).analyze(token)
+    opp = report.opportunity
+    assert report.status == "WATCH" and 0 <= opp["score"] <= 100
+    assert opp["complete"] is False and opp["available_weight"] == 60 and opp["missing"]
+
+
+@pytest.mark.asyncio
+async def test_no_score_when_inputs_are_unavailable():
+    repo = InMemoryRepository()
+    token = fixture_token(4)
+    await repo.create_token_if_absent(token)
+    report = await SecurityAnalyzer(FakeRPC(fail={"get_balance"}), repo, SecurityPolicy()).analyze(token)
+    assert report.opportunity is None   # never invent a neutral value for missing evidence
+
+
 # ----------------------------------------------------------------------
 # test_api
 # ----------------------------------------------------------------------
