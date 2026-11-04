@@ -14,6 +14,7 @@ Detection and analysis only: no trading, no guarantees. Missing data is never tr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 import logging
+from collections import OrderedDict, deque
 import sys
 from datetime import datetime, timezone
 import re
@@ -99,6 +100,30 @@ class Settings(BaseSettings):
     max_transfer_fee_bps: int = 500
     creator_max_launches_24h: int = 5
     min_curve_reserve_sol: float = 0.1
+
+    # Live buy signal (trade feed). EXPERIMENTAL starting values, not calibrated on real results.
+    signals_enabled: bool = True           # watch trades of WATCH tokens and allow QUALIFIED (= BUY light). False = never QUALIFIED
+    signal_window_minutes: float = 30.0    # how long one token is watched for a buy signal
+    signal_max_tracked: int = 150          # most tokens watched at once
+    signal_review_seconds: int = 30        # how often a watched token is re-evaluated
+    security_recheck_seconds: int = 120    # RPC security checks are reused between signal reviews for this long
+    review_save_seconds: int = 180         # unchanged re-reviews are saved at most this often (protects database quota)
+    signal_min_observe_seconds: int = 90
+    signal_min_trades: int = 15
+    signal_min_unique_buyers: int = 8
+    signal_min_distinct_sellers: int = 2
+    signal_max_top_trader_pct: float = 35.0
+    signal_max_wash_pct: float = 50.0
+    signal_momentum_window_seconds: int = 120
+    signal_min_mcap_change_pct: float = 3.0
+    signal_max_mcap_change_pct: float = 150.0
+    signal_max_drawdown_pct: float = 20.0
+    signal_min_buy_pressure_pct: float = 60.0
+    signal_min_new_buyers: int = 3
+    signal_max_trade_age_seconds: int = 45
+    signal_max_mcap_sol: float = 60.0
+    signal_min_curve_sol: float = 5.0
+    qualify_min_score: float = 65.0
 
     @property
     def persist_status_set(self) -> set[str] | None:
@@ -268,6 +293,15 @@ NOT_EVALUATED = [
 ]
 
 
+# Used when the live trade feed is on: the items below are still NOT built.
+NOT_EVALUATED_LIVE = [
+    "sell_simulation (no transaction is simulated; replaced by sell_evidence: real sells by other wallets seen on the feed)",
+    "metadata_and_links (website / social review)",
+    "creator_dump_history (transfer-level analysis of the creator wallet)",
+    "post_migration_pool_liquidity (after the token leaves the bonding curve the signal ends)",
+]
+
+
 class SecurityPolicy(BaseModel):
     """Thresholds are experimental. Authority and dangerous-extension rules are hard-coded, not settings."""
 
@@ -281,6 +315,24 @@ class SecurityPolicy(BaseModel):
     review_seconds_insufficient: int = 60
     review_seconds_hold: int = 300
     review_seconds_watch: int = 600
+    # live buy-signal thresholds (experimental)
+    signal_review_seconds: int = 30
+    signal_min_observe_seconds: int = 90
+    signal_min_trades: int = 15
+    signal_min_unique_buyers: int = 8
+    signal_min_distinct_sellers: int = 2
+    signal_max_top_trader_pct: float = 35.0
+    signal_max_wash_pct: float = 50.0
+    signal_momentum_window_seconds: int = 120
+    signal_min_mcap_change_pct: float = 3.0
+    signal_max_mcap_change_pct: float = 150.0
+    signal_max_drawdown_pct: float = 20.0
+    signal_min_buy_pressure_pct: float = 60.0
+    signal_min_new_buyers: int = 3
+    signal_max_trade_age_seconds: int = 45
+    signal_max_mcap_sol: float = 60.0
+    signal_min_curve_sol: float = 5.0
+    qualify_min_score: float = 65.0
 
 
 # ============================================================================
@@ -377,6 +429,39 @@ def parse_message(raw: str | bytes, received_at: datetime | None = None) -> Laun
         received_at=received_at or utcnow(),
         raw=stored_raw,
     )
+
+
+@dataclass(frozen=True)
+class Trade:
+    mint: str
+    wallet: str
+    side: str  # "buy" | "sell"
+    sol: float
+    tokens: float
+    mcap_sol: float | None
+    ts: float  # local receipt time (epoch seconds)
+
+
+def parse_trade(raw: str | bytes, now: float | None = None) -> Trade | None:
+    """Parse a PumpPortal trade message. Returns None for anything that is not a well-formed buy/sell
+    (launches, acknowledgements, garbage). Never raises: bad data is dropped, never guessed."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw).decode("utf-8", errors="replace")
+    if '"txType"' not in raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("txType") not in ("buy", "sell"):
+        return None
+    mint, wallet = _addr(data.get("mint")), _addr(data.get("traderPublicKey"))
+    sol, tokens = _num(data.get("solAmount")), _num(data.get("tokenAmount"))
+    if mint is None or wallet is None or sol is None or sol < 0:
+        return None
+    mcap = _num(data.get("marketCapSol"))
+    return Trade(mint, wallet, data["txType"], sol, tokens or 0.0, mcap if mcap and mcap > 0 else None,
+                 time.time() if now is None else now)
 
 
 # ============================================================================
@@ -1188,6 +1273,272 @@ def decide(results: list[CheckResult], now: datetime, policy: SecurityPolicy) ->
             [], now + timedelta(seconds=policy.review_seconds_watch))
 
 
+# ============================================================================
+# app/signal.py  (live trade tracking and the BUY signal)
+# ============================================================================
+SRC_TRADES = "pumpportal_trade_feed"
+SIGNAL_CHECKS = ("sell_evidence", "trading_manipulation", "momentum")
+
+
+@dataclass
+class TradeStats:
+    observed_seconds: float
+    n_trades: int
+    last_trade_age: float | None
+    unique_buyers: int          # independent buyers (the creator is excluded)
+    distinct_sellers: int       # independent wallets that sold (the creator is excluded)
+    creator_sold_sol: float
+    volume_sol: float
+    top_trader_pct: float       # biggest single wallet's share of all traded SOL
+    wash_pct: float             # share of traded SOL from wallets that both bought and sold
+    mcap_now: float | None
+    mcap_ref: float | None
+    mcap_change_pct: float | None
+    drawdown_pct: float | None  # fall from the highest market cap seen while watching
+    buy_pressure_pct: float | None  # buy SOL / all SOL traded in the momentum window
+    new_buyers: int             # independent buyers first seen inside the momentum window
+    window_seconds: int
+
+
+def compute_stats(trades, creator: str | None, since: float, now: float, window: int) -> TradeStats:
+    cutoff = now - window
+    first_buy: dict[str, float] = {}
+    sellers: set[str] = set()
+    vol: dict[str, float] = {}
+    sides: dict[str, set[str]] = {}
+    buy_sol = sell_sol = wbuy = wsell = creator_sold = 0.0
+    prices: list[tuple[float, float]] = []
+    for t in trades:
+        vol[t.wallet] = vol.get(t.wallet, 0.0) + t.sol
+        sides.setdefault(t.wallet, set()).add(t.side)
+        is_creator = bool(creator) and t.wallet == creator
+        if t.mcap_sol:
+            prices.append((t.ts, t.mcap_sol))
+        if t.side == "buy":
+            buy_sol += t.sol
+            if not is_creator:
+                first_buy.setdefault(t.wallet, t.ts)
+            if t.ts >= cutoff:
+                wbuy += t.sol
+        else:
+            sell_sol += t.sol
+            if is_creator:
+                creator_sold += t.sol
+            else:
+                sellers.add(t.wallet)
+            if t.ts >= cutoff:
+                wsell += t.sol
+    total = buy_sol + sell_sol
+    top = (max(vol.values()) / total * 100) if total > 0 else 0.0
+    wash = (sum(v for w, v in vol.items() if len(sides[w]) == 2) / total * 100) if total > 0 else 0.0
+    mcap_now = prices[-1][1] if prices else None
+    ref = None
+    if prices:
+        before = [p for p in prices if p[0] <= cutoff]
+        ref = (before[-1] if before else prices[0])[1]
+    change = ((mcap_now - ref) / ref * 100) if (mcap_now is not None and ref) else None
+    peak = max((p[1] for p in prices), default=None)
+    dd = ((peak - mcap_now) / peak * 100) if (peak and mcap_now is not None) else None
+    wtotal = wbuy + wsell
+    return TradeStats(
+        observed_seconds=max(0.0, now - since), n_trades=len(trades),
+        last_trade_age=(now - trades[-1].ts) if trades else None,
+        unique_buyers=len(first_buy), distinct_sellers=len(sellers), creator_sold_sol=creator_sold, volume_sol=total,
+        top_trader_pct=top, wash_pct=wash, mcap_now=mcap_now, mcap_ref=ref, mcap_change_pct=change, drawdown_pct=dd,
+        buy_pressure_pct=(wbuy / wtotal * 100) if wtotal > 0 else None,
+        new_buyers=sum(1 for ts in first_buy.values() if ts >= cutoff), window_seconds=window)
+
+
+class TradeTracker:
+    """In-memory trade book for the few tokens that passed the security checks (WATCH). It is NOT stored in the
+    database, so a restart clears it and every BUY signal is re-earned from fresh trades. Subscriptions are
+    requested here and sent by the listener on the single shared WebSocket connection."""
+
+    def __init__(self, window_seconds: float = 1800.0, max_tracked: int = 150, max_trades: int = 3000, clock=time.time,
+                 momentum_window: int = 120) -> None:
+        self.window, self.max_tracked, self.max_trades, self._clock = window_seconds, max_tracked, max_trades, clock
+        self.momentum_window = momentum_window
+        self._tok: dict[str, dict] = {}
+        self._finished: OrderedDict[str, float] = OrderedDict()
+        self.pending_sub: set[str] = set()
+        self.pending_unsub: set[str] = set()
+        self.trades_seen = 0
+
+    def is_tracked(self, mint: str) -> bool:
+        return mint in self._tok
+
+    def active(self) -> int:
+        return len(self._tok)
+
+    def track(self, mint: str, creator: str | None = None) -> bool:
+        """True if this token is being watched. False if its window already ended or the tracker is full."""
+        if mint in self._tok:
+            return True
+        if mint in self._finished or len(self._tok) >= self.max_tracked:
+            return False
+        now = self._clock()
+        self._tok[mint] = {"since": now, "creator": creator, "trades": deque(maxlen=self.max_trades), "last_review": now}
+        self.pending_sub.add(mint)
+        self.pending_unsub.discard(mint)
+        return True
+
+    def untrack(self, mint: str) -> None:
+        if self._tok.pop(mint, None) is None:
+            return
+        self._finished[mint] = self._clock()
+        while len(self._finished) > 5000:
+            self._finished.popitem(last=False)
+        self.pending_sub.discard(mint)
+        self.pending_unsub.add(mint)
+
+    def add(self, trade: Trade) -> bool:
+        rec = self._tok.get(trade.mint)
+        if rec is None:
+            return False
+        rec["trades"].append(trade)
+        self.trades_seen += 1
+        return True
+
+    def resubscribe_all(self) -> None:
+        self.pending_sub |= set(self._tok)
+
+    def drain_subs(self) -> tuple[list[str], list[str]]:
+        subs, unsubs = sorted(self.pending_sub), sorted(self.pending_unsub)
+        self.pending_sub, self.pending_unsub = set(), set()
+        return subs, unsubs
+
+    def expired(self, now: float | None = None) -> list[str]:
+        now = self._clock() if now is None else now
+        return [m for m, r in self._tok.items() if now - r["since"] >= self.window]
+
+    def due(self, interval: float, now: float | None = None) -> list[str]:
+        now = self._clock() if now is None else now
+        out = []
+        for m, r in self._tok.items():
+            if now - r["last_review"] >= interval:
+                r["last_review"] = now
+                out.append(m)
+        return out
+
+    def snapshot(self, mint: str, now: float | None = None) -> TradeStats | None:
+        rec = self._tok.get(mint)
+        if rec is None:
+            return None
+        now = self._clock() if now is None else now
+        return compute_stats(list(rec["trades"]), rec["creator"], rec["since"], now, self.momentum_window)
+
+
+@dataclass
+class SignalResult:
+    state: str  # "BUY" | "WAIT" | "HOLD"
+    checks: list
+    reasons: list
+
+
+def _sig_check(name, status, summary, evidence=None, warnings=None) -> CheckResult:
+    return result(name, status, summary, evidence=evidence, warnings=warnings, sources=[SRC_TRADES], mandatory=False)
+
+
+def _waiting(name: str, why: str) -> CheckResult:
+    return _sig_check(name, "UNAVAILABLE", f"Waiting: {why}")
+
+
+def evaluate_signal(stats: TradeStats | None, p: SecurityPolicy, curve_sol: float, note: str | None = None) -> SignalResult:
+    """BUY only when every live condition holds at this moment. Anything missing or stale is WAIT, never BUY.
+    HOLD only for trading behaviour that looks manipulated or like a creator dump."""
+    if stats is None:
+        why = note or "no live trade data for this token"
+        return SignalResult("WAIT", [_waiting(n, why) for n in SIGNAL_CHECKS], [why])
+    ev = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in stats.__dict__.items()}
+    blockers: list[str] = []
+    fresh = stats.last_trade_age is not None and stats.last_trade_age <= p.signal_max_trade_age_seconds
+    enough = stats.observed_seconds >= p.signal_min_observe_seconds and stats.n_trades >= p.signal_min_trades
+
+    # 1. sell evidence (observed, not simulated)
+    if stats.distinct_sellers >= p.signal_min_distinct_sellers:
+        sell = _sig_check("sell_evidence", "PASS", f"{stats.distinct_sellers} different wallets (not the creator) have sold on the curve, so exits work. This is observed evidence, not a simulation.", ev)
+    else:
+        sell = _waiting("sell_evidence", f"only {stats.distinct_sellers} independent wallet(s) have sold so far (needs {p.signal_min_distinct_sellers}).")
+        blockers.append("sell evidence: " + sell.summary)
+
+    # 2. manipulation
+    flags = []
+    if stats.creator_sold_sol > 0:
+        flags.append(f"the creator sold {stats.creator_sold_sol:.2f} SOL worth")
+    if enough and stats.top_trader_pct > p.signal_max_top_trader_pct:
+        flags.append(f"one wallet made {stats.top_trader_pct:.0f}% of all trading (max {p.signal_max_top_trader_pct:.0f}%)")
+    if enough and stats.wash_pct > p.signal_max_wash_pct:
+        flags.append(f"{stats.wash_pct:.0f}% of volume came from wallets that both bought and sold (max {p.signal_max_wash_pct:.0f}%)")
+    if flags:
+        manip = _sig_check("trading_manipulation", "SUSPICIOUS", "Suspicious trading: " + "; ".join(flags) + ".", ev)
+    elif not enough:
+        manip = _waiting("trading_manipulation", f"{stats.n_trades} trades over {stats.observed_seconds:.0f}s (needs {p.signal_min_trades} trades over {p.signal_min_observe_seconds}s).")
+        blockers.append("manipulation check: " + manip.summary)
+    elif stats.unique_buyers < p.signal_min_unique_buyers:
+        manip = _waiting("trading_manipulation", f"only {stats.unique_buyers} independent buyers (needs {p.signal_min_unique_buyers}).")
+        blockers.append("manipulation check: " + manip.summary)
+    else:
+        manip = _sig_check("trading_manipulation", "PASS", f"{stats.unique_buyers} independent buyers, top wallet {stats.top_trader_pct:.0f}% of volume, round-trip volume {stats.wash_pct:.0f}%, creator has not sold.", ev)
+
+    # 3. momentum
+    unmet = []
+    if not fresh:
+        unmet.append("no trade in the last %ds" % p.signal_max_trade_age_seconds if stats.last_trade_age is None or stats.last_trade_age > p.signal_max_trade_age_seconds else "")
+    if stats.mcap_change_pct is None:
+        unmet.append("no price data yet")
+    else:
+        if stats.mcap_change_pct < p.signal_min_mcap_change_pct:
+            unmet.append(f"price {stats.mcap_change_pct:+.1f}% in {stats.window_seconds}s (needs at least +{p.signal_min_mcap_change_pct:.0f}%)")
+        if stats.mcap_change_pct > p.signal_max_mcap_change_pct:
+            unmet.append(f"price {stats.mcap_change_pct:+.0f}% in {stats.window_seconds}s is a vertical spike (max +{p.signal_max_mcap_change_pct:.0f}%), chasing it is risky")
+        if stats.drawdown_pct is not None and stats.drawdown_pct > p.signal_max_drawdown_pct:
+            unmet.append(f"price is {stats.drawdown_pct:.0f}% below its peak (max {p.signal_max_drawdown_pct:.0f}%)")
+    if stats.buy_pressure_pct is None or stats.buy_pressure_pct < p.signal_min_buy_pressure_pct:
+        unmet.append("buy pressure %s (needs %.0f%%)" % ("n/a" if stats.buy_pressure_pct is None else f"{stats.buy_pressure_pct:.0f}%", p.signal_min_buy_pressure_pct))
+    if stats.new_buyers < p.signal_min_new_buyers:
+        unmet.append(f"only {stats.new_buyers} new buyers in {stats.window_seconds}s (needs {p.signal_min_new_buyers})")
+    if stats.mcap_now is not None and stats.mcap_now > p.signal_max_mcap_sol:
+        unmet.append(f"market cap {stats.mcap_now:.0f} SOL is above the {p.signal_max_mcap_sol:.0f} SOL entry limit")
+    if curve_sol < p.signal_min_curve_sol:
+        unmet.append(f"curve holds {curve_sol:.1f} SOL (needs {p.signal_min_curve_sol:.0f})")
+    unmet = [u for u in unmet if u]
+    if unmet:
+        mom = _waiting("momentum", "; ".join(unmet) + ".")
+        blockers.append("momentum: " + "; ".join(unmet))
+    else:
+        mom = _sig_check("momentum", "PASS", f"Price {stats.mcap_change_pct:+.1f}% in {stats.window_seconds}s, buy pressure {stats.buy_pressure_pct:.0f}%, {stats.new_buyers} new buyers, {stats.drawdown_pct or 0:.0f}% below peak.", ev)
+
+    checks = [sell, manip, mom]
+    if manip.status == "SUSPICIOUS":
+        return SignalResult("HOLD", checks, [manip.summary])
+    if all(c.status == "PASS" for c in checks):
+        return SignalResult("BUY", checks, [])
+    return SignalResult("WAIT", checks, blockers)
+
+
+def signal_components(stats: TradeStats | None, p: SecurityPolicy) -> list[dict] | None:
+    """The three scoring inputs the evidence score was missing. None until there is price data and enough trades."""
+    if stats is None or stats.mcap_change_pct is None or stats.n_trades < p.signal_min_trades:
+        return None
+    c = stats.mcap_change_pct
+    if c <= 0:
+        mom = 0.0
+    elif c <= 30:
+        mom = c / 30 * 100
+    elif c <= p.signal_max_mcap_change_pct:
+        mom = 100 - (c - 30) / max(1.0, p.signal_max_mcap_change_pct - 30) * 50
+    else:
+        mom = 30.0
+    mom = _clamp(mom - 2 * (stats.drawdown_pct or 0.0))
+    growth = _clamp(50 * min(1.0, stats.unique_buyers / 25) + 50 * min(1.0, stats.new_buyers / 8))
+    auth = _clamp(100 - 1.5 * stats.top_trader_pct - stats.wash_pct)
+    return [
+        {"name": "trading_momentum", "weight": 20, "score": round(mom, 1), "detail": f"price {c:+.1f}% in {stats.window_seconds}s, {stats.drawdown_pct or 0:.0f}% below peak"},
+        {"name": "independent_buyer_growth", "weight": 10, "score": round(growth, 1), "detail": f"{stats.unique_buyers} independent buyers, {stats.new_buyers} new in {stats.window_seconds}s"},
+        {"name": "volume_authenticity", "weight": 10, "score": round(auth, 1), "detail": f"top wallet {stats.top_trader_pct:.0f}% of volume, round-trip volume {stats.wash_pct:.0f}%"},
+    ]
+
+
 OPP_WEIGHTS = {"liquidity_quality": 20, "holder_distribution": 15, "wallet_intelligence": 15, "developer_history": 10}
 OPP_MISSING = ["trading_momentum (weight 20)", "independent_buyer_growth (weight 10)", "volume_authenticity (weight 10)"]
 
@@ -1196,7 +1547,7 @@ def _clamp(x: float) -> float:
     return max(0.0, min(100.0, x))
 
 
-def opportunity_score(results: list[CheckResult]) -> dict | None:
+def opportunity_score(results: list[CheckResult], extra: list[dict] | None = None) -> dict | None:
     """PARTIAL evidence-quality score from the inputs that exist today (60% of the planned weights).
     It is NOT a profit probability. Returns None when any input is unavailable (never guesses a neutral value)."""
     by = {r.name: r for r in results}
@@ -1218,15 +1569,23 @@ def opportunity_score(results: list[CheckResult]) -> dict | None:
         {"name": "developer_history", "weight": OPP_WEIGHTS["developer_history"], "score": round(_clamp(100 - 25 * max(0, launches - 1)), 1),
          "detail": f"{launches} launch(es) by this creator seen in 24h"},
     ]
+    if extra:
+        comps += extra
     total_w = sum(c["weight"] for c in comps)
     score = round(sum(c["weight"] * c["score"] for c in comps) / total_w, 1)
-    return {"score": score, "available_weight": total_w, "complete": False, "components": comps, "missing": OPP_MISSING,
-            "note": "Partial evidence score from the inputs available today. Not a prediction and not a recommendation."}
+    complete = bool(extra) and total_w >= 100
+    return {"score": score, "available_weight": total_w, "complete": complete, "components": comps,
+            "missing": [] if complete else OPP_MISSING,
+            "note": ("Complete evidence score including live trade data. Not a prediction and not a recommendation." if complete
+                     else "Partial evidence score from the inputs available today. Not a prediction and not a recommendation.")}
 
 
 class SecurityAnalyzer:
-    def __init__(self, rpc: SolanaRPC, repo: Repository, policy: SecurityPolicy) -> None:
+    def __init__(self, rpc: SolanaRPC, repo: Repository, policy: SecurityPolicy, tracker: "TradeTracker | None" = None,
+                 security_cache_seconds: float = 0.0) -> None:
         self.rpc, self.repo, self.policy = rpc, repo, policy
+        self.tracker, self._sec_ttl = tracker, security_cache_seconds
+        self._sec_cache: dict[str, tuple[datetime, list[CheckResult]]] = {}
 
     async def _safe(self, name: str, coro) -> CheckResult:
         try:
@@ -1250,7 +1609,23 @@ class SecurityAnalyzer:
         except (KeyError, TypeError, ValueError) as exc:
             return None, f"unexpected mint data ({type(exc).__name__}: {exc})"
 
-    async def analyze(self, token: TokenRecord) -> SecurityReport:
+    async def _security_results(self, token: TokenRecord) -> list[CheckResult]:
+        """The on-chain checks. With the live signal on, a clean result is reused briefly so the 30 second
+        signal reviews do not repeat every RPC call."""
+        cached = self._sec_cache.get(token.mint)
+        if self.tracker is not None and self._sec_ttl and cached and (utcnow() - cached[0]).total_seconds() < self._sec_ttl:
+            return list(cached[1])
+        results = await self._run_security(token)
+        if self.tracker is not None and self._sec_ttl:
+            if all(r.status == "PASS" for r in results):
+                if len(self._sec_cache) > 2000:
+                    self._sec_cache.clear()
+                self._sec_cache[token.mint] = (utcnow(), list(results))
+            else:
+                self._sec_cache.pop(token.mint, None)
+        return results
+
+    async def _run_security(self, token: TokenRecord) -> list[CheckResult]:
         md, err = await self._load_mint(token.mint)
         if md is None:
             mint_checks = [unavailable(n, err) for n in ("mint_permissions", "token_extensions", "holder_concentration")]
@@ -1262,13 +1637,56 @@ class SecurityAnalyzer:
         others = [self._safe("creator_wallet", check_creator(self.rpc, self.repo, token, self.policy)),
                   self._safe("liquidity", check_liquidity(self.rpc, token, self.policy))]
         gathered = await asyncio.gather(*(([holders] if holders else []) + others))
-        results = mint_checks + (list(gathered[:1]) if holders else []) + list(gathered[1 if holders else 0:])
+        return mint_checks + (list(gathered[:1]) if holders else []) + list(gathered[1 if holders else 0:])
+
+    def _signal_overlay(self, token: TokenRecord, results: list[CheckResult], status: str, reason: str, reasons: list[str],
+                        next_review, now: datetime):
+        """Only a token whose security verdict is WATCH can move. BUY (QUALIFIED) needs every live condition AND a
+        complete evidence score at or above the bar. Missing or stale trade data always leaves the token at WATCH."""
+        tr, p = self.tracker, self.policy
+        if status in ("REJECTED", "REVOKED"):
+            tr.untrack(token.mint)
+        if status != "WATCH":
+            return status, reason, reasons, next_review, [], None
+        tracked = tr.track(token.mint, token.creator)
+        stats = tr.snapshot(token.mint) if tracked else None
+        note = None if tracked else "live trade watching is not active for this token (its watch window ended or the tracker is full)."
+        liq = next((r for r in results if r.name == "liquidity" and r.status != "UNAVAILABLE"), None)
+        curve_sol = float(liq.evidence.get("curve_sol", 0.0)) if liq else 0.0
+        sig = evaluate_signal(stats, p, curve_sol, note=note)
+        opp = opportunity_score(results, signal_components(stats, p))
+        review = now + timedelta(seconds=p.signal_review_seconds) if tracked else next_review
+        if sig.state == "HOLD":
+            return "HOLD", "Suspicious trading activity. " + " | ".join(sig.reasons), sig.reasons, review, sig.checks, opp
+        if sig.state == "BUY":
+            if opp and opp["complete"] and opp["score"] >= p.qualify_min_score:
+                msg = (f"BUY conditions are met right now. All implemented security checks passed, other wallets have sold successfully, "
+                       f"trading looks organic and momentum is positive. Evidence score {opp['score']:.1f}/100. "
+                       "This is a signal, not a guarantee, and it is re-checked every "
+                       f"{p.signal_review_seconds} seconds.")
+                return "QUALIFIED", msg, [], review, sig.checks, opp
+            low = [f"evidence score {opp['score']:.1f} is below the {p.qualify_min_score:.0f} needed"] if opp else ["evidence score could not be completed"]
+            return status, "Security checks passed and trading conditions look fine, but " + low[0] + ".", low, review, sig.checks, opp
+        why = "; ".join(sig.reasons) if sig.reasons else "waiting for trade data"
+        return status, "Security checks passed. No buy signal yet: " + why, [], review, sig.checks, opp
+
+    async def analyze(self, token: TokenRecord) -> SecurityReport:
+        results = await self._security_results(token)
         now = utcnow()
         status, reason, reasons, next_review = decide(results, now, self.policy)
         warnings = sorted({w for r in results for w in r.warnings})
-        opp = opportunity_score(results) if status in ("WATCH", "HOLD") else None
-        return SecurityReport(mint=token.mint, analysis_version=ANALYSIS_VERSION, analyzed_at=now, status=status, reason=reason,
-                              reasons=reasons, warnings=warnings, checks=results, not_evaluated=NOT_EVALUATED,
+        if self.tracker is not None:
+            status, reason, reasons, next_review, extra, opp = self._signal_overlay(token, results, status, reason, reasons, next_review, now)
+            if opp is None and status in ("WATCH", "HOLD", "QUALIFIED"):
+                opp = opportunity_score(results)
+            results = results + extra
+            warnings = sorted({w for r in results for w in r.warnings})
+            version, not_eval = ANALYSIS_VERSION + "+signal", NOT_EVALUATED_LIVE
+        else:
+            opp = opportunity_score(results) if status in ("WATCH", "HOLD") else None
+            version, not_eval = ANALYSIS_VERSION, NOT_EVALUATED
+        return SecurityReport(mint=token.mint, analysis_version=version, analyzed_at=now, status=status, reason=reason,
+                              reasons=reasons, warnings=warnings, checks=results, not_evaluated=not_eval,
                               next_review_at=next_review, policy=self.policy.model_dump(), opportunity=opp)
 
 
@@ -1285,8 +1703,10 @@ class AnalysisWorker:
 
     def __init__(self, repo: Repository, analyzer: SecurityAnalyzer, queue: asyncio.Queue, health: HealthRegistry,
                  metrics: Metrics, *, retry_delays: list[float] | None = None, sleep=asyncio.sleep,
-                 save_all_attempts: bool = True, store_jobs: bool = True) -> None:
+                 save_all_attempts: bool = True, store_jobs: bool = True, review_save_seconds: float = 0.0) -> None:
         self.repo, self.analyzer, self.queue, self.health, self.metrics = repo, analyzer, queue, health, metrics
+        self.review_save_seconds = review_save_seconds
+        self._last_saved: dict[str, float] = {}
         self.retry_delays = retry_delays if retry_delays is not None else [5.0, 20.0, 60.0]
         self._sleep = sleep
         self.save_all_attempts, self.store_jobs = save_all_attempts, store_jobs
@@ -1299,7 +1719,18 @@ class AnalysisWorker:
         report = await self.analyzer.analyze(token)
         self.metrics.analyses += 1
         # Lean mode: skip saving intermediate "insufficient data" retries (each save is a billable write).
-        if self.save_all_attempts or final or report.status != "INSUFFICIENT_DATA":
+        should_save = self.save_all_attempts or final or report.status != "INSUFFICIENT_DATA"
+        if should_save and self.review_save_seconds > 0:
+            # Re-reviews every 30s must not burn the database quota: an unchanged verdict is saved at most every
+            # review_save_seconds. A status change and every QUALIFIED review (it must stay fresh) are always saved.
+            last, mono = self._last_saved.get(mint), time.monotonic()
+            if last is not None and report.status == token.status and report.status != "QUALIFIED" and mono - last < self.review_save_seconds:
+                should_save = False
+            else:
+                if len(self._last_saved) > 5000:
+                    self._last_saved.clear()
+                self._last_saved[mint] = mono
+        if should_save:
             report_id = await self.repo.save_security_report(report)
             score = report.opportunity["score"] if report.opportunity else None
             await self.repo.update_token_decision(mint, report.status, report.reason, report_id, report.analyzed_at, score)
@@ -1330,6 +1761,37 @@ class AnalysisWorker:
                 log.exception("analysis failed", extra={"mint": mint})
             finally:
                 self.queue.task_done()
+
+
+class ReviewScheduler:
+    """Re-queues watched tokens for a fresh signal check, and ends their watch window. When a window ends the token
+    gets one last analysis with no live data, so a BUY signal can never outlive its evidence."""
+
+    def __init__(self, tracker: TradeTracker, analysis_queue: asyncio.Queue, *, interval: float = 30.0, sleep=asyncio.sleep) -> None:
+        self.tracker, self.queue, self.interval, self._sleep = tracker, analysis_queue, interval, sleep
+
+    def _enqueue(self, mint: str) -> None:
+        if self.queue.maxsize and self.queue.qsize() > self.queue.maxsize * 0.8:
+            return  # never let reviews crowd out brand-new launches
+        try:
+            self.queue.put_nowait(mint)
+        except asyncio.QueueFull:
+            pass
+
+    def tick(self) -> None:
+        for mint in self.tracker.expired():
+            self.tracker.untrack(mint)
+            self._enqueue(mint)
+        for mint in self.tracker.due(self.interval):
+            self._enqueue(mint)
+
+    async def run(self) -> None:
+        while True:
+            await self._sleep(max(1.0, self.interval / 3))
+            try:
+                self.tick()
+            except Exception:
+                log.exception("review scheduler tick failed")
 
 
 # ============================================================================
@@ -1363,7 +1825,9 @@ class PumpPortalListener:
         stable_after: float = 30.0,
         clock=time.monotonic,
         rng=random.random,
+        tracker: TradeTracker | None = None,
     ) -> None:
+        self.tracker = tracker
         self.url, self.queue, self.health, self.metrics = url, queue, health, metrics
         self._connect, self._sleep = connect, sleep
         self._base, self._max, self._stable = base_delay, max_delay, stable_after
@@ -1372,6 +1836,11 @@ class PumpPortalListener:
     def _handle(self, raw) -> None:
         self.metrics.received += 1
         self.health.mark_message(LISTENER_PROVIDER)
+        if self.tracker is not None:
+            trade = parse_trade(raw)
+            if trade is not None:
+                self.tracker.add(trade)
+                return
         try:
             event = parse_message(raw)
         except ParseError as exc:
@@ -1388,6 +1857,20 @@ class PumpPortalListener:
             self.metrics.dropped_queue_full += 1
             log.error("queue full, launch event dropped", extra={"mint": event.mint})
 
+    async def _sub_pump(self, ws) -> None:
+        """Sends trade subscribe / unsubscribe requests for watched tokens over the one shared connection."""
+        try:
+            while True:
+                subs, unsubs = self.tracker.drain_subs()
+                for method, keys in (("subscribeTokenTrade", subs), ("unsubscribeTokenTrade", unsubs)):
+                    for i in range(0, len(keys), 50):
+                        await ws.send(json.dumps({"method": method, "keys": keys[i:i + 50]}))
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("trade subscription sender stopped", extra={"error": f"{type(exc).__name__}: {exc}"})
+
     async def run(self, stop: asyncio.Event) -> None:
         attempt = 0
         while not stop.is_set():
@@ -1398,10 +1881,18 @@ class PumpPortalListener:
                     started = self._clock()
                     self.health.mark_connected(LISTENER_PROVIDER)
                     log.info("connected and subscribed", extra={"url": self.url})
-                    async for raw in ws:
-                        self._handle(raw)
-                        if stop.is_set():
-                            break
+                    pump = None
+                    if self.tracker is not None:
+                        self.tracker.resubscribe_all()  # after a reconnect every watched token must be subscribed again
+                        pump = asyncio.create_task(self._sub_pump(ws), name="trade-subscriptions")
+                    try:
+                        async for raw in ws:
+                            self._handle(raw)
+                            if stop.is_set():
+                                break
+                    finally:
+                        if pump is not None:
+                            pump.cancel()
                 if not stop.is_set():
                     self.health.mark_disconnected(LISTENER_PROVIDER, "connection closed by server")
             except asyncio.CancelledError:
@@ -1523,7 +2014,15 @@ def policy_from_settings(s: Settings) -> SecurityPolicy:
     return SecurityPolicy(
         evidence_max_age_seconds=s.evidence_max_age_seconds, single_holder_reject_pct=s.single_holder_reject_pct,
         top10_hold_pct=s.top10_hold_pct, creator_hold_pct=s.creator_hold_pct, max_transfer_fee_bps=s.max_transfer_fee_bps,
-        creator_max_launches_24h=s.creator_max_launches_24h, min_curve_reserve_sol=s.min_curve_reserve_sol)
+        creator_max_launches_24h=s.creator_max_launches_24h, min_curve_reserve_sol=s.min_curve_reserve_sol,
+        **{k: getattr(s, k) for k in SIGNAL_POLICY_FIELDS})
+
+
+SIGNAL_POLICY_FIELDS = [
+    "signal_review_seconds", "signal_min_observe_seconds", "signal_min_trades", "signal_min_unique_buyers",
+    "signal_min_distinct_sellers", "signal_max_top_trader_pct", "signal_max_wash_pct", "signal_momentum_window_seconds",
+    "signal_min_mcap_change_pct", "signal_max_mcap_change_pct", "signal_max_drawdown_pct", "signal_min_buy_pressure_pct",
+    "signal_min_new_buyers", "signal_max_trade_age_seconds", "signal_max_mcap_sol", "signal_min_curve_sol", "qualify_min_score"]
 
 
 def _valid_mint(mint: str) -> str:
@@ -1835,17 +2334,20 @@ const STATUS_HELP = {
   REJECTED:"A verified, serious security problem was found.",
   INSUFFICIENT_DATA:"Some required checks could not be completed yet. Nothing is approved without them.",
   HOLD:"Something looks suspicious but is not proven. It needs a closer look.",
-  WATCH:"Every check built so far passed. This is not a buy signal.",
-  QUALIFIED:"All required checks and the opportunity bar were met.",
+  WATCH:"Security checks passed. The bot is now watching live trades; BUY only lights when all buy conditions are met.",
+  QUALIFIED:"Security passed and live buy conditions are met right now. Re-checked every 30 seconds.",
   REVOKED:"This token no longer meets the requirements."
 };
-const CHECK_TITLE = {mint_permissions:"Mint & freeze permissions",token_extensions:"Token rules & extensions",holder_concentration:"Holder concentration",creator_wallet:"Creator wallet",liquidity:"Liquidity"};
+const CHECK_TITLE = {mint_permissions:"Mint & freeze permissions",token_extensions:"Token rules & extensions",holder_concentration:"Holder concentration",creator_wallet:"Creator wallet",liquidity:"Liquidity",sell_evidence:"Sell evidence",trading_manipulation:"Trading manipulation",momentum:"Momentum"};
 const CHECK_HELP = {
   mint_permissions:"Can anyone create more tokens, or freeze holders' balances?",
   token_extensions:"Does the token have special rules like hidden fees or blocked transfers?",
   holder_concentration:"Do just a few wallets control most of the supply?",
   creator_wallet:"What has the wallet that launched this token been doing?",
-  liquidity:"Is there real money in the pool to trade against?"
+  liquidity:"Is there real money in the pool to trade against?",
+  sell_evidence:"Have other wallets actually sold on the curve, so exits work? (Observed on the live feed, not simulated.)",
+  trading_manipulation:"Is the trading organic, or one wallet / round-trip wash trading / a creator dump?",
+  momentum:"Is the price rising now, with real buyers, without being a vertical spike or already falling?"
 };
 const ICONS = {
   home:'<path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v10h5v-6h4v6h5V10"/>',
@@ -1901,14 +2403,30 @@ function logo(size) {
     '<path d="M13.5 20h3l2-4.5 3 9 2-4.5h3" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>';
   return s;
 }
+// Last good answer for every request, so a screen can be painted instantly when you come back to it.
+const CACHE = new Map();
+let cacheOnly = false;
 async function api(path) {
-  const r = await fetch(API + path, {cache: "no-store"});
-  if (!r.ok) {
-    let d = "HTTP " + r.status;
-    try { const j = await r.json(); if (j.detail) d = j.detail; } catch (e) {}
-    const err = new Error(d); err.status = r.status; throw err;
+  if (cacheOnly) {
+    if (CACHE.has(path)) return CACHE.get(path);
+    const miss = new Error("not cached yet"); miss.noCache = true; throw miss;
   }
-  return r.json();
+  const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch(API + path, {cache: "no-store", signal: ctl.signal});
+    if (!r.ok) {
+      let d = "HTTP " + r.status;
+      try { const j = await r.json(); if (j.detail) d = j.detail; } catch (e) {}
+      const err = new Error(d); err.status = r.status; throw err;
+    }
+    const j = await r.json();
+    CACHE.delete(path); CACHE.set(path, j);
+    if (CACHE.size > 80) CACHE.delete(CACHE.keys().next().value);
+    return j;
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error("the server took too long to answer");
+    throw e;
+  } finally { clearTimeout(to); }
 }
 const short = (a, n = 4) => !a ? "—" : a.length <= 2 * n + 1 ? a : a.slice(0, n) + "…" + a.slice(-n);
 const fmt = (iso) => iso ? new Date(iso).toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : "—";
@@ -1919,7 +2437,8 @@ function ago(iso) {
   if (s < 86400) return Math.floor(s / 3600) + "h ago"; return Math.floor(s / 86400) + "d ago";
 }
 function setNum(el, n) {
-  const from = el._v || 0; el._v = n;
+  if (el._v === undefined) { el._v = n; el.textContent = Number(n).toLocaleString(); return; }
+  const from = el._v; el._v = n;
   if (from === n) { el.textContent = Number(n).toLocaleString(); return; }
   const t0 = performance.now();
   (function step(t) {
@@ -1999,7 +2518,7 @@ function tokRow(t, withReason, extra) {
       h("div", {class: "tt"}, h("b", {}, t.symbol || "—"), h("span", {}, t.name || "Unnamed")),
       h("div", {class: "ts"}, short(t.mint, 5) + " · " + ago(t.detected_at)),
       withReason && t.status_reason ? h("div", {class: "why"}, t.status_reason) : null),
-    h("div", {class: "tr"}, h("div", {class: "trr"}, t.status === "QUALIFIED" ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
+    h("div", {class: "tr"}, h("div", {class: "trr"}, t.status === "QUALIFIED" && t.status_updated_at && (Date.now() - new Date(t.status_updated_at).getTime()) < 180000 ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
 }
 const skeleton = (n) => h("div", {class: "card list"}, Array.from({length: n || 6}, () => h("div", {class: "skrow"})));
 const empty = (iconName, title, text) => h("div", {class: "card empty"}, h("div", {class: "eic"}, icon(iconName, 26)), h("b", {}, title), text || "");
@@ -2141,13 +2660,13 @@ function holdersBlock(c) {
 function evidenceCard(o) {
   const c = o.score >= 70 ? "#34d399" : o.score >= 50 ? "#4c9bff" : "#ffb340";
   return h("div", {class: "card pad", style: "margin-top:12px"},
-    h("div", {style: "display:flex;align-items:baseline;justify-content:space-between"}, h("b", {}, "Evidence score"), h("span", {class: "dim", style: "font-size:12px"}, "partial · " + o.available_weight + "% of planned inputs")),
+    h("div", {style: "display:flex;align-items:baseline;justify-content:space-between"}, h("b", {}, "Evidence score"), h("span", {class: "dim", style: "font-size:12px"}, (o.complete ? "complete · includes live trade data" : "partial · " + o.available_weight + "% of planned inputs"))),
     h("div", {style: "font-size:44px;font-weight:800;letter-spacing:-.04em;color:" + c}, o.score.toFixed(1), h("span", {class: "dim", style: "font-size:16px;font-weight:600"}, " / 100")),
     o.components.map((x) => h("div", {style: "margin:12px 0"},
       h("div", {class: "hrow"}, h("span", {}, x.name.replace(/_/g, " ") + " (weight " + x.weight + ")"), h("b", {style: "color:var(--text)"}, x.score.toFixed(0))),
       h("div", {class: "stack", style: "height:8px;margin:4px 0"}, h("span", {style: "width:" + Math.max(1, x.score) + "%;background:" + c})),
       h("div", {class: "dim", style: "font-size:12px"}, x.detail))),
-    h("p", {class: "dim", style: "font-size:12px;margin:10px 0 0"}, "Not scored yet (never guessed): " + o.missing.join(", ") + ". " + o.note));
+    h("p", {class: "dim", style: "font-size:12px;margin:10px 0 0"}, (o.missing.length ? "Not scored yet (never guessed): " + o.missing.join(", ") + ". " : "") + o.note));
 }
 
 function checkRow(c) {
@@ -2181,8 +2700,11 @@ const axiomUrl = (t) => t.bonding_curve ? "https://axiom.trade/meme/" + t.bondin
 
 // Plain-language action derived ONLY from the verdict. The bot has no price/momentum/sell-simulation data yet,
 // so it never says "buy now" for WATCH; only QUALIFIED is a buy candidate. It does not track your positions.
-function actionFor(status, hist) {
+function actionFor(status, hist, rep) {
   const r = actionBase(status, hist);
+  if (status === "QUALIFIED" && !(rep && (Date.now() - new Date(rep.analyzed_at).getTime()) < 180000)) {
+    return {light: "wait", c: "#6b7686", a: "WAIT: signal expired", why: "The last live check of this token is more than 3 minutes old, so the BUY signal is no longer trusted. Re-check on Axiom.", sell: null};
+  }
   const prev = hist && hist.length > 1 ? hist[1].status : null;
   if (prev && ["WATCH", "QUALIFIED"].includes(prev) && ["REJECTED", "REVOKED", "HOLD"].includes(status)) r.light = "sell";
   return r;
@@ -2194,8 +2716,8 @@ function actionBase(status, hist) {
     ? "Downgraded: this token was " + LABEL[prev] + " earlier and is now " + LABEL[status] + ". Do not buy."
     : null;
   switch (status) {
-    case "QUALIFIED": return {light: "buy", c: "#2ebd85", a: "BUY CANDIDATE", why: "Passed every check. Confirm the chart and price on Axiom, then size your own entry.", sell: SELL_BAD};
-    case "WATCH": return {light: "wait", c: "#3b82f6", a: "WAIT: not a buy yet", why: "Security checks passed, but sell simulation and momentum checks do not exist yet, so the bot cannot call a buy. Open Axiom and judge the chart yourself.", sell: SELL_BAD};
+    case "QUALIFIED": return {light: "buy", c: "#2ebd85", a: "BUY CANDIDATE", why: "Security passed and the live buy conditions are met right now (real buyers, sells working, price rising, no manipulation seen). Check the chart on Axiom before you buy. This is a signal, not a guarantee.", sell: SELL_BAD};
+    case "WATCH": return {light: "wait", c: "#3b82f6", a: "WAIT: not a buy yet", why: prev === "QUALIFIED" ? "The buy window has closed: it was a BUY signal earlier but the live conditions no longer all hold. Do not chase it." : "Security checks passed. The bot is watching live trades and lights BUY only when momentum, real buyers and sell evidence all line up. See Security checks below for what is still missing.", sell: SELL_BAD};
     case "HOLD": return {light: "wait", c: "#f5a524", a: "WAIT: do not buy", why: "Something suspicious is unresolved.", sell: SELL_BAD};
     case "REJECTED": case "REVOKED": return {light: "sell", c: "#f6465d", a: "AVOID: do not buy", why: "A verified serious problem was found.", sell: SELL_BAD};
     default: return {light: "wait", c: "#6b7686", a: "WAIT: not enough data", why: "The security engine has not finished. Do not buy yet.", sell: null};
@@ -2206,7 +2728,7 @@ function tokenView(mint) {
   const top = h("div"), bottom = h("div");
   top.append(skeleton(3));
   const chart = chartCard(mint);   // built once and never re-rendered, so the chart does not reload every refresh
-  const root = h("div", {}, h("a", {href: "#/scanner", class: "back"}, icon("back", 18), "Back"), top, chart, bottom);
+  const root = h("div", {}, h("a", {href: "#/scanner", class: "back", onclick: (e) => { if (navDepth > 1) { e.preventDefault(); history.back(); } }}, icon("back", 18), "Back"), top, chart, bottom);
   let lastKey = "";
   async function refresh() {
     const t = await api("/tokens/" + encodeURIComponent(mint));
@@ -2227,12 +2749,12 @@ function tokenView(mint) {
         h("p", {}, r ? r.reason : t.status_reason),
         r && r.warnings.length ? h("ul", {class: "warns"}, r.warnings.map((x) => h("li", {}, x))) : null,
         r ? h("p", {class: "dim", style: "font-size:12px"}, "Analysed " + ago(r.analyzed_at) + " · logic " + r.analysis_version + (r.next_review_at ? " · next review " + fmt(r.next_review_at) : "")) : null),
-      (() => { const a = actionFor(t.status, hist); return h("section", {class: "action", style: "--c:" + a.c},
+      (() => { const a = actionFor(t.status, hist, r); return h("section", {class: "action", style: "--c:" + a.c},
         h("div", {class: "k"}, "Signal board"),
         h("div", {class: "board"}, [["buy", "BUY"], ["wait", "WAIT"], ["sell", "AVOID"]].map(([k, l]) => h("div", {class: "lt " + k + (a.light === k ? " on" : "")}, l))),
         h("div", {class: "a"}, a.a), h("p", {class: "mute"}, a.why),
         a.sell ? h("p", {class: "sell", style: "font-weight:650"}, a.sell) : null,
-        h("p", {class: "dim", style: "font-size:12px"}, "The BUY light only turns on for Qualified, which needs price, momentum and sell checks that are not built yet, so it stays off for now. AVOID lights when a token is rejected or downgraded. Not financial advice.")); })(),
+        h("p", {class: "dim", style: "font-size:12px"}, "BUY lights only when every live condition holds right now and goes off the moment one fails. AVOID lights for rejected or suspicious tokens. It is a signal from public trade data, not a guarantee. Not financial advice.")); })(),
       r && r.opportunity ? evidenceCard(r.opportunity) : null,
       h("div", {class: "facts"}, fact("Detected", fmt(t.detected_at)), fact("Launch time", t.launch_timestamp ? fmt(t.launch_timestamp) : "Not supplied"), fact("Creator", short(t.creator, 6), true), fact("Bonding curve", short(t.bonding_curve, 6), true)),
       h("div", {class: "btns"},
@@ -2277,7 +2799,7 @@ let timer = null, gen = 0;
 function build(name, arg) {
   switch (name) {
     case "scanner": return listView({title: "Scanner", subtitle: "Every new launch, newest first. Search or filter by security status.", url: "/tokens/recent?limit=200", search: true, icon: "radar", emptyTitle: "No tokens detected yet", emptyText: "If the backend is running, open System health to confirm the feed is connected."});
-    case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check built so far, best evidence score first. A pick is not a buy signal and not a guarantee of safety.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=score", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes all checks. Qualified is not possible until sell simulation and market scoring exist."});
+    case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check, best evidence score first. Only a pulsing BUY chip means live buy conditions are met right now. Never a guarantee.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=score", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes the security checks. BUY needs live momentum, real buyers and sell evidence on top."});
     case "review": case "investigating": return listView({title: "In review", subtitle: "Required evidence is missing, or something suspicious is unresolved.", url: "/tokens/recent?limit=200&status=INSUFFICIENT_DATA,HOLD", icon: "eye", emptyTitle: "Nothing in review", emptyText: "Tokens land here while data is being collected, or when something looks suspicious but is not proven."});
     case "rejected": return listView({title: "Rejected", subtitle: "A verified, serious security problem was found. Open a token to see the exact evidence.", url: "/tokens/recent?limit=200&status=REJECTED,REVOKED", icon: "ban", emptyTitle: "No rejected tokens", emptyText: "Rejections appear here with the on-chain evidence behind them."});
     case "system": return systemView();
@@ -2296,19 +2818,35 @@ async function pickWatcher() {
     if (fresh.length) { newPicks += fresh.length; toast("New pick: " + (fresh[0].symbol || "token") + (fresh.length > 1 ? " +" + (fresh.length - 1) + " more" : ""), 5000); updateTitle(); }
   } catch (e) { /* the banner already reports connection problems */ }
 }
-function route() {
+let prevHash = null, navDepth = 0, currentRun = null;
+const SCROLL = new Map();
+document.addEventListener("visibilitychange", () => { if (!document.hidden && currentRun) currentRun(); });
+async function route() {
   clearInterval(timer);
+  navDepth++;
+  if (prevHash !== null) SCROLL.set(prevHash, window.scrollY);
+  prevHash = location.hash;
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   let name = parts[0] || "", arg = decodeURIComponent(parts[1] || "");
   if (name === "investigating") name = "review";
   if (name === "passed") { newPicks = 0; updateTitle(); }
   document.querySelectorAll("[data-r]").forEach((a) => a.classList.toggle("on", a.dataset.r === name || (name === "token" && a.dataset.r === "scanner")));
   const view = build(name, arg), my = ++gen;
-  app.replaceChildren(view.root); banner.style.display = "none"; window.scrollTo(0, 0);
+  app.replaceChildren(view.root); banner.style.display = "none";
+  let painted = false;
+  cacheOnly = true;  // instant paint from the last data received: no placeholders, no zeros
+  try { await view.refresh(); painted = true; } catch (e) { /* first visit: placeholders stay until data arrives */ } finally { cacheOnly = false; }
+  if (my !== gen) return;
+  window.scrollTo(0, painted ? (SCROLL.get(location.hash) || 0) : 0);
+  let busy = false;
   const run = async () => {
+    if (busy || document.hidden || my !== gen) return;
+    busy = true;
     try { await view.refresh(); if (my === gen) banner.style.display = "none"; }
     catch (e) { if (my === gen) { banner.textContent = "Can't reach live data (" + e.message + "). Showing the last data received. Retrying automatically."; banner.style.display = "block"; } }
+    finally { busy = false; }
   };
+  currentRun = run;
   run(); timer = setInterval(run, view.every);
 }
 async function pill2() {
@@ -2712,12 +3250,22 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                                    max_new_per_day=settings.max_new_tokens_per_day)
         tasks = [asyncio.create_task(processor.run(), name="processor")]
         analysis_tasks: list[asyncio.Task] = []
+        tracker = None
+        if settings.analysis_enabled and settings.listener_enabled and settings.signals_enabled:
+            tracker = TradeTracker(settings.signal_window_minutes * 60, settings.signal_max_tracked,
+                                   momentum_window=settings.signal_momentum_window_seconds)
+        app.state.tracker = tracker
         if settings.analysis_enabled:
-            analyzer = SecurityAnalyzer(solana, repo, policy_from_settings(settings))
+            analyzer = SecurityAnalyzer(solana, repo, policy_from_settings(settings), tracker=tracker,
+                                        security_cache_seconds=settings.security_recheck_seconds)
             for i in range(settings.analysis_workers):
                 worker = AnalysisWorker(repo, analyzer, analysis_queue, health, metrics, retry_delays=settings.retry_delay_list,
-                                        save_all_attempts=settings.save_all_attempts, store_jobs=settings.store_jobs)
+                                        save_all_attempts=settings.save_all_attempts, store_jobs=settings.store_jobs,
+                                        review_save_seconds=settings.review_save_seconds if tracker else 0.0)
                 analysis_tasks.append(asyncio.create_task(worker.run(), name=f"analysis-{i}"))
+            if tracker is not None:
+                analysis_tasks.append(asyncio.create_task(
+                    ReviewScheduler(tracker, analysis_queue, interval=settings.signal_review_seconds).run(), name="signal-reviews"))
             try:  # resume jobs left pending by a restart (only possible when jobs are stored)
                 for mint in (await repo.list_pending_jobs(500) if settings.store_jobs else []):
                     analysis_queue.put_nowait(mint)
@@ -2729,7 +3277,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             listener = PumpPortalListener(
                 settings.pumpportal_ws_url, queue, health, metrics,
                 base_delay=settings.reconnect_base_seconds, max_delay=settings.reconnect_max_seconds,
-                stable_after=settings.stable_connection_seconds)
+                stable_after=settings.stable_connection_seconds, tracker=tracker)
             tasks.append(asyncio.create_task(listener.run(stop), name="listener"))
         else:
             log.warning("listener disabled by configuration")

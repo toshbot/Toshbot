@@ -887,3 +887,224 @@ async def test_firestore_dedupes_and_lists():
     assert any(t.mint == token.mint for t in await repo.list_recent_tokens(50))
     assert await repo.ping()
     await repo.aclose()
+
+
+# ----------------------------------------------------------------------
+# test_buy_signal  (live trade feed -> QUALIFIED / BUY)
+# ----------------------------------------------------------------------
+T0 = 1_000_000.0
+
+
+def sig_wallet(i: int) -> str:
+    return fixture_mint(20 + i)
+
+
+def feed(tracker, mint, *, buyers=12, sellers=3, mcap0=30.0, mcap1=34.0, start=T0, end=T0 + 140, creator_sells=0.0,
+         buy_sol=0.5, sell_sol=0.3, last_gap=0.0):
+    """Synthetic, clearly fake trades spread over start..end with a smoothly rising market cap."""
+    n = buyers + sellers + (1 if creator_sells else 0)
+    ts_end = end - last_gap
+    trades = []
+    for k in range(n):
+        ts = start + 1 + (ts_end - start - 1) * k / max(1, n - 1)
+        mcap = mcap0 + (mcap1 - mcap0) * k / max(1, n - 1)
+        if k < buyers:
+            trades.append(Trade(mint, sig_wallet(k), "buy", buy_sol, 1000.0, mcap, ts))
+        elif k < buyers + sellers:
+            trades.append(Trade(mint, sig_wallet(k - buyers), "sell", sell_sol, 500.0, mcap, ts))
+        else:
+            trades.append(Trade(mint, FIXTURE_CREATOR, "sell", creator_sells, 500.0, mcap, ts))
+    for t in trades:
+        tracker.add(t)
+
+
+class Clock:
+    def __init__(self, t=T0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def signal_setup(**feed_kw):
+    clock = Clock()
+    tracker = TradeTracker(1800, 150, clock=clock)
+    token = fixture_token()
+    assert tracker.track(token.mint, token.creator)
+    feed(tracker, token.mint, **feed_kw)
+    clock.t = T0 + 140
+    return clock, tracker, token
+
+
+def analyze_with(tracker, token, curve_sol=20.0):
+    repo = InMemoryRepository()
+    rpc = FakeRPC(curve_lamports=int(curve_sol * 1e9))
+    analyzer = SecurityAnalyzer(rpc, repo, SecurityPolicy(), tracker=tracker)
+
+    async def go():
+        await repo.create_token_if_absent(token)
+        return await analyzer.analyze(token)
+
+    return asyncio.run(go())
+
+
+def test_parse_trade_accepts_only_wellformed_buys_and_sells():
+    good = json.dumps({"mint": fixture_mint(1), "traderPublicKey": FIXTURE_CREATOR, "txType": "buy", "solAmount": 0.5,
+                       "tokenAmount": 100.0, "marketCapSol": 31.2})
+    t = parse_trade(good, now=5.0)
+    assert (t.side, t.sol, t.mcap_sol, t.ts) == ("buy", 0.5, 31.2, 5.0)
+    assert parse_trade(create_message(1)) is None                       # launches are not trades
+    assert parse_trade("garbage") is None and parse_trade("{}") is None
+    assert parse_trade(json.dumps({"mint": fixture_mint(1), "txType": "buy", "solAmount": 1})) is None  # no wallet
+    assert parse_trade(json.dumps({"mint": fixture_mint(1), "traderPublicKey": FIXTURE_CREATOR, "txType": "buy", "solAmount": -1})) is None
+
+
+def test_buy_signal_fires_when_every_condition_holds():
+    _, tracker, token = signal_setup()
+    report = analyze_with(tracker, token)
+    assert report.status == "QUALIFIED", report.reason
+    assert report.opportunity["complete"] and report.opportunity["score"] >= SecurityPolicy().qualify_min_score
+    names = {c.name: c.status for c in report.checks}
+    assert names["sell_evidence"] == names["trading_manipulation"] == names["momentum"] == "PASS"
+
+
+def test_no_buy_without_enough_trade_evidence():
+    clock, tracker, token = signal_setup(buyers=4, sellers=1)
+    report = analyze_with(tracker, token)
+    assert report.status == "WATCH" and "No buy signal yet" in report.reason
+
+
+def test_no_buy_without_sell_evidence():
+    _, tracker, token = signal_setup(sellers=0)
+    report = analyze_with(tracker, token)
+    assert report.status == "WATCH"
+    assert {c.name: c.status for c in report.checks}["sell_evidence"] == "UNAVAILABLE"
+
+
+def test_no_buy_when_price_is_falling_or_flat():
+    _, tracker, token = signal_setup(mcap0=34.0, mcap1=30.0)
+    assert analyze_with(tracker, token).status == "WATCH"
+    _, tracker, token = signal_setup(mcap0=30.0, mcap1=30.0)
+    assert analyze_with(tracker, token).status == "WATCH"
+
+
+def test_no_buy_on_a_vertical_spike():
+    _, tracker, token = signal_setup(mcap0=20.0, mcap1=60.0)
+    report = analyze_with(tracker, token)
+    assert report.status == "WATCH" and "vertical spike" in report.reason
+
+
+def test_creator_selling_puts_the_token_on_hold():
+    _, tracker, token = signal_setup(creator_sells=1.0)
+    report = analyze_with(tracker, token)
+    assert report.status == "HOLD" and "creator sold" in report.reason
+
+
+def test_one_wallet_dominating_volume_is_suspicious():
+    clock, tracker, token = signal_setup()
+    for k in range(3):  # a whale trading back and forth
+        tracker.add(Trade(token.mint, sig_wallet(30), "buy", 6.0, 1.0, 34.0, T0 + 130 + k))
+    report = analyze_with(tracker, token)
+    assert report.status == "HOLD"
+
+
+def test_stale_trade_feed_cannot_be_a_buy():
+    _, tracker, token = signal_setup(last_gap=100.0)  # last trade is 100s old
+    report = analyze_with(tracker, token)
+    assert report.status == "WATCH" and "no trade in the last" in report.reason
+
+
+def test_buy_signal_cannot_outlive_its_watch_window():
+    _, tracker, token = signal_setup()
+    assert analyze_with(tracker, token).status == "QUALIFIED"
+    tracker.untrack(token.mint)  # window ended
+    assert not tracker.track(token.mint, token.creator)  # and it can never be re-watched
+    assert analyze_with(tracker, token).status == "WATCH"
+
+
+def test_rejected_token_is_never_a_buy_and_stops_being_watched():
+    clock, tracker, token = signal_setup()
+    clock.t = T0 + 140
+    repo = InMemoryRepository()
+    bad = mint_account(freeze=OTHER1)  # freeze authority present = critical failure
+    analyzer = SecurityAnalyzer(FakeRPC(mint=bad, curve_lamports=20 * 10**9), repo, SecurityPolicy(), tracker=tracker)
+    report = asyncio.run(analyzer.analyze(token))
+    assert report.status == "REJECTED" and not tracker.is_tracked(token.mint)
+
+
+def test_without_a_tracker_nothing_is_ever_qualified():
+    report = asyncio.run(SecurityAnalyzer(FakeRPC(curve_lamports=20 * 10**9), InMemoryRepository(), SecurityPolicy()).analyze(fixture_token()))
+    assert report.status == "WATCH"
+
+
+def test_tracker_subscriptions_and_capacity():
+    tracker = TradeTracker(60, 2, clock=Clock())
+    assert tracker.track(fixture_mint(1)) and tracker.track(fixture_mint(2)) and not tracker.track(fixture_mint(3))
+    subs, unsubs = tracker.drain_subs()
+    assert sorted(subs) == sorted([fixture_mint(1), fixture_mint(2)]) and unsubs == []
+    tracker.untrack(fixture_mint(1))
+    assert tracker.drain_subs() == ([], [fixture_mint(1)])
+    tracker.resubscribe_all()
+    assert tracker.drain_subs()[0] == [fixture_mint(2)]
+
+
+def test_trades_for_unwatched_tokens_are_ignored():
+    tracker = TradeTracker(60, 5, clock=Clock())
+    assert not tracker.add(Trade(fixture_mint(5), sig_wallet(1), "buy", 1.0, 1.0, 30.0, T0))
+
+
+def test_listener_routes_trades_and_subscribes_watched_tokens():
+    async def go():
+        clock = Clock()
+        tracker = TradeTracker(1800, 10, clock=clock)
+        mint = fixture_mint(4)
+        tracker.track(mint, FIXTURE_CREATOR)
+        stop = asyncio.Event()
+        trade = json.dumps({"mint": mint, "traderPublicKey": sig_wallet(1), "txType": "buy", "solAmount": 0.4, "marketCapSol": 31.0})
+        class SlowWS(FakeWS):  # stays connected a moment, like a real feed, so the subscription sender gets to run
+            async def _gen(self):
+                async for m in super()._gen():
+                    yield m
+                await asyncio.sleep(0.1)
+
+        ws = SlowWS([trade, create_message(1)], on_done=stop.set)
+        listener, queue, *_ = build_listener([ws], tracker=tracker)
+        task = asyncio.create_task(listener.run(stop))
+        await asyncio.sleep(0.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert tracker.trades_seen == 1 and queue.qsize() == 1  # the trade fed the tracker; only the launch was queued
+        sent = [json.loads(x) for x in ws.sent]
+        assert {"method": "subscribeNewToken"} in sent
+        assert {"method": "subscribeTokenTrade", "keys": [mint]} in sent
+    asyncio.run(go())
+
+
+def test_review_scheduler_requeues_and_ends_windows():
+    clock = Clock()
+    tracker = TradeTracker(100, 10, clock=clock)
+    tracker.track(fixture_mint(1))
+    q: asyncio.Queue = asyncio.Queue()
+    sched = ReviewScheduler(tracker, q, interval=30)
+    clock.t = T0 + 31
+    sched.tick()
+    assert q.qsize() == 1 and tracker.is_tracked(fixture_mint(1))
+    clock.t = T0 + 101
+    sched.tick()
+    assert q.qsize() == 2 and not tracker.is_tracked(fixture_mint(1))  # one final analysis, then the watch ends
+
+
+def test_unchanged_reviews_are_not_saved_every_time():
+    async def go():
+        repo = InMemoryRepository()
+        token = fixture_token()
+        await repo.create_token_if_absent(token)
+        worker = AnalysisWorker(repo, SecurityAnalyzer(FakeRPC(), repo, SecurityPolicy()), asyncio.Queue(), HealthRegistry(), Metrics(),
+                                review_save_seconds=1000)
+        for _ in range(3):
+            await worker.analyze_once(token.mint)
+        assert len(repo.reports[token.mint]) == 1  # saved once (INSUFFICIENT -> WATCH); the two unchanged re-reviews are skipped
+    asyncio.run(go())
