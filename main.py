@@ -39,7 +39,7 @@ import base64
 import hmac
 from pathlib import Path
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 log = logging.getLogger("tosh")
@@ -71,6 +71,13 @@ class Settings(BaseSettings):
     feed_stale_after_seconds: float = 120.0
     queue_maxsize: int = 1000
     processor_max_attempts: int = 3
+
+    # Firestore cost control (the free plan allows 20,000 writes and 50,000 reads per day)
+    cache_recent_tokens: int = 1000        # keep the newest N tokens in memory so the dashboard costs zero reads
+    store_launch_events: bool = False      # raw launch event documents (1 extra write per token)
+    store_jobs: bool = False               # analysis job documents (2 extra writes per token; only needed to resume after a restart)
+    save_all_attempts: bool = False        # False = save only the final analysis report instead of every retry
+    max_new_tokens_per_day: int = 0        # 0 = unlimited. Set e.g. 5000 to stay inside the free write quota
 
     # Solana RPC (use a dedicated provider URL, e.g. Helius, for real use; keep the key only in env vars)
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
@@ -379,6 +386,7 @@ class Metrics:
     failed_jobs: int = 0
     analyses: int = 0
     failed_analyses: int = 0
+    throttled: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -682,6 +690,104 @@ class InMemoryRepository(Repository):
 
     async def ping(self) -> bool:
         return True
+
+
+class CachedRepository(Repository):
+    """Wraps a real repository and answers the dashboard's reads from memory.
+
+    Keeps the newest N tokens, status counts and per-creator launch times in RAM, so refreshing the dashboard
+    costs zero database reads. Writes still go to the real database. Limits: only the newest N tokens are
+    listable, and creator launch counts cover launches since the last restart plus the cached tokens."""
+
+    def __init__(self, inner: Repository, size: int = 1000) -> None:
+        self.inner, self.size = inner, size
+        self.recent: dict[str, TokenRecord] = {}  # oldest first
+        self.counts: dict[str, int] = {}
+        self.creator_log: dict[str, list[datetime]] = {}
+        self.warm_ok = False
+
+    async def warm(self) -> None:
+        tokens = await self.inner.list_recent_tokens(self.size)
+        counts = await self.inner.count_tokens_by_status()
+        self.recent = {t.mint: t for t in reversed(tokens)}
+        self.counts = dict(counts)
+        self.creator_log = {}
+        for t in tokens:
+            if t.creator:
+                self.creator_log.setdefault(t.creator, []).append(t.detected_at)
+        self.warm_ok = True
+
+    def _bump(self, status: str, delta: int) -> None:
+        self.counts[status] = max(0, self.counts.get(status, 0) + delta)
+
+    async def record_launch_event(self, event: LaunchEvent) -> bool:
+        return await self.inner.record_launch_event(event)
+
+    async def create_token_if_absent(self, token: TokenRecord) -> bool:
+        created = await self.inner.create_token_if_absent(token)
+        if created and self.warm_ok:
+            self.recent[token.mint] = token
+            while len(self.recent) > self.size:
+                self.recent.pop(next(iter(self.recent)))
+            self._bump(token.status, 1)
+            if token.creator:
+                log_ = self.creator_log.setdefault(token.creator, [])
+                log_.append(token.detected_at)
+                if len(log_) > 300:
+                    del log_[:-300]
+        return created
+
+    async def create_analysis_job(self, mint: str) -> bool:
+        return await self.inner.create_analysis_job(mint)
+
+    async def list_recent_tokens(self, limit: int, statuses: list[str] | None = None) -> list[TokenRecord]:
+        if not self.warm_ok:
+            return await self.inner.list_recent_tokens(limit, statuses)
+        items = [t for t in self.recent.values() if not statuses or t.status in statuses]
+        return sorted(items, key=lambda t: t.detected_at, reverse=True)[:limit]
+
+    async def count_tokens_by_status(self) -> dict[str, int]:
+        return dict(self.counts) if self.warm_ok else await self.inner.count_tokens_by_status()
+
+    async def get_token(self, mint: str) -> TokenRecord | None:
+        return self.recent.get(mint) or await self.inner.get_token(mint)
+
+    async def update_token_decision(self, mint, status, reason, report_id, at) -> None:
+        old = self.recent.get(mint)
+        if old is None and self.warm_ok:
+            old = await self.inner.get_token(mint)  # rare: token older than the cache window
+        await self.inner.update_token_decision(mint, status, reason, report_id, at)
+        if self.warm_ok and old is not None:
+            self._bump(old.status, -1)
+            self._bump(status, 1)
+            if mint in self.recent:
+                self.recent[mint] = old.model_copy(update={"status": status, "status_reason": reason, "latest_report_id": report_id, "status_updated_at": at})
+
+    async def save_security_report(self, report: SecurityReport) -> str:
+        return await self.inner.save_security_report(report)
+
+    async def get_latest_report(self, mint: str) -> SecurityReport | None:
+        return await self.inner.get_latest_report(mint)
+
+    async def list_reports(self, mint: str, limit: int) -> list[SecurityReport]:
+        return await self.inner.list_reports(mint, limit)
+
+    async def list_pending_jobs(self, limit: int) -> list[str]:
+        return await self.inner.list_pending_jobs(limit)
+
+    async def complete_job(self, mint: str, status: str) -> None:
+        await self.inner.complete_job(mint, status)
+
+    async def count_recent_tokens_by_creator(self, creator: str, since: datetime) -> int:
+        if not self.warm_ok:
+            return await self.inner.count_recent_tokens_by_creator(creator, since)
+        return sum(1 for ts in self.creator_log.get(creator, []) if ts >= since)
+
+    async def ping(self) -> bool:
+        return await self.inner.ping()
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
 
 
 class FirestoreRepository(Repository):
@@ -1089,32 +1195,37 @@ class AnalysisWorker:
     and updates the token's current status. Re-tries only while evidence is unavailable."""
 
     def __init__(self, repo: Repository, analyzer: SecurityAnalyzer, queue: asyncio.Queue, health: HealthRegistry,
-                 metrics: Metrics, *, retry_delays: list[float] | None = None, sleep=asyncio.sleep) -> None:
+                 metrics: Metrics, *, retry_delays: list[float] | None = None, sleep=asyncio.sleep,
+                 save_all_attempts: bool = True, store_jobs: bool = True) -> None:
         self.repo, self.analyzer, self.queue, self.health, self.metrics = repo, analyzer, queue, health, metrics
         self.retry_delays = retry_delays if retry_delays is not None else [5.0, 20.0, 60.0]
         self._sleep = sleep
+        self.save_all_attempts, self.store_jobs = save_all_attempts, store_jobs
 
-    async def analyze_once(self, mint: str) -> SecurityReport | None:
+    async def analyze_once(self, mint: str, final: bool = True) -> SecurityReport | None:
         token = await self.repo.get_token(mint)
         if token is None:
             log.error("analysis requested for unknown token", extra={"mint": mint})
             return None
         report = await self.analyzer.analyze(token)
-        report_id = await self.repo.save_security_report(report)
-        await self.repo.update_token_decision(mint, report.status, report.reason, report_id, report.analyzed_at)
         self.metrics.analyses += 1
-        log.info("analysis complete", extra={"mint": mint, "status": report.status, "report_id": report_id})
+        # Lean mode: skip saving intermediate "insufficient data" retries (each save is a billable write).
+        if self.save_all_attempts or final or report.status != "INSUFFICIENT_DATA":
+            report_id = await self.repo.save_security_report(report)
+            await self.repo.update_token_decision(mint, report.status, report.reason, report_id, report.analyzed_at)
+            log.info("analysis complete", extra={"mint": mint, "status": report.status, "report_id": report_id})
         return report
 
     async def process(self, mint: str) -> None:
         report = None
-        for delay in [0.0, *self.retry_delays]:
+        delays = [0.0, *self.retry_delays]
+        for i, delay in enumerate(delays):
             if delay:
                 await self._sleep(delay)
-            report = await self.analyze_once(mint)
+            report = await self.analyze_once(mint, final=(i == len(delays) - 1))
             if report is None or report.status != "INSUFFICIENT_DATA":
                 break
-        if report is not None:
+        if report is not None and self.store_jobs:
             await self.repo.complete_job(mint, report.status)
 
     async def run(self) -> None:
@@ -1229,17 +1340,29 @@ class TokenProcessor:
     """Consumes launch events from the queue: record event, register token once, create analysis job."""
 
     def __init__(self, repo: Repository, queue: asyncio.Queue, health: HealthRegistry, metrics: Metrics,
-                 *, max_attempts: int = 3, sleep=asyncio.sleep, analysis_queue: asyncio.Queue | None = None) -> None:
+                 *, max_attempts: int = 3, sleep=asyncio.sleep, analysis_queue: asyncio.Queue | None = None,
+                 store_events: bool = True, store_jobs: bool = True, max_new_per_day: int = 0) -> None:
         self.repo, self.queue, self.health, self.metrics = repo, queue, health, metrics
         self.max_attempts, self._sleep = max_attempts, sleep
         self.analysis_queue = analysis_queue
+        self.store_events, self.store_jobs, self.max_new_per_day = store_events, store_jobs, max_new_per_day
+        self._day, self._day_count = utcnow().date(), 0
 
     async def handle(self, event: LaunchEvent) -> bool:
         """Idempotent: safe to retry and safe for duplicate / delayed / out-of-order events."""
-        await self.repo.record_launch_event(event)
+        today = utcnow().date()
+        if today != self._day:
+            self._day, self._day_count = today, 0
+        if self.max_new_per_day and self._day_count >= self.max_new_per_day:
+            self.metrics.throttled += 1  # daily limit reached: protects the free database quota
+            return False
+        if self.store_events:
+            await self.repo.record_launch_event(event)
         created = await self.repo.create_token_if_absent(TokenRecord.from_event(event))
-        await self.repo.create_analysis_job(event.mint)  # always attempted so a retry can finish a half-done earlier attempt
+        if self.store_jobs:
+            await self.repo.create_analysis_job(event.mint)  # always attempted so a retry can finish a half-done earlier attempt
         if created:
+            self._day_count += 1
             self.metrics.stored += 1
             if self.analysis_queue is not None:
                 try:
@@ -1341,11 +1464,11 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 <style>
 :root{
   color-scheme:dark;
-  --bg:#05070c;--text:#f5f7fb;--mute:rgba(235,240,250,.68);--dim:rgba(235,240,250,.45);
+  --bg:#000000;--text:#f5f7fb;--mute:rgba(235,240,250,.68);--dim:rgba(235,240,250,.45);
   --blue:#4c9bff;--cyan:#3de0f5;--gold:#f0b90b;--green:#34d399;--amber:#ffb340;--red:#ff5d73;--gray:#8b97aa;
   --g-bg:rgba(255,255,255,.075);--g-bg2:rgba(255,255,255,.12);--g-line:rgba(255,255,255,.16);--g-hi:rgba(255,255,255,.36);--g-lo:rgba(255,255,255,.05);
   --g-shadow:0 14px 44px rgba(0,0,0,.38);--line:rgba(255,255,255,.10);--card2:rgba(255,255,255,.06);--r:28px;
-  --o1:rgba(30,100,255,.85);--o2:rgba(150,80,255,.75);--o3:rgba(0,200,235,.55);--o4:rgba(255,160,30,.42);--o5:rgba(255,60,130,.38);
+  --o1:transparent;--o2:transparent;--o3:transparent;--o4:transparent;--o5:transparent;
   --font:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
   --spring:cubic-bezier(.34,1.56,.64,1);
@@ -1444,7 +1567,7 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 
 /* hero */
 .hero{overflow:hidden;padding:24px;border-radius:36px;
-  background:radial-gradient(120% 150% at 0% 0%,rgba(76,155,255,.34),transparent 58%),radial-gradient(90% 120% at 100% 0%,rgba(240,185,11,.16),transparent 52%),var(--g-bg)}
+  background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.04))}
 [data-theme="light"] .hero{background:radial-gradient(120% 150% at 0% 0%,rgba(10,116,255,.18),transparent 58%),radial-gradient(90% 120% at 100% 0%,rgba(250,200,60,.22),transparent 52%),var(--g-bg)}
 .hero-row{position:relative;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .live{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--mute)}
@@ -1513,7 +1636,7 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 .thead h1{margin:0;font-size:28px;font-weight:800;letter-spacing:-.035em;line-height:1.1}
 .copy{display:inline-flex;align-items:center;gap:6px;background:none;border:0;padding:0;color:var(--dim);font-family:var(--mono);font-size:12px;word-break:break-all;text-align:left}
 .verdict{padding:22px;border-radius:34px;
-  background:radial-gradient(130% 120% at 0% 0%,color-mix(in srgb,var(--c) 30%,transparent),transparent 62%),var(--g-bg)}
+  background:radial-gradient(130% 120% at 0% 0%,color-mix(in srgb,var(--c) 16%,transparent),transparent 62%),var(--g-bg)}
 .verdict .big{position:relative;display:flex;align-items:center;gap:12px}
 .verdict h2{position:relative;margin:0;font-size:26px;font-weight:800;letter-spacing:-.035em;color:var(--c)}
 .verdict p{position:relative;margin:10px 0 0}
@@ -1551,6 +1674,11 @@ pre{background:rgba(0,0,0,.28);border:1px solid var(--line);border-radius:16px;p
 .prow{position:relative;display:flex;align-items:center;gap:10px;padding:12px 0;border-top:1px solid var(--line)}
 .prow:first-child{border-top:0}
 .card.pad>*,.hero>*{position:relative}
+.chartbody{position:relative;overflow:hidden;border-radius:var(--r)}
+.chartframe{display:block;width:100%;height:460px;border:0;background:#000}
+.chartempty{padding:34px 20px;text-align:center;color:var(--mute)}
+.chartempty .eic{display:inline-grid;place-items:center;width:60px;height:60px;border-radius:50%;background:var(--card2);color:var(--dim);margin-bottom:12px;box-shadow:inset 0 1px 0 var(--g-hi)}
+.chartempty b{display:block;color:var(--text);font-size:17px}
 footer{max-width:1080px;margin:0 auto;padding:0 20px 24px;color:var(--dim);font-size:12px;line-height:1.5}
 @media(min-width:900px){footer{padding-bottom:30px}}
 </style>
@@ -1812,7 +1940,7 @@ function systemView() {
   const tiles = h("div", {class: "grid3"}), provs = h("div"), counters = h("div");
   const root = h("div", {}, h("h1", {class: "large"}, "System health"), h("p", {class: "sub"}, "Connections, queues and counters since the backend last started."), tiles,
     sec("Providers"), h("div", {class: "card pad"}, provs), sec("Counters"), h("div", {class: "card pad"}, counters));
-  const NAMES = {received:"Messages received",parsed:"Launches parsed",ignored:"Ignored (non-launch)",parse_errors:"Parse errors",dropped_queue_full:"Dropped (queue full)",stored:"New tokens stored",duplicates:"Duplicates skipped",failed_jobs:"Failed storage jobs",analyses:"Analyses run",failed_analyses:"Failed analyses"};
+  const NAMES = {received:"Messages received",parsed:"Launches parsed",ignored:"Ignored (non-launch)",parse_errors:"Parse errors",dropped_queue_full:"Dropped (queue full)",stored:"New tokens stored",duplicates:"Duplicates skipped",failed_jobs:"Failed storage jobs",analyses:"Analyses run",failed_analyses:"Failed analyses",throttled:"Skipped (daily limit)"};
   const BAD = new Set(["parse_errors", "dropped_queue_full", "failed_jobs", "failed_analyses"]);
   const tile = (l, v, hint, color) => h("div", {class: "tile"}, h("div", {class: "l"}, l), h("div", {class: "v", style: color ? "color:" + color : null}, v), hint ? h("div", {class: "h"}, hint) : null);
   async function refresh() {
@@ -1855,10 +1983,26 @@ function checkRow(c) {
       h("div", {class: "dim", style: "font-size:12px;margin-top:8px"}, "Source: " + c.sources.join(", ") + " · retrieved " + fmt(c.retrieved_at))));
 }
 
+function chartCard(mint) {
+  const body = h("div", {class: "chartbody"});
+  function load() {
+    const th = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+    const url = "https://dexscreener.com/solana/" + encodeURIComponent(mint) + "?embed=1&loadChartSettings=0&trades=0&chartStyle=1&chartLeftToolbar=0&chartType=usd&interval=5&chartDefaultOnMobile=1&theme=" + th + "&chartTheme=" + th;
+    body.replaceChildren(
+      h("iframe", {class: "chartframe", src: url, title: "Price chart", loading: "lazy", referrerpolicy: "no-referrer", sandbox: "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"}),
+      h("p", {class: "dim", style: "font-size:12px;margin:10px 16px 14px"}, "Chart by DEX Screener. Brand-new tokens can take a minute or two to appear. If it says not found, the token has no market yet."));
+  }
+  body.append(h("div", {class: "chartempty"}, h("div", {class: "eic"}, icon("pulse", 26)), h("b", {}, "Live price chart"),
+    h("p", {style: "margin:4px 0 16px"}, "Candlesticks from DEX Screener, shown inside this page. Nothing is loaded from them until you tap."),
+    h("button", {class: "btn", onclick: load}, icon("pulse", 16), "Load chart")));
+  return h("div", {}, sec("Price chart"), h("div", {class: "card"}, body));
+}
+
 function tokenView(mint) {
-  const box = h("div", {});
-  box.append(skeleton(4));
-  const root = h("div", {}, h("a", {href: "#/scanner", class: "back"}, icon("back", 18), "Back"), box);
+  const top = h("div"), bottom = h("div");
+  top.append(skeleton(3));
+  const chart = chartCard(mint);   // built once and never re-rendered, so the chart does not reload every refresh
+  const root = h("div", {}, h("a", {href: "#/scanner", class: "back"}, icon("back", 18), "Back"), top, chart, bottom);
   let lastKey = "";
   async function refresh() {
     const t = await api("/tokens/" + encodeURIComponent(mint));
@@ -1869,7 +2013,7 @@ function tokenView(mint) {
     if (key === lastKey) return;   // nothing new: leave the page (and any opened sections) untouched
     lastKey = key;
     const fact = (k, v, copy) => h("div", {class: "fact"}, h("div", {class: "k"}, k), h("div", {class: "v" + (copy ? " mono" : "")}, v));
-    box.replaceChildren(...[
+    top.replaceChildren(
       h("div", {class: "thead"}, avatar(t, 58), h("div", {style: "min-width:0"}, h("h1", {}, t.symbol || "Token"), h("div", {class: "mute"}, t.name || "Unnamed"),
         h("button", {class: "copy", onclick: () => copyText(t.mint)}, short(t.mint, 8), icon("copy", 13)))),
       h("section", {class: "verdict", style: "--c:" + COLOR[t.status]},
@@ -1881,7 +2025,8 @@ function tokenView(mint) {
       h("div", {class: "facts"}, fact("Detected", fmt(t.detected_at)), fact("Launch time", t.launch_timestamp ? fmt(t.launch_timestamp) : "Not supplied"), fact("Creator", short(t.creator, 6), true), fact("Bonding curve", short(t.bonding_curve, 6), true)),
       h("div", {class: "btns"},
         h("a", {class: "btn", href: "https://solscan.io/token/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Solscan", icon("ext", 15)),
-        h("a", {class: "btn", href: "https://pump.fun/coin/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Pump.fun", icon("ext", 15))),
+        h("a", {class: "btn", href: "https://pump.fun/coin/" + t.mint, target: "_blank", rel: "noopener noreferrer"}, "Pump.fun", icon("ext", 15))));
+    bottom.replaceChildren(...[
       sec("Security checks"),
       r ? h("div", {class: "card list"}, r.checks.map(checkRow)) : empty("pulse", "Analysis has not completed yet", "The security engine runs shortly after detection. This page refreshes automatically."),
       r && r.not_evaluated.length ? [sec("Not checked yet"), h("div", {class: "card pad"}, h("p", {class: "dim", style: "margin:0 0 8px;font-size:13px"}, "These checks do not exist yet. “Not checked” is never the same as “passed”."), h("ul", {class: "mute", style: "margin:0;padding-left:18px;font-size:13.5px"}, r.not_evaluated.map((x) => h("li", {}, x))))] : null,
@@ -2025,6 +2170,13 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         if not settings.api_key:
             log.warning("API_KEY is empty: API is unauthenticated (development only)")
         repo = repository or build_repository(settings)
+        if repository is None and settings.storage_backend != "memory" and settings.cache_recent_tokens > 0:
+            repo = CachedRepository(repo, settings.cache_recent_tokens)
+            try:
+                await repo.warm()
+                log.info("memory cache ready", extra={"tokens": len(repo.recent)})
+            except Exception as exc:  # database unreachable or over quota: fall back to direct reads
+                log.warning("cache warm-up failed", extra={"error": f"{type(exc).__name__}: {str(exc)[:200]}"})
         if settings.storage_backend == "memory" and repository is None:
             log.warning("STORAGE_BACKEND=memory: data is NOT persistent")
         health, metrics = HealthRegistry(), Metrics()
@@ -2037,16 +2189,19 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         solana = rpc or SolanaRPC(settings.solana_rpc_url, health, timeout=settings.rpc_timeout_seconds,
                                   max_concurrency=settings.rpc_max_concurrency)
         processor = TokenProcessor(repo, queue, health, metrics, max_attempts=settings.processor_max_attempts,
-                                   analysis_queue=analysis_queue if settings.analysis_enabled else None)
+                                   analysis_queue=analysis_queue if settings.analysis_enabled else None,
+                                   store_events=settings.store_launch_events, store_jobs=settings.store_jobs,
+                                   max_new_per_day=settings.max_new_tokens_per_day)
         tasks = [asyncio.create_task(processor.run(), name="processor")]
         analysis_tasks: list[asyncio.Task] = []
         if settings.analysis_enabled:
             analyzer = SecurityAnalyzer(solana, repo, policy_from_settings(settings))
             for i in range(settings.analysis_workers):
-                worker = AnalysisWorker(repo, analyzer, analysis_queue, health, metrics, retry_delays=settings.retry_delay_list)
+                worker = AnalysisWorker(repo, analyzer, analysis_queue, health, metrics, retry_delays=settings.retry_delay_list,
+                                        save_all_attempts=settings.save_all_attempts, store_jobs=settings.store_jobs)
                 analysis_tasks.append(asyncio.create_task(worker.run(), name=f"analysis-{i}"))
-            try:  # resume jobs left pending by a restart
-                for mint in await repo.list_pending_jobs(500):
+            try:  # resume jobs left pending by a restart (only possible when jobs are stored)
+                for mint in (await repo.list_pending_jobs(500) if settings.store_jobs else []):
                     analysis_queue.put_nowait(mint)
             except Exception as exc:
                 log.warning("could not re-queue pending jobs", extra={"error": str(exc)})
@@ -2079,6 +2234,11 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
 
     app = FastAPI(title="Tosh Bot API", version="0.2.0", lifespan=lifespan)
     app.state.settings = settings
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception):
+        log.error("unhandled error", extra={"path": request.url.path, "error": f"{type(exc).__name__}: {str(exc)[:300]}"})
+        return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {str(exc)[:200]}"})
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_methods=["GET"], allow_headers=["X-API-Key"])
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)

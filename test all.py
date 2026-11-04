@@ -616,6 +616,104 @@ def test_all_pass_never_returns_qualified():
 
 
 # ----------------------------------------------------------------------
+# test_cache
+# ----------------------------------------------------------------------
+class CountingRepo(InMemoryRepository):
+    """Counts reads so tests can prove the cache avoids database reads."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    async def list_recent_tokens(self, limit, statuses=None):
+        self.reads += 1
+        return await super().list_recent_tokens(limit, statuses)
+
+    async def count_tokens_by_status(self):
+        self.reads += 1
+        return await super().count_tokens_by_status()
+
+
+@pytest.mark.asyncio
+async def test_cache_serves_lists_and_counts_without_database_reads():
+    inner = CountingRepo()
+    for i in range(1, 4):
+        await inner.create_token_if_absent(fixture_token(i))
+    repo = CachedRepository(inner, size=10)
+    await repo.warm()
+    reads_after_warm = inner.reads
+    for _ in range(20):  # simulate a dashboard polling
+        assert len(await repo.list_recent_tokens(50)) == 3
+        assert (await repo.count_tokens_by_status())["INSUFFICIENT_DATA"] == 3
+    assert inner.reads == reads_after_warm
+
+
+@pytest.mark.asyncio
+async def test_cache_tracks_new_tokens_and_status_changes():
+    repo = CachedRepository(CountingRepo(), size=10)
+    await repo.warm()
+    t = fixture_token(1)
+    assert await repo.create_token_if_absent(t) is True
+    assert await repo.create_token_if_absent(t) is False  # duplicate does not double-count
+    assert (await repo.count_tokens_by_status())["INSUFFICIENT_DATA"] == 1
+    await repo.update_token_decision(t.mint, "REJECTED", "fixture", "r1", utcnow())
+    counts = await repo.count_tokens_by_status()
+    assert counts["INSUFFICIENT_DATA"] == 0 and counts["REJECTED"] == 1
+    assert [x.mint for x in await repo.list_recent_tokens(10, ["REJECTED"])] == [t.mint]
+
+
+@pytest.mark.asyncio
+async def test_cache_evicts_oldest_beyond_size():
+    repo = CachedRepository(CountingRepo(), size=2)
+    await repo.warm()
+    for i in range(1, 4):
+        await repo.create_token_if_absent(fixture_token(i))
+    assert len(await repo.list_recent_tokens(10)) == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_counts_creator_launches_in_memory():
+    repo = CachedRepository(CountingRepo(), size=10)
+    await repo.warm()
+    for i in range(1, 4):
+        await repo.create_token_if_absent(fixture_token(i))
+    assert await repo.count_recent_tokens_by_creator(fixture_token(1).creator, utcnow() - timedelta(hours=24)) == 3
+
+
+@pytest.mark.asyncio
+async def test_daily_limit_throttles_new_tokens_and_counts_them():
+    repo, metrics = InMemoryRepository(), Metrics()
+    proc = TokenProcessor(repo, asyncio.Queue(), HealthRegistry(), metrics, max_new_per_day=2)
+    for i in range(1, 5):
+        await proc.handle(parse_message(create_message(i)))
+    assert len(repo.tokens) == 2 and metrics.throttled == 2
+
+
+@pytest.mark.asyncio
+async def test_lean_mode_skips_event_and_job_writes():
+    repo = InMemoryRepository()
+    proc = TokenProcessor(repo, asyncio.Queue(), HealthRegistry(), Metrics(), store_events=False, store_jobs=False)
+    await proc.handle(parse_message(create_message(1)))
+    assert len(repo.tokens) == 1 and not repo.events and not repo.jobs
+
+
+@pytest.mark.asyncio
+async def test_lean_worker_saves_only_the_final_report_when_data_is_unavailable():
+    repo, metrics = InMemoryRepository(), Metrics()
+
+    async def nosleep(d):
+        pass
+
+    worker = AnalysisWorker(repo, SecurityAnalyzer(FakeRPC(fail={"get_account_info"}), repo, SecurityPolicy()), asyncio.Queue(), HealthRegistry(),
+                            metrics, retry_delays=[1.0, 2.0], sleep=nosleep, save_all_attempts=False, store_jobs=False)
+    token = fixture_token(1)
+    await repo.create_token_if_absent(token)
+    await worker.process(token.mint)
+    assert metrics.analyses == 3                       # tried three times
+    assert len(await repo.list_reports(token.mint, 10)) == 1  # but only one billable save
+
+
+# ----------------------------------------------------------------------
 # test_api
 # ----------------------------------------------------------------------
 def client_with_tokens(n=3, api_key="secret"):
