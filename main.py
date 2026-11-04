@@ -37,10 +37,13 @@ import random
 import time
 from contextlib import asynccontextmanager
 import base64
+import hashlib
 import hmac
+from html import escape as _html_escape
+from urllib.parse import parse_qs
 from pathlib import Path
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 log = logging.getLogger("tosh")
@@ -1992,21 +1995,87 @@ async def require_api_key(request: Request, x_api_key: str | None = Header(defau
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+SESSION_COOKIE = "tosh_session"
+SESSION_TTL = 30 * 24 * 3600          # stay signed in for 30 days
+LOGIN_MAX_FAILS, LOGIN_WINDOW = 8, 600  # 8 wrong tries per 10 minutes per address, then a cool-down
+_LOGIN_FAILS: dict[str, list[float]] = {}
+
+
+def _session_key(cfg: Settings) -> bytes:
+    # Derived from the password, so changing DASHBOARD_PASSWORD signs every device out.
+    return hashlib.sha256(f"toshbot-session:{cfg.dashboard_password}:{cfg.api_key}".encode()).digest()
+
+
+def _session_sig(cfg: Settings, exp: int) -> str:
+    return hmac.new(_session_key(cfg), f"{cfg.dashboard_user}|{exp}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_session(cfg: Settings, now: float | None = None) -> str:
+    exp = int((time.time() if now is None else now) + SESSION_TTL)
+    return f"{exp}.{_session_sig(cfg, exp)}"
+
+
+def session_valid(cfg: Settings, token: str, now: float | None = None) -> bool:
+    try:
+        exp_s, _, sig = token.partition(".")
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    if exp < (time.time() if now is None else now) or not sig:
+        return False
+    return hmac.compare_digest(sig, _session_sig(cfg, exp))
+
+
+def _client_ip(request: Request) -> str:
+    # Rightmost X-Forwarded-For entry = the address the platform's own proxy saw; the left side can be faked by the client.
+    fwd = request.headers.get("x-forwarded-for", "")
+    last = fwd.split(",")[-1].strip() if fwd else ""
+    return last or (request.client.host if request.client else "unknown")
+
+
+def _login_locked(ip: str, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    recent = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < LOGIN_WINDOW]
+    if recent:
+        _LOGIN_FAILS[ip] = recent
+    else:
+        _LOGIN_FAILS.pop(ip, None)
+    return len(recent) >= LOGIN_MAX_FAILS
+
+
+def _login_failed(ip: str, now: float | None = None) -> None:
+    if len(_LOGIN_FAILS) > 1000:   # bound memory
+        _LOGIN_FAILS.clear()
+    _LOGIN_FAILS.setdefault(ip, []).append(time.time() if now is None else now)
+
+
 async def require_dashboard_auth(request: Request) -> None:
-    """HTTP Basic Auth for the built-in dashboard. Fails closed in production when no password is set."""
+    """Dashboard door: a signed session cookie (from the branded /login page) or HTTP Basic Auth (for scripts).
+    Fails closed in production when no password is set."""
     cfg = request.app.state.settings
     if not cfg.dashboard_password:
         if cfg.environment == "production":
             raise HTTPException(status_code=503, detail="Dashboard is disabled: set DASHBOARD_PASSWORD")
         return
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if token and session_valid(cfg, token):
+        return
     header = request.headers.get("authorization", "")
     if header.lower().startswith("basic "):
         try:
             user, _, pw = base64.b64decode(header[6:]).decode("utf-8").partition(":")
-            if hmac.compare_digest(user.encode(), cfg.dashboard_user.encode()) and hmac.compare_digest(pw.encode(), cfg.dashboard_password.encode()):
+            ok_user = hmac.compare_digest(user.encode(), cfg.dashboard_user.encode())
+            ok_pw = hmac.compare_digest(pw.encode(), cfg.dashboard_password.encode())
+            if ok_user and ok_pw:
                 return
         except Exception:
             pass
+    accept = request.headers.get("accept", "")
+    is_browser = "text/html" in accept or "sec-fetch-dest" in request.headers
+    if is_browser and "text/html" in accept and request.url.path.rstrip("/") == "/dashboard":
+        raise HTTPException(status_code=303, detail="Sign in required", headers={"Location": "/login"})
+    if is_browser:   # a background fetch from the page: plain 401 so the browser never shows its own ugly popup
+        raise HTTPException(status_code=401, detail="Authentication required")
     raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": 'Basic realm="Tosh Bot"'})
 
 
@@ -2029,6 +2098,138 @@ def _valid_mint(mint: str) -> str:
     if not BASE58_ADDRESS.match(mint):
         raise HTTPException(status_code=422, detail="Invalid mint address")
     return mint
+
+
+LOGIN_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#eaf0fb" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Tosh Bot">
+<meta name="robots" content="noindex">
+<title>Sign in · Tosh Bot</title>
+<script>
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("tosh-theme"); } catch (e) {}
+  if (!t) t = (window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", t);
+})();
+</script>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#000;--text:#f5f7fb;--mute:rgba(235,240,250,.68);--dim:rgba(235,240,250,.45);
+  --blue:#4c9bff;--cyan:#3de0f5;--red:#ff5d73;
+  --g-bg:rgba(255,255,255,.075);--g-line:rgba(255,255,255,.16);--g-hi:rgba(255,255,255,.36);--g-lo:rgba(255,255,255,.05);
+  --g-shadow:0 14px 44px rgba(0,0,0,.45);--field:rgba(255,255,255,.07);--field-line:rgba(255,255,255,.14);
+  --o1:rgba(59,130,246,.30);--o2:rgba(34,211,238,.20);--o3:rgba(120,90,255,.16);
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;
+  --spring:cubic-bezier(.34,1.56,.64,1);
+}
+[data-theme="light"]{
+  color-scheme:light;
+  --bg:#eaf0fb;--text:#0a0f1a;--mute:rgba(10,15,26,.66);--dim:rgba(10,15,26,.42);
+  --blue:#0a74ff;--red:#ec3b55;
+  --g-bg:rgba(255,255,255,.62);--g-line:rgba(255,255,255,.9);--g-hi:rgba(255,255,255,1);--g-lo:rgba(255,255,255,.4);
+  --g-shadow:0 12px 40px rgba(40,60,110,.18);--field:rgba(10,15,26,.045);--field-line:rgba(10,15,26,.12);
+  --o1:rgba(59,130,246,.45);--o2:rgba(167,139,250,.40);--o3:rgba(34,211,238,.38);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{background:var(--bg);-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;min-height:100dvh;color:var(--text);font:15px/1.45 var(--font);-webkit-font-smoothing:antialiased;
+  display:grid;place-items:center;padding:calc(24px + env(safe-area-inset-top)) 18px calc(24px + env(safe-area-inset-bottom));overflow-x:hidden}
+body::before{content:"";position:fixed;inset:-20%;z-index:-1;pointer-events:none;will-change:transform;
+  background:radial-gradient(46% 40% at 18% 14%,var(--o1),transparent 72%),radial-gradient(42% 36% at 86% 22%,var(--o2),transparent 72%),
+             radial-gradient(46% 40% at 72% 88%,var(--o3),transparent 72%);
+  animation:drift 28s ease-in-out infinite alternate}
+@keyframes drift{from{transform:translate3d(-2%,-1%,0) scale(1)}to{transform:translate3d(3%,2%,0) scale(1.12)}}
+@media(prefers-reduced-motion:reduce){body::before{animation:none}*{transition:none!important;animation:none!important}}
+svg{display:block}
+button{font:inherit;color:inherit;cursor:pointer}
+.card{position:relative;width:100%;max-width:400px;padding:34px 26px 26px;border-radius:34px;
+  background:var(--g-bg);-webkit-backdrop-filter:blur(28px) saturate(190%);backdrop-filter:blur(28px) saturate(190%);
+  border:1px solid var(--g-line);
+  box-shadow:var(--g-shadow),inset 0 1.5px 0 var(--g-hi),inset 0 -1px 0 var(--g-lo);
+  animation:rise .7s var(--spring) both}
+@keyframes rise{from{opacity:0;transform:translateY(18px) scale(.97)}to{opacity:1;transform:none}}
+.card::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  background:linear-gradient(135deg,rgba(255,255,255,.22) 0%,rgba(255,255,255,0) 32%,rgba(255,255,255,0) 68%,rgba(255,255,255,.08) 100%);mix-blend-mode:overlay}
+.logo{width:68px;height:68px;margin:0 auto 16px;border-radius:21px;box-shadow:0 10px 34px rgba(59,130,246,.45)}
+h1{margin:0;text-align:center;font-size:27px;font-weight:800;letter-spacing:-.03em}
+.sub{margin:6px 0 26px;text-align:center;color:var(--mute);font-size:14px}
+label{display:block;margin-bottom:14px}
+label>span{display:block;margin:0 4px 7px;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+.in{position:relative}
+input{width:100%;height:52px;padding:0 16px;border-radius:17px;border:1px solid var(--field-line);background:var(--field);
+  color:var(--text);font:inherit;font-size:16px;outline:none;transition:border-color .2s,box-shadow .2s}
+input::placeholder{color:var(--dim)}
+input:focus{border-color:var(--blue);box-shadow:0 0 0 4px rgba(76,155,255,.22)}
+.in input{padding-right:52px}
+.eye{position:absolute;right:6px;top:6px;width:40px;height:40px;display:grid;place-items:center;border:0;border-radius:13px;background:transparent;color:var(--mute)}
+.eye:active{transform:scale(.9)}
+.err{display:flex;gap:9px;align-items:flex-start;margin:2px 0 14px;padding:11px 13px;border-radius:15px;font-size:13.5px;font-weight:600;
+  color:var(--red);background:rgba(255,93,115,.12);border:1px solid rgba(255,93,115,.30)}
+.err svg{flex:none;margin-top:1px}
+.go{width:100%;height:54px;margin-top:6px;border:0;border-radius:999px;font-size:16px;font-weight:750;letter-spacing:-.01em;color:#fff;
+  background:linear-gradient(135deg,#3b82f6,#22d3ee);box-shadow:0 10px 30px rgba(59,130,246,.42),inset 0 1px 0 rgba(255,255,255,.45);
+  transition:transform .35s var(--spring),opacity .2s}
+.go:active{transform:scale(.96)}
+.go[disabled]{opacity:.65}
+.foot{margin:22px 4px 0;text-align:center;color:var(--dim);font-size:12px;line-height:1.5}
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="logo"><svg viewBox="0 0 40 40" width="68" height="68" aria-hidden="true"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs><rect width="40" height="40" rx="12" fill="url(#lg)"/><path d="M20 8 10 12v7c0 6 4.2 10.3 10 12 5.8-1.7 10-6 10-12v-7z" fill="rgba(255,255,255,.18)" stroke="#fff" stroke-width="1.8" stroke-linejoin="round"/><path d="M13.5 20h3l2-4.5 3 9 2-4.5h3" fill="none" stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  <h1>Tosh Bot</h1>
+  <p class="sub">Live security analysis for new Solana launches</p>
+  <form method="post" action="/login" id="f">
+    <label><span>Username</span>
+      <input name="username" type="text" value="__USER__" placeholder="Your name" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required __USERFOCUS__>
+    </label>
+    <label><span>Password</span>
+      <div class="in">
+        <input name="password" id="pw" type="password" placeholder="Your password" autocomplete="current-password" required __PWFOCUS__>
+        <button type="button" class="eye" id="eye" aria-label="Show password"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button>
+      </div>
+    </label>
+    __ERROR__
+    <button class="go" type="submit" id="go">Sign in</button>
+  </form>
+  <p class="foot">Detection and analysis only. Nothing here is financial advice or a guarantee that a token is safe.</p>
+</main>
+<script>
+(function () {
+  var pw = document.getElementById("pw"), eye = document.getElementById("eye");
+  eye.addEventListener("click", function () {
+    var show = pw.type === "password";
+    pw.type = show ? "text" : "password";
+    eye.setAttribute("aria-label", show ? "Hide password" : "Show password");
+    eye.style.color = show ? "var(--blue)" : "";
+  });
+  document.getElementById("f").addEventListener("submit", function () {
+    var b = document.getElementById("go"); b.disabled = true; b.textContent = "Signing in…";
+  });
+  window.addEventListener("pageshow", function () { var b = document.getElementById("go"); b.disabled = false; b.textContent = "Sign in"; });
+})();
+</script>
+</body>
+</html>'''
+
+
+def render_login_page(error: str = "", user: str = "") -> str:
+    err = ('<div class="err" role="alert"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16h.01"/></svg><span>'
+           + _html_escape(error) + "</span></div>") if error else ""
+    return (LOGIN_HTML.replace("__ERROR__", err).replace("__USER__", _html_escape(user, quote=True))
+            .replace("__USERFOCUS__", "" if user else "").replace("__PWFOCUS__", "autofocus" if user else ""))
+
+
+LOGIN_HEADERS = {"Cache-Control": "no-store", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
 
 
 DASHBOARD_HTML = r'''<!DOCTYPE html>
@@ -2289,6 +2490,12 @@ pre{background:rgba(0,0,0,.28);border:1px solid var(--line);border-radius:16px;p
 .card.pad>*,.hero>*{position:relative}
 .chartbody{position:relative;overflow:hidden;border-radius:var(--r)}
 .chartframe{display:block;width:100%;height:460px;border:0;background:#000}
+.chartwrap.full{position:fixed;inset:0;z-index:100;display:flex;flex-direction:column;background:var(--bg);padding:env(safe-area-inset-top) 10px calc(10px + env(safe-area-inset-bottom))}
+.chartwrap.full .sec{margin:8px 6px}
+.chartwrap.full>.card{flex:1;min-height:0;display:flex;flex-direction:column}
+.chartwrap.full .chartbody{flex:1;min-height:0;display:flex;flex-direction:column}
+.chartwrap.full .chartframe{flex:1;height:auto;min-height:0}
+body.chartfull{overflow:hidden}
 .chartempty{padding:34px 20px;text-align:center;color:var(--mute)}
 .chartempty .eic{display:inline-grid;place-items:center;width:60px;height:60px;border-radius:50%;background:var(--card2);color:var(--dim);margin-bottom:12px;box-shadow:inset 0 1px 0 var(--g-hi)}
 .chartempty b{display:block;color:var(--text);font-size:17px}
@@ -2312,6 +2519,7 @@ footer{max-width:1080px;margin:0 auto;padding:0 20px 24px;color:var(--dim);font-
         <span class="feed"><span id="pdot" class="dot"></span><span id="ptxt">Connecting…</span></span>
         <button class="ibtn" id="themebtn" aria-label="Switch theme"></button>
         <a class="ibtn mob-only" href="#/system" aria-label="System health" id="sysbtn"></a>
+        <a class="ibtn" href="/logout" aria-label="Sign out" id="outbtn"></a>
       </div>
     </div></header>
     <div id="banner"></div>
@@ -2366,7 +2574,10 @@ const ICONS = {
   alert:'<path d="M12 6.5v7"/><path d="M12 17.5h.01"/>',
   x:'<path d="m6.5 6.5 11 11M17.5 6.5l-11 11"/>',
   help:'<path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.7.4-1 1-1 1.7"/><path d="M12 17.5h.01"/>',
-  search:'<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'
+  search:'<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  expand:'<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+  shrink:'<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
+  logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"/><path d="m16 8 4 4-4 4M20 12H9"/>'
 };
 
 /* ---------- helpers: all text goes through textContent, so token names can never inject HTML ---------- */
@@ -2414,6 +2625,7 @@ async function api(path) {
   const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 20000);
   try {
     const r = await fetch(API + path, {cache: "no-store", signal: ctl.signal});
+    if (r.status === 401) { location.href = "/login"; throw new Error("Signed out"); }
     if (!r.ok) {
       let d = "HTTP " + r.status;
       try { const j = await r.json(); if (j.detail) d = j.detail; } catch (e) {}
@@ -2693,7 +2905,21 @@ function chartCard(mint) {
         h("button", {class: "btn", onclick: load, style: "flex:none"}, icon("pulse", 16), "Reload")));
   }
   load();  // loads automatically as soon as the token screen opens
-  return h("div", {}, sec("Price chart"), h("div", {class: "card"}, body));
+  const wrap = h("div", {class: "chartwrap"});
+  const btn = h("button", {class: "ibtn", "aria-label": "Fullscreen chart", title: "Fullscreen"}, icon("expand", 20));
+  function setFull(on) {
+    wrap.classList.toggle("full", on);        // CSS only, so the iframe is never reloaded
+    document.body.classList.toggle("chartfull", on);
+    btn.replaceChildren(icon(on ? "shrink" : "expand", 20));
+    btn.setAttribute("aria-label", on ? "Exit fullscreen" : "Fullscreen chart");
+    if (on) window.scrollTo(0, 0);
+  }
+  btn.addEventListener("click", () => setFull(!wrap.classList.contains("full")));
+  const onKey = (e) => { if (e.key === "Escape" && wrap.classList.contains("full")) setFull(false); };
+  document.addEventListener("keydown", onKey);
+  window.addEventListener("hashchange", () => { document.body.classList.remove("chartfull"); document.removeEventListener("keydown", onKey); }, {once: true});
+  wrap.append(h("div", {class: "sec"}, h("h2", {}, "Price chart"), btn), h("div", {class: "card"}, body));
+  return wrap;
 }
 
 const axiomUrl = (t) => t.bonding_curve ? "https://axiom.trade/meme/" + t.bonding_curve : "https://axiom.trade/t/" + t.mint;
@@ -2782,6 +3008,7 @@ function buildNav() {
   document.getElementById("logo1").replaceChildren(logo(36));
   document.getElementById("logo2").replaceChildren(logo(30));
   document.getElementById("sysbtn").replaceChildren(icon("pulse", 19));
+  document.getElementById("outbtn").replaceChildren(icon("logout", 19));
 }
 function themeIcon() {
   const dark = document.documentElement.getAttribute("data-theme") !== "light";
@@ -3323,6 +3550,43 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @app.get("/dashboard", include_in_schema=False, dependencies=[Depends(require_dashboard_auth)])
     async def dashboard_page():
         return HTMLResponse(DASHBOARD_HTML, headers={"Cache-Control": "no-store"})
+
+    @app.get("/login", include_in_schema=False)
+    async def login_page(request: Request):
+        cfg = request.app.state.settings
+        token = request.cookies.get(SESSION_COOKIE, "")
+        if not cfg.dashboard_password or (token and session_valid(cfg, token)):
+            return RedirectResponse("/dashboard", status_code=303)
+        return HTMLResponse(render_login_page(), headers=LOGIN_HEADERS)
+
+    @app.post("/login", include_in_schema=False)
+    async def login_submit(request: Request):
+        cfg = request.app.state.settings
+        if not cfg.dashboard_password:
+            return RedirectResponse("/dashboard", status_code=303)
+        ip = _client_ip(request)
+        if _login_locked(ip):
+            return HTMLResponse(render_login_page("Too many attempts. Wait a few minutes and try again."), status_code=429, headers=LOGIN_HEADERS)
+        form = parse_qs((await request.body())[:4096].decode("utf-8", "replace"), keep_blank_values=True)
+        user = form.get("username", [""])[0].strip()
+        pw = form.get("password", [""])[0]
+        ok_user = hmac.compare_digest(user.encode(), cfg.dashboard_user.encode())
+        ok_pw = hmac.compare_digest(pw.encode(), cfg.dashboard_password.encode())
+        if not (ok_user and ok_pw):
+            _login_failed(ip)
+            await asyncio.sleep(0.4)   # slows down guessing
+            return HTMLResponse(render_login_page("Wrong username or password.", user), status_code=401, headers=LOGIN_HEADERS)
+        _LOGIN_FAILS.pop(ip, None)
+        resp = RedirectResponse("/dashboard", status_code=303)
+        resp.set_cookie(SESSION_COOKIE, make_session(cfg), max_age=SESSION_TTL, httponly=True,
+                        secure=cfg.environment == "production", samesite="lax", path="/")
+        return resp
+
+    @app.get("/logout", include_in_schema=False)
+    async def logout():
+        resp = RedirectResponse("/login", status_code=303)
+        resp.delete_cookie(SESSION_COOKIE, path="/")
+        return resp
 
     return app
 

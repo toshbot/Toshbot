@@ -871,6 +871,51 @@ def test_dashboard_is_disabled_in_production_without_password():
         assert c.get("/dashboard").status_code == 503
 
 
+def test_branded_login_page_sets_session_and_unlocks_dashboard():
+    repo = InMemoryRepository()
+    asyncio.run(repo.create_token_if_absent(TokenRecord.from_event(parse_message(create_message(1)))))
+    settings = Settings(_env_file=None, storage_backend="memory", listener_enabled=False, analysis_enabled=False,
+                        api_key="secret", dashboard_user="boss", dashboard_password="pw")
+    html_accept = {"accept": "text/html,application/xhtml+xml"}
+    with TestClient(create_app(settings, repo), follow_redirects=False) as c:
+        # a browser opening the dashboard is sent to the branded page, not the browser's own popup
+        r = c.get("/dashboard", headers=html_accept)
+        assert r.status_code == 303 and r.headers["location"] == "/login"
+        page = c.get("/login")
+        assert page.status_code == 200 and "Tosh Bot" in page.text and 'name="password"' in page.text
+        # wrong password: stays on the login page, no session, username is kept
+        bad = c.post("/login", content="username=boss&password=nope", headers={"content-type": "application/x-www-form-urlencoded"})
+        assert bad.status_code == 401 and "Wrong username or password" in bad.text and "tosh_session" not in bad.headers.get("set-cookie", "")
+        assert c.get("/dashboard/api/stats").status_code == 401
+        # right password: cookie is set and unlocks both the page and its data
+        ok = c.post("/login", content="username=boss&password=pw", headers={"content-type": "application/x-www-form-urlencoded"})
+        assert ok.status_code == 303 and ok.headers["location"] == "/dashboard"
+        assert "httponly" in ok.headers["set-cookie"].lower()
+        assert c.get("/dashboard").status_code == 200
+        assert c.get("/dashboard/api/stats").json()["total"] == 1
+        assert c.get("/api/stats").status_code == 401   # the API-key door is unaffected by a dashboard session
+        # a tampered cookie is rejected
+        c.cookies.set("tosh_session", "9999999999.deadbeef")
+        assert c.get("/dashboard/api/stats").status_code == 401
+        # sign out clears the session
+        c.post("/login", content="username=boss&password=pw", headers={"content-type": "application/x-www-form-urlencoded"})
+        assert c.get("/logout").status_code == 303
+        assert c.get("/dashboard/api/stats").status_code == 401
+
+
+def test_login_is_rate_limited_after_repeated_wrong_passwords():
+    settings = Settings(_env_file=None, storage_backend="memory", listener_enabled=False, analysis_enabled=False,
+                        api_key="secret", dashboard_user="boss", dashboard_password="pw")
+    form = {"content-type": "application/x-www-form-urlencoded"}
+    _LOGIN_FAILS.clear()
+    with TestClient(create_app(settings, InMemoryRepository()), follow_redirects=False) as c:
+        for _ in range(LOGIN_MAX_FAILS):
+            assert c.post("/login", content="username=boss&password=x", headers=form).status_code == 401
+        locked = c.post("/login", content="username=boss&password=pw", headers=form)   # even the right password waits
+        assert locked.status_code == 429 and "Too many attempts" in locked.text
+    _LOGIN_FAILS.clear()
+
+
 # ----------------------------------------------------------------------
 # test_firestore_integration
 # ----------------------------------------------------------------------
