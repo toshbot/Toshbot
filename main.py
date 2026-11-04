@@ -39,7 +39,7 @@ import base64
 import hmac
 from pathlib import Path
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 log = logging.getLogger("tosh")
@@ -1681,6 +1681,10 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 .tok:hover{background:var(--card2)}
 .tok:active{background:var(--card2);transform:scale(.985)}
 .av{display:grid;place-items:center;flex:none;border-radius:50%;color:#fff;font-weight:800;letter-spacing:-.02em;text-shadow:0 1px 2px rgba(0,0,0,.3);box-shadow:inset 0 1.5px 0 rgba(255,255,255,.45),inset 0 -2px 4px rgba(0,0,0,.2),0 4px 12px rgba(0,0,0,.25)}
+.av{position:relative;overflow:hidden}
+.av .avimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .2s}
+.av.has-img{color:transparent;text-shadow:none;background:#1a2230!important}
+.av.has-img .avimg{opacity:1}
 .tmain{flex:1;min-width:0}
 .tt{display:flex;gap:8px;align-items:baseline;min-width:0}
 .tt b{font-size:16px;font-weight:750;white-space:nowrap}
@@ -1917,11 +1921,25 @@ async function copyText(txt) {
   catch (e) { window.prompt("Copy this:", txt); }
 }
 const pill = (s) => h("span", {class: "pill p-" + s}, h("i"), LABEL[s] || s);
-function avatar(t, size) {
+const AV_OK = new Set();  // mints whose real picture has already loaded (no flicker on refresh)
+function initialsAvatar(t, size) {
   const sym = ((t.symbol || t.name || "?") + "").replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "?";
   let n = 0; for (const ch of t.mint) n = (n * 31 + ch.charCodeAt(0)) >>> 0;
   const hue = n % 360;
   return h("span", {class: "av", style: "width:" + size + "px;height:" + size + "px;font-size:" + Math.round(size * 0.36) + "px;background:linear-gradient(135deg,hsl(" + hue + " 68% 56%),hsl(" + ((hue + 45) % 360) + " 68% 38%))"}, sym);
+}
+function avatar(t, size) {
+  // Real picture first; the coloured initials (above) are only the fallback when it can't be fetched.
+  const box = initialsAvatar(t, size);
+  if (!t.uri) return box;
+  const img = document.createElement("img");
+  img.className = "avimg"; img.alt = ""; img.loading = "eager"; img.decoding = "async";
+  img.addEventListener("load", () => { AV_OK.add(t.mint); box.classList.add("has-img"); });
+  img.addEventListener("error", () => img.remove());
+  if (AV_OK.has(t.mint)) box.classList.add("has-img");
+  img.src = API + "/tokens/" + encodeURIComponent(t.mint) + "/image";
+  box.appendChild(img);
+  return box;
 }
 function scoreChip(sc) {
   if (sc == null) return null;
@@ -2232,6 +2250,172 @@ route(); pill2(); setInterval(pill2, 10000); pickWatcher(); setInterval(pickWatc
 '''
 
 
+# ============================================================================
+# app/token_images.py  (real token pictures, with the dashboard falling back to initials)
+# ============================================================================
+IPFS_GATEWAYS = ("https://ipfs.io", "https://dweb.link", "https://gateway.pinata.cloud", "https://nftstorage.link")
+IMAGE_MAX_BYTES = 1_500_000
+METADATA_MAX_BYTES = 200_000
+
+
+def sniff_image_type(data: bytes) -> str | None:
+    """Identify an image by its magic bytes (never trust the remote Content-Type). SVG is deliberately NOT allowed."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:12] in (b"ftypavif", b"ftypavis"):
+        return "image/avif"
+    return None
+
+
+def ipfs_candidates(url: str) -> list[str]:
+    """ipfs:// and any /ipfs/<cid> URL become a list of public gateways to try; other URLs are used as-is."""
+    from urllib.parse import urlparse
+
+    url = (url or "").strip()
+    if not url:
+        return []
+    if url.startswith("ipfs://"):
+        path = url[len("ipfs://"):].lstrip("/")
+        path = path[len("ipfs/"):] if path.startswith("ipfs/") else path
+        return [f"{gw}/ipfs/{path}" for gw in IPFS_GATEWAYS]
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return []
+    out = [url]
+    if parsed.path.startswith("/ipfs/"):
+        tail = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        out += [gw + tail for gw in IPFS_GATEWAYS if urlparse(gw).hostname != parsed.hostname]
+    return out[:5]
+
+
+class TokenImageService:
+    """Fetches a token's real picture: token uri -> metadata JSON -> "image" -> bytes. Done server-side because the
+    token creator controls the uri, so it is treated as untrusted (no private/internal addresses, size caps, only real
+    raster images). Results are cached; failures are retried with a back-off because new IPFS content is often slow."""
+
+    def __init__(self, *, max_cached: int = 250, concurrency: int = 6, max_bytes_total: int = 60_000_000) -> None:
+        from collections import OrderedDict
+
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=4.0), follow_redirects=False,
+                                         headers={"User-Agent": "ToshBot/0.2 (+token image fetch)"})
+        self._ok: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
+        self._max_cached = max_cached
+        self._max_bytes_total = max_bytes_total
+        self._bytes = 0
+        self._fail: dict[str, tuple[float, int]] = {}  # mint -> (retry_not_before, attempts)
+        self._inflight: dict[str, asyncio.Task] = {}
+        self._sem = asyncio.Semaphore(concurrency)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    @staticmethod
+    async def _assert_public(host: str) -> None:
+        import ipaddress
+        import socket
+
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        if not infos:
+            raise ValueError("host did not resolve")
+        for info in infos:
+            if not ipaddress.ip_address(info[4][0].split("%")[0]).is_global:
+                raise ValueError("refusing to fetch a non-public address")
+
+    async def _get(self, url: str, max_bytes: int) -> bytes:
+        from urllib.parse import urljoin, urlparse
+
+        for _ in range(4):  # follow a few redirects manually so every hop is re-validated
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError("unsupported url")
+            await self._assert_public(parsed.hostname)
+            async with self._client.stream("GET", url) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
+                    url = urljoin(url, resp.headers["location"])
+                    continue
+                if resp.status_code != 200:
+                    raise ValueError(f"http {resp.status_code}")
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > max_bytes:
+                        raise ValueError("response too large")
+                return bytes(buf)
+        raise ValueError("too many redirects")
+
+    async def _first_ok(self, candidates: list[str], max_bytes: int) -> bytes:
+        last: Exception = ValueError("no candidates")
+        for url in candidates:
+            try:
+                return await self._get(url, max_bytes)
+            except Exception as exc:  # try the next gateway
+                last = exc
+        raise last
+
+    async def _resolve(self, uri: str) -> tuple[bytes, str]:
+        raw = await self._first_ok(ipfs_candidates(uri), IMAGE_MAX_BYTES)
+        kind = sniff_image_type(raw)
+        if kind:  # the uri pointed straight at an image
+            return raw, kind
+        meta = json.loads(raw[:METADATA_MAX_BYTES].decode("utf-8", errors="strict"))
+        image_url = next((meta.get(k) for k in ("image", "image_uri", "imageUrl", "logo", "icon")
+                          if isinstance(meta, dict) and isinstance(meta.get(k), str) and meta.get(k)), None)
+        if not image_url:
+            raise ValueError("metadata has no image")
+        data = await self._first_ok(ipfs_candidates(image_url), IMAGE_MAX_BYTES)
+        kind = sniff_image_type(data)
+        if not kind:
+            raise ValueError("not a supported raster image")
+        return data, kind
+
+    async def _fetch_and_store(self, mint: str, uri: str) -> tuple[bytes, str] | None:
+        async with self._sem:
+            try:
+                data, kind = await asyncio.wait_for(self._resolve(uri), timeout=25)
+            except Exception as exc:
+                attempts = self._fail.get(mint, (0.0, 0))[1] + 1
+                delay = (30, 120, 600, 3600)[min(attempts - 1, 3)]
+                self._fail[mint] = (time.monotonic() + delay, attempts)
+                if len(self._fail) > 5000:
+                    self._fail.clear()
+                log.info("token image unavailable", extra={"mint": mint, "reason": f"{type(exc).__name__}: {exc}"[:120]})
+                return None
+        self._fail.pop(mint, None)
+        if mint in self._ok:
+            self._bytes -= len(self._ok[mint][0])
+        self._ok[mint] = (data, kind)
+        self._ok.move_to_end(mint)
+        self._bytes += len(data)
+        while self._ok and (len(self._ok) > self._max_cached or self._bytes > self._max_bytes_total):
+            _, (old, _k) = self._ok.popitem(last=False)  # drop the oldest picture first
+            self._bytes -= len(old)
+        return data, kind
+
+    async def get(self, mint: str, uri: str | None) -> tuple[bytes, str] | None:
+        """Returns (bytes, content_type) or None when there is no real picture (caller falls back to initials)."""
+        if not uri:
+            return None
+        hit = self._ok.get(mint)
+        if hit:
+            self._ok.move_to_end(mint)
+            return hit
+        failed = self._fail.get(mint)
+        if failed and time.monotonic() < failed[0]:
+            return None
+        task = self._inflight.get(mint)
+        if task is None:
+            task = asyncio.create_task(self._fetch_and_store(mint, uri))
+            self._inflight[mint] = task
+            task.add_done_callback(lambda _t, m=mint: self._inflight.pop(m, None))
+        return await asyncio.shield(task)
+
+
 def build_api_router(auth) -> APIRouter:
     router = APIRouter(dependencies=[Depends(auth)])
 
@@ -2246,6 +2430,24 @@ def build_api_router(auth) -> APIRouter:
         if sort == "score":
             rows = sorted(rows, key=lambda t: (t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at), reverse=True)
         return rows
+
+    @router.get("/tokens/{mint}/image")
+    async def token_image(request: Request, mint: str):
+        """The token's real picture (from its on-chain metadata). 404 means "none": the dashboard shows initials."""
+        mint = _valid_mint(mint)
+        token = await request.app.state.repo.get_token(mint)
+        if token is None or not token.uri:
+            raise HTTPException(status_code=404, detail="No image")
+        svc = getattr(request.app.state, "images", None)
+        if svc is None:
+            svc = request.app.state.images = TokenImageService()
+        found = await svc.get(mint, token.uri)
+        if found is None:
+            return Response(status_code=404, headers={"Cache-Control": "no-store"})
+        data, kind = found
+        return Response(content=data, media_type=kind, headers={
+            "Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox"})
 
     @router.get("/stats")
     async def stats(request: Request) -> dict:
@@ -2316,6 +2518,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         analysis_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.analysis_queue_maxsize)
         stop = asyncio.Event()
         app.state.repo, app.state.health, app.state.metrics = repo, health, metrics
+        app.state.images = TokenImageService()
         app.state.queue, app.state.analysis_queue = queue, analysis_queue
 
         solana = rpc or SolanaRPC(settings.solana_rpc_url, health, timeout=settings.rpc_timeout_seconds,
@@ -2362,6 +2565,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             await asyncio.gather(*tasks, *analysis_tasks, return_exceptions=True)
             if rpc is None:
                 await solana.aclose()
+            await app.state.images.aclose()
             await repo.aclose()
 
     app = FastAPI(title="Tosh Bot API", version="0.2.0", lifespan=lifespan)
