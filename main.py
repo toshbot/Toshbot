@@ -151,6 +151,20 @@ class Settings(BaseSettings):
     trade_trail_pct: float = 15.0          # ... and sells when price falls this far from the peak
     trade_max_hold_seconds: int = 600
     trade_stale_seconds: int = 45          # sell if nobody has traded it for this long
+    # Sniper (entry = "snipe"): buy seconds after launch once the first trades show it is climbing, sell the moment it turns down
+    snipe_window_seconds: int = 25         # only coins launched in the last N seconds are considered
+    snipe_min_trades: int = 2
+    snipe_min_buyers: int = 2
+    snipe_min_change_pct: float = 8.0      # must already be up this much since its first trade ("skyrocketing")
+    snipe_max_mcap_sol: float = 40.0       # do not chase a coin that is already this big
+    snipe_stop_loss_pct: float = 15.0
+    snipe_trail_pct: float = 12.0          # sell when price drops this far from its peak, from the first second
+    snipe_take_profit_pct: float = 300.0
+    snipe_max_hold_seconds: int = 120
+    snipe_stale_seconds: int = 12
+    snipe_slippage_pct: float = 30.0
+    snipe_priority_fee_sol: float = 0.003
+    snipe_paper_extra_slippage_pct: float = 8.0  # demo mode adds this per side: a real order lands 1-3 seconds after the decision
     trade_paper_slippage_pct: float = 3.0  # paper mode assumes this slippage each way (plus the 0.5% fee)
     # Several people / wallets: JSON list, e.g. [{"name":"me","api_key":"...","wallet":"PUBLIC_ADDRESS","buy_sol":0.05},{"name":"friend","api_key":"...","wallet":"...","mode":"paper"}]
     # Each account trades its own wallet with its own limits. "mode" is optional (default = TRADING_MODE). Empty = one account from PUMPPORTAL_API_KEY.
@@ -1432,7 +1446,7 @@ class TradeTracker:
     def active(self) -> int:
         return len(self._tok)
 
-    def track(self, mint: str, creator: str | None = None, reviewable: bool = True) -> bool:
+    def track(self, mint: str, creator: str | None = None, reviewable: bool = True, symbol: str | None = None) -> bool:
         """True if this token is being watched. False if its window already ended or the tracker is full.
         reviewable=False (launch fast lane): trades are recorded but the token is not re-analysed until the security
         verdict turns it into a WATCH token, so early watching never multiplies RPC calls."""
@@ -1443,7 +1457,7 @@ class TradeTracker:
         if mint in self._finished or len(self._tok) >= self.max_tracked:
             return False
         now = self._clock()
-        self._tok[mint] = {"since": now, "creator": creator, "trades": deque(maxlen=self.max_trades), "last_review": now, "review": reviewable}
+        self._tok[mint] = {"since": now, "creator": creator, "trades": deque(maxlen=self.max_trades), "last_review": now, "review": reviewable, "symbol": symbol}
         self.pending_sub.add(mint)
         self.pending_unsub.discard(mint)
         return True
@@ -1487,6 +1501,11 @@ class TradeTracker:
     def is_reviewable(self, mint: str) -> bool:
         rec = self._tok.get(mint)
         return bool(rec and rec.get("review", True))
+
+    def recent(self, max_age: float, now: float | None = None) -> list[tuple[str, str | None, str | None]]:
+        """(mint, creator, symbol) of watched tokens that launched within the last max_age seconds."""
+        now = self._clock() if now is None else now
+        return [(m, r.get("creator"), r.get("symbol")) for m, r in self._tok.items() if now - r["since"] <= max_age]
 
     def pin(self, mint: str) -> None:
         self._pinned.add(mint)  # held positions are never dropped or expired while we own them
@@ -2121,7 +2140,7 @@ class TokenProcessor:
             self._day_count += 1
             self.metrics.stored += 1
             if self.tracker is not None:
-                self.tracker.track(event.mint, event.creator, reviewable=False)  # trades are recorded from second zero, before any verdict
+                self.tracker.track(event.mint, event.creator, reviewable=False, symbol=event.symbol)  # trades are recorded from second zero, before any verdict
             if self.analysis_queue is not None:
                 try:
                     self.analysis_queue.put_nowait(event.mint)
@@ -2177,7 +2196,7 @@ class Trader:
         self.wallet = str(acct.get("wallet") or "")
         self.buy_sol = float(acct.get("buy_sol") or cfg.trade_buy_sol)
         self.max_open = int(acct.get("max_open") or cfg.trade_max_open)
-        self.entry = "picks" if acct.get("entry") == "picks" else "buy"  # buy = BUY signals only; picks = every rising Top pick
+        self.entry = acct.get("entry") if acct.get("entry") in ("picks", "snipe") else "buy"  # buy = BUY signals only; picks = every rising Top pick
         self.max_daily_loss = float(acct.get("max_daily_loss_sol") or cfg.trade_max_daily_loss_sol)
         self.rpc, self.balance_sol, self._bal_at = rpc, None, 0.0
         self.store, self.auto, self._seq = store, bool(acct.get("auto", True)), 0
@@ -2249,11 +2268,12 @@ class Trader:
                 self.paused, self.pause_reason = False, ""
 
     # ---- execution ----
-    async def _order(self, action: str, mint: str, amount, in_sol: bool) -> tuple[bool, str]:
+    async def _order(self, action: str, mint: str, amount, in_sol: bool, snipe: bool = False) -> tuple[bool, str]:
         if self.mode != "live":
             return True, "paper"
         body = {"action": action, "mint": mint, "amount": amount, "denominatedInSol": "true" if in_sol else "false",
-                "slippage": self.cfg.trade_slippage_pct, "priorityFee": self.cfg.trade_priority_fee_sol, "pool": self.cfg.trade_pool}
+                "slippage": self.cfg.snipe_slippage_pct if snipe else self.cfg.trade_slippage_pct,
+                "priorityFee": self.cfg.snipe_priority_fee_sol if snipe else self.cfg.trade_priority_fee_sol, "pool": self.cfg.trade_pool}
         try:
             if self._client is None:
                 self._client = httpx.AsyncClient(timeout=10)
@@ -2265,8 +2285,8 @@ class Trader:
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}"
 
-    def _net_pnl_sol(self, sol_in: float, entry: float, exit_: float) -> float:
-        fee, slip = 0.005, self.cfg.trade_paper_slippage_pct / 100
+    def _net_pnl_sol(self, sol_in: float, entry: float, exit_: float, snipe: bool = False) -> float:
+        fee, slip = 0.005, (self.cfg.trade_paper_slippage_pct + (self.cfg.snipe_paper_extra_slippage_pct if snipe else 0)) / 100
         gross = sol_in * (exit_ / entry) * ((1 - fee) * (1 - slip)) ** 2
         return gross - sol_in - 2 * self.cfg.trade_priority_fee_sol
 
@@ -2275,7 +2295,7 @@ class Trader:
         """Called after every analysis. Buys only on a fresh BUY that is also rising at this moment."""
         if self.mode == "off" or report.status not in ("QUALIFIED", "WATCH"):
             return
-        if report.status == "WATCH" and self.entry != "picks":
+        if self.entry == "snipe" or (report.status == "WATCH" and self.entry != "picks"):
             return
         c = self.cfg
         async with self._lock:
@@ -2295,21 +2315,47 @@ class Trader:
                 if (stats.n_trades < 5 or stats.unique_buyers < 3 or (stats.buy_pressure_pct or 0) < 55
                         or (stats.mcap_change_pct or 0) > c.signal_max_mcap_change_pct):
                     return
-            self.traded[mint] = self._clock()
-            while len(self.traded) > 5000:
-                self.traded.popitem(last=False)
-            entry = stats.mcap_now
-            ok, info = await self._order("buy", mint, self.buy_sol, True)
-            if not ok:
-                log.error("BUY failed", extra={"mint": mint, "error": info})
-                self._event({"type": "buy_failed", "mint": mint, "symbol": token.symbol, "info": info})
-                return
-            self.tracker.track(mint, token.creator)
-            self.tracker.pin(mint)
-            self.positions[mint] = {"mint": mint, "symbol": token.symbol, "creator": token.creator, "sol_in": self.buy_sol,
-                                    "entry_mcap": entry, "peak_mcap": entry, "opened_at": self._clock(), "buy_ref": info, "sell_fails": 0}
-            log.warning("BUY", extra={"mint": mint, "mode": self.mode, "sol": self.buy_sol, "account": self.name, "entry_mcap": round(entry, 2)})
-            self._event({"type": "buy", "mint": mint, "symbol": token.symbol, "sol": self.buy_sol, "mcap": round(entry, 2), "mode": self.mode})
+            await self._enter(mint, token.symbol, token.creator, stats.mcap_now, snipe=False)
+
+    async def _enter(self, mint: str, symbol: str | None, creator: str | None, entry: float, snipe: bool) -> None:
+        """Place the buy and record the position. Caller holds the lock and has already checked every limit."""
+        self.traded[mint] = self._clock()
+        while len(self.traded) > 5000:
+            self.traded.popitem(last=False)
+        ok, info = await self._order("buy", mint, self.buy_sol, True, snipe)
+        if not ok:
+            log.error("BUY failed", extra={"mint": mint, "error": info})
+            self._event({"type": "buy_failed", "mint": mint, "symbol": symbol, "info": info})
+            return
+        self.tracker.track(mint, creator)
+        self.tracker.pin(mint)
+        self.positions[mint] = {"mint": mint, "symbol": symbol, "creator": creator, "sol_in": self.buy_sol, "snipe": snipe,
+                                "entry_mcap": entry, "peak_mcap": entry, "opened_at": self._clock(), "buy_ref": info, "sell_fails": 0}
+        log.warning("BUY", extra={"mint": mint, "mode": self.mode, "sol": self.buy_sol, "account": self.name, "snipe": snipe, "entry_mcap": round(entry, 2)})
+        self._event({"type": "buy", "mint": mint, "symbol": symbol, "sol": self.buy_sol, "mcap": round(entry, 2), "mode": self.mode, "snipe": snipe})
+
+    async def snipe_scan(self) -> None:
+        """Sniper: look at coins that launched seconds ago and buy the ones the first trades show are climbing."""
+        if self.mode == "off" or self.entry != "snipe" or not self.auto or self.paused:
+            return
+        c = self.cfg
+        for mint, creator, symbol in self.tracker.recent(c.snipe_window_seconds):
+            if mint in self.traded or mint in self.positions:
+                continue
+            stats = self.tracker.snapshot(mint)
+            if (stats is None or stats.mcap_now is None or stats.n_trades < c.snipe_min_trades or stats.unique_buyers < c.snipe_min_buyers
+                    or (stats.mcap_change_pct or 0) < c.snipe_min_change_pct or stats.mcap_now > c.snipe_max_mcap_sol
+                    or (stats.buy_pressure_pct or 0) < 60 or stats.creator_sold_sol > 0
+                    or stats.last_trade_age is None or stats.last_trade_age > 5):
+                continue
+            async with self._lock:
+                self._roll_day()
+                if self.paused or mint in self.traded or mint in self.positions or len(self.positions) >= self.max_open:
+                    return
+                if self.day_pnl_sol <= -self.max_daily_loss:
+                    self.paused, self.pause_reason = True, "daily loss limit"
+                    return
+                await self._enter(mint, symbol, creator, stats.mcap_now, snipe=True)
 
     # ---- exits ----
     def _exit_reason(self, pos: dict, stats: "TradeStats | None") -> tuple[str | None, float | None]:
@@ -2320,6 +2366,20 @@ class Trader:
         pos["peak_mcap"] = max(pos["peak_mcap"], mc)
         pnl = (mc / pos["entry_mcap"] - 1) * 100
         peak_pnl = (pos["peak_mcap"] / pos["entry_mcap"] - 1) * 100
+        if pos.get("snipe"):  # tight exits: the moment it turns down, get out
+            if pnl <= -c.snipe_stop_loss_pct:
+                return f"stop loss ({pnl:.0f}%)", mc
+            if stats.creator_sold_sol > 0:
+                return "creator sold", mc
+            if pnl >= c.snipe_take_profit_pct:
+                return f"take profit (+{pnl:.0f}%)", mc
+            if mc <= pos["peak_mcap"] * (1 - c.snipe_trail_pct / 100):
+                return f"turned down (peak {peak_pnl:+.0f}%, now {pnl:+.0f}%)", mc
+            if now - pos["opened_at"] >= c.snipe_max_hold_seconds:
+                return f"max hold time ({pnl:+.0f}%)", mc
+            if stats.last_trade_age is not None and stats.last_trade_age > c.snipe_stale_seconds:
+                return f"trading went quiet ({pnl:+.0f}%)", mc
+            return None, mc
         if pnl <= -c.trade_stop_loss_pct:
             return f"stop loss ({pnl:.0f}%)", mc
         if stats.creator_sold_sol > 0:
@@ -2335,13 +2395,13 @@ class Trader:
         return None, mc
 
     async def _sell(self, pos: dict, reason: str, mcap: float | None) -> bool:
-        ok, info = await self._order("sell", pos["mint"], "100%", False)
+        ok, info = await self._order("sell", pos["mint"], "100%", False, bool(pos.get("snipe")))
         if not ok:
             pos["sell_fails"] += 1
             log.error("SELL failed, will retry", extra={"mint": pos["mint"], "reason": reason, "error": info, "fails": pos["sell_fails"]})
             return False
         exit_mc = mcap if mcap else pos["peak_mcap"]
-        pnl = self._net_pnl_sol(pos["sol_in"], pos["entry_mcap"], exit_mc)
+        pnl = self._net_pnl_sol(pos["sol_in"], pos["entry_mcap"], exit_mc, bool(pos.get("snipe")))
         self.day_pnl_sol += pnl
         self.positions.pop(pos["mint"], None)
         self.tracker.unpin(pos["mint"])
@@ -2370,9 +2430,10 @@ class Trader:
 
     async def run(self) -> None:
         while True:
-            await self._sleep(1.0)
+            await self._sleep(0.5)
             try:
                 await self.check_exits()
+                await self.snipe_scan()
             except Exception:
                 log.exception("trader exit check failed")
 
@@ -2416,7 +2477,7 @@ class AccountIn(BaseModel):
     max_open: int = 3
     max_daily_loss_sol: float = 0.2
     confirm_live: bool = False
-    entry: Literal["buy", "picks"] = "buy"  # buy = only BUY signals, picks = also every rising Top pick
+    entry: Literal["buy", "picks", "snipe"] = "buy"  # buy = only BUY signals, picks = also rising Top picks, snipe = buy seconds after launch
 
 
 class TradingManager:
@@ -3690,7 +3751,7 @@ function settingsView() {
     const name = h("input", {value: v.name, maxlength: "24", autocomplete: "off", autocapitalize: "off", placeholder: "e.g. me", disabled: isNew ? null : "disabled"});
     const mode = h("select", {}, h("option", {value: "paper"}, "Demo (practice, no money)"), h("option", {value: "live"}, "Real (uses real money)"));
     mode.value = v.mode;
-    const entry = h("select", {}, h("option", {value: "buy"}, "Only BUY signals (safer, fewer trades)"), h("option", {value: "picks"}, "Every rising Top pick (more trades, riskier)"));
+    const entry = h("select", {}, h("option", {value: "buy"}, "Only BUY signals (safer, fewer trades)"), h("option", {value: "picks"}, "Every rising Top pick (more trades, riskier)"), h("option", {value: "snipe"}, "Sniper: buy seconds after launch (very risky)"));
     entry.value = v.entry || "buy";
     const key = h("input", {type: "password", autocomplete: "off", placeholder: a && a.has_key ? "Saved (" + a.api_key_hint + "). Leave blank to keep it" : "Paste your PumpPortal API key"});
     const wallet = h("input", {value: v.wallet, autocomplete: "off", autocapitalize: "off", spellcheck: "false", placeholder: "Public wallet address (to show the balance)"});
@@ -3717,7 +3778,7 @@ function settingsView() {
     }}, "Remove");
     return h("div", {}, f("Account name", name), f("Mode", mode, "Start in Demo. Real mode needs the API key from pumpportal.fun."),
       f("PumpPortal API key", key, "Stored on your server only. Never shown again."), f("Wallet address", wallet, "PUBLIC address only. Never paste a private key here."),
-      f("What to trade", entry, "Rising Top picks are tokens that passed the security checks and are climbing now, but without the full BUY evidence."), f("Buy size per trade (SOL)", buy), f("Most trades open at once", open), f("Stop buying for the day after losing (SOL)", loss), confirmRow, err, h("div", {class: "btns"}, save, del));
+      f("What to trade", entry, "Sniper buys a new coin 2 to 10 seconds after launch when its first trades are climbing, and sells the moment it turns down. It skips the security checks. Try it in Demo first."), f("Buy size per trade (SOL)", buy), f("Most trades open at once", open), f("Stop buying for the day after losing (SOL)", loss), confirmRow, err, h("div", {class: "btns"}, save, del));
   }
   function alertsCard() {
     const on = () => localStorage.getItem("tosh-notify") === "1";
