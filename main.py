@@ -162,8 +162,11 @@ class Settings(BaseSettings):
     launch_max_creator_launches_per_hour: int = 2   # serial launchers are token farms
     launch_max_same_symbol: int = 3        # the same ticker 4+ times in 10 minutes = spam wave
     launch_max_per_minute: int = 4         # never more than this many launch buys a minute
-    launch_stale_seconds: int = 25         # sell if nobody else has traded it this long after we bought
-    launch_max_hold_seconds: int = 90
+    launch_stale_seconds: int = 75         # sell only if NOBODY has traded it for this long (gives the market time to find it)
+    launch_max_hold_seconds: int = 300     # after this, sell unless it is clearly winning (winners ride until the trailing stop)
+    launch_hard_cap_seconds: int = 1200
+    launch_stop_loss_pct: float = 20.0     # wider than the momentum sniper: a fresh coin has a thin, jumpy price
+    launch_trail_pct: float = 20.0
     snipe_window_seconds: int = 30         # only coins launched in the last N seconds are considered
     snipe_min_trades: int = 2
     snipe_min_buyers: int = 2
@@ -175,7 +178,7 @@ class Settings(BaseSettings):
     snipe_max_hold_seconds: int = 120
     snipe_stale_seconds: int = 12
     snipe_slippage_pct: float = 30.0
-    snipe_priority_fee_sol: float = 0.003
+    snipe_priority_fee_sol: float = 0.001
     snipe_paper_extra_slippage_pct: float = 8.0  # demo mode adds this per side: a real order lands 1-3 seconds after the decision
     trade_paper_slippage_pct: float = 3.0  # paper mode assumes this slippage each way (plus the 0.5% fee)
     # Several people / wallets: JSON list, e.g. [{"name":"me","api_key":"...","wallet":"PUBLIC_ADDRESS","buy_sol":0.05},{"name":"friend","api_key":"...","wallet":"...","mode":"paper"}]
@@ -2083,7 +2086,7 @@ class PumpPortalListener:
                 for method, keys in (("subscribeTokenTrade", subs), ("unsubscribeTokenTrade", unsubs)):
                     for i in range(0, len(keys), 50):
                         await ws.send(json.dumps({"method": method, "keys": keys[i:i + 50]}))
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.2)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2362,7 +2365,7 @@ class Trader:
     def _net_pnl_sol(self, sol_in: float, entry: float, exit_: float, snipe: bool = False) -> float:
         fee, slip = 0.005, (self.cfg.trade_paper_slippage_pct + (self.cfg.snipe_paper_extra_slippage_pct if snipe else 0)) / 100
         gross = sol_in * (exit_ / entry) * ((1 - fee) * (1 - slip)) ** 2
-        return gross - sol_in - 2 * self.cfg.trade_priority_fee_sol
+        return gross - sol_in - 2 * (self.cfg.snipe_priority_fee_sol if snipe else self.cfg.trade_priority_fee_sol)
 
     # ---- entry ----
     async def consider(self, token: "TokenRecord", report: "SecurityReport") -> None:
@@ -2518,15 +2521,18 @@ class Trader:
             peak_pnl = (pos["peak_mcap"] / pos["entry_mcap"] - 1) * 100
             held = now - pos["opened_at"]
             idle = held if not have or stats.last_trade_age is None else min(held, stats.last_trade_age)
-            if pnl <= -c.snipe_stop_loss_pct:
+            pos["trades"] = stats.n_trades if stats is not None else 0
+            if pnl <= -c.launch_stop_loss_pct:
                 return f"stop loss ({pnl:.0f}%)", mc
             if stats is not None and stats.creator_sold_sol > 0:
                 return "creator sold", mc
             if pnl >= c.snipe_take_profit_pct:
                 return f"take profit (+{pnl:.0f}%)", mc
-            if peak_pnl > 0 and mc <= pos["peak_mcap"] * (1 - c.snipe_trail_pct / 100):
+            if peak_pnl >= 5 and mc <= pos["peak_mcap"] * (1 - c.launch_trail_pct / 100):
                 return f"turned down (peak {peak_pnl:+.0f}%, now {pnl:+.0f}%)", mc
-            if held >= c.launch_max_hold_seconds:
+            if held >= c.launch_hard_cap_seconds:
+                return f"max hold time ({pnl:+.0f}%)", mc
+            if held >= c.launch_max_hold_seconds and pnl < 10:
                 return f"max hold time ({pnl:+.0f}%)", mc
             if idle > c.launch_stale_seconds:
                 return f"nobody else came in ({pnl:+.0f}%)" if not have or stats.n_trades <= 1 else f"trading went quiet ({pnl:+.0f}%)", mc
@@ -2578,7 +2584,8 @@ class Trader:
         self.tracker.unpin(pos["mint"])
         log.warning("SELL", extra={"mint": pos["mint"], "reason": reason, "est_pnl_sol": round(pnl, 4), "mode": self.mode})
         self._event({"type": "sell", "mint": pos["mint"], "symbol": pos.get("symbol"), "reason": reason,
-                                 "est_pnl_sol": round(pnl, 4), "held_s": round(self._clock() - pos["opened_at"]), "mode": self.mode})
+                                 "est_pnl_sol": round(pnl, 4), "held_s": round(self._clock() - pos["opened_at"]), "mode": self.mode,
+                     "trades": pos.get("trades")})
         if self.day_pnl_sol <= -self.max_daily_loss and not self.paused:
             self.paused, self.pause_reason = True, "daily loss limit"
         return True
@@ -2809,7 +2816,8 @@ class TradingManager:
     async def status(self) -> dict:
         trs = list(self.traders.values())
         await asyncio.gather(*(t.refresh_balance() for t in trs))
-        return {"accounts": [{**t.status(), **self.public(self.cfgs[t.name])} for t in trs]}
+        return {"accounts": [{**t.status(), **self.public(self.cfgs[t.name])} for t in trs],
+                "feed": {"trades_received": self.tracker.trades_seen, "coins_watched": len(self.tracker._tok)}}
 
 
 # ============================================================================
@@ -3935,6 +3943,7 @@ function tradesView() {
       h("dt", {}, "Wallet balance"), h("dd", {}, a.wallet_balance_sol == null ? (a.wallet ? "—" : "add wallet in Settings") : a.wallet_balance_sol + " SOL"),
       h("dt", {}, "Today (estimate)"), h("dd", {style: "color:" + pnlColor(a.day_pnl_sol_estimate)}, sol(a.day_pnl_sol_estimate) + " SOL"),
       h("dt", {}, "Buy size"), h("dd", {}, a.buy_sol + " SOL"),
+      a.snipe_why && data.feed ? h("dt", {}, "Trade feed") : null, a.snipe_why && data.feed ? h("dd", {}, data.feed.trades_received + " trades from " + data.feed.coins_watched + " coins") : null,
       a.snipe_why ? h("dt", {}, "Sniper sees") : null, a.snipe_why ? h("dd", {style: "white-space:normal;text-align:right"}, whyText(a.snipe_why)) : null);
     let list;
     if (tab === "open") {
@@ -3945,7 +3954,7 @@ function tradesView() {
     } else {
       list = a.history.length ? a.history.map((e) => h("div", {class: "trrow"},
         h("div", {}, h("b", {}, (e.type === "buy" ? "BUY " : e.type === "sell" ? "SELL " : "BUY FAILED ") + (e.symbol || short(e.mint, 4))),
-          h("div", {class: "dim", style: "font-size:12px"}, (e.type === "sell" ? e.reason + " · held " + heldFor(e.held_s || 0) : e.type === "buy" ? e.sol + " SOL" : (e.info || "")) + " · " + ago(e.t))),
+          h("div", {class: "dim", style: "font-size:12px"}, (e.type === "sell" ? e.reason + " · held " + heldFor(e.held_s || 0) + (e.trades != null ? " · " + e.trades + " trades seen" : "") : e.type === "buy" ? e.sol + " SOL" : (e.info || "")) + " · " + ago(e.t))),
         e.type === "sell" ? h("b", {style: "color:" + pnlColor(e.est_pnl_sol)}, sol(e.est_pnl_sol)) : null))
         : [h("div", {class: "dim", style: "padding:16px"}, "No trades yet.")];
     }
