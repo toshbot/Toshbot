@@ -3171,6 +3171,16 @@ svg{display:block}
 #tabbar a{position:relative;flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 0 7px;font-size:10.5px;font-weight:650;color:var(--mute);border-radius:28px;transition:background .3s var(--spring),color .2s,transform .35s var(--spring)}
 #tabbar a:active{transform:scale(.93)}
 #tabbar a.on{color:var(--blue);background:var(--g-bg2);box-shadow:inset 0 1.5px 0 var(--g-hi),inset 0 -1px 0 var(--g-lo),0 4px 14px rgba(0,0,0,.14)}
+#tabbar a[data-r="trades"]{flex:1.35;color:#fff;background:linear-gradient(135deg,#10b981 0%,#2563eb 100%);box-shadow:0 6px 18px rgba(37,99,235,.45),inset 0 1.5px 0 rgba(255,255,255,.35)}
+#tabbar a[data-r="trades"] svg{width:26px;height:26px}
+#tabbar a[data-r="trades"].on{color:#fff;background:linear-gradient(135deg,#34d399 0%,#3b82f6 100%);box-shadow:0 6px 22px rgba(59,130,246,.65),inset 0 1.5px 0 rgba(255,255,255,.45)}
+.menuwrap{position:relative}
+.menu{position:absolute;right:0;top:calc(100% + 10px);min-width:220px;padding:6px;border-radius:22px;z-index:60;background:rgba(24,28,38,.97);border:1px solid var(--g-line);box-shadow:0 18px 50px rgba(0,0,0,.5);-webkit-backdrop-filter:blur(28px);backdrop-filter:blur(28px)}
+[data-theme="light"] .menu{background:rgba(255,255,255,.98);box-shadow:0 18px 50px rgba(0,0,0,.18)}
+.menu[hidden]{display:none}
+.menu a,.menu button{display:flex;align-items:center;gap:12px;width:100%;box-sizing:border-box;padding:13px 14px;border:0;border-radius:16px;background:none;font:inherit;font-size:15px;font-weight:650;color:var(--text);text-align:left;text-decoration:none;cursor:pointer}
+.menu a:active,.menu button:active{background:rgba(128,128,128,.2)}
+@media(hover:hover){.menu a:hover,.menu button:hover{background:rgba(128,128,128,.16)}}
 @media(min-width:900px){#rail{display:flex}#tabbar{display:none}.page{padding-bottom:60px}.mob-only{display:none!important}}
 @media(max-width:899px){.desk-only{display:none!important}}
 
@@ -3355,10 +3365,15 @@ footer{max-width:1080px;margin:0 auto;padding:0 20px 24px;color:var(--dim);font-
       <span class="desk-only dim" style="font-size:13px">Live security analysis for new Solana launches</span>
       <div class="tools">
         <span class="feed"><span id="pdot" class="dot"></span><span id="ptxt">Connecting…</span></span>
-        <button class="ibtn" id="themebtn" aria-label="Switch theme"></button>
         <a class="ibtn" href="#/settings" aria-label="Settings" id="setbtn"></a>
-        <a class="ibtn mob-only" href="#/system" aria-label="System health" id="sysbtn"></a>
-        <a class="ibtn" href="/logout" aria-label="Sign out" id="outbtn"></a>
+        <div class="menuwrap">
+          <button class="ibtn" id="menubtn" aria-label="Menu" aria-haspopup="true" aria-expanded="false"></button>
+          <div class="menu" id="menu" hidden>
+            <button type="button" id="mtheme"></button>
+            <a href="#/system" id="msys"></a>
+            <a href="/logout" id="mout"></a>
+          </div>
+        </div>
       </div>
     </div></header>
     <div id="banner"></div>
@@ -3416,6 +3431,7 @@ const ICONS = {
   search:'<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   expand:'<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
   shrink:'<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
+  dots:'<circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/>',
   bolt:'<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
   sliders:'<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
   logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"/><path d="m16 8 4 4-4 4M20 12H9"/>'
@@ -3840,23 +3856,32 @@ function tokenView(mint) {
 }
 
 /* ---------- router ---------- */
-const NAV = [["", "Home", "home"], ["scanner", "Scanner", "radar"], ["passed", "Picks", "shield"], ["trades", "Trades", "bolt"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
+const NAV = [["", "Home", "home"], ["scanner", "Scanner", "radar"], ["trades", "Trades", "bolt"], ["passed", "Picks", "shield"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
+const TABS = NAV.filter(([r]) => r !== "review");  // the bottom bar has no Review tab; it is still on Home and in the side rail
 function buildNav() {
   const mk = (cls) => (r, l, ic) => h("a", {href: "#/" + r, "data-r": r}, icon(ic, cls === "rail" ? 20 : 22), cls === "rail" ? l : h("span", {}, l));
   document.getElementById("railnav").replaceChildren(...NAV.map(([r, l, ic]) => mk("rail")(r, l, ic)));
   document.getElementById("railsys").replaceChildren(mk("rail")("settings", "Settings", "sliders"), mk("rail")("system", "System health", "pulse"));
-  document.getElementById("tabbar").replaceChildren(...NAV.map(([r, l, ic]) => mk("tab")(r, l, ic)));
+  document.getElementById("tabbar").replaceChildren(...TABS.map(([r, l, ic]) => mk("tab")(r, l, ic)));
   document.getElementById("logo1").replaceChildren(logo(36));
   document.getElementById("logo2").replaceChildren(logo(30));
-  document.getElementById("sysbtn").replaceChildren(icon("pulse", 19));
   document.getElementById("setbtn").replaceChildren(icon("sliders", 19));
-  document.getElementById("outbtn").replaceChildren(icon("logout", 19));
+  document.getElementById("menubtn").replaceChildren(icon("dots", 20));
+  document.getElementById("msys").replaceChildren(icon("pulse", 18), h("span", {}, "System health"));
+  document.getElementById("mout").replaceChildren(icon("logout", 18), h("span", {}, "Sign out"));
 }
 function themeIcon() {
   const dark = document.documentElement.getAttribute("data-theme") !== "light";
-  document.getElementById("themebtn").replaceChildren(icon(dark ? "sun" : "moon", 19));
+  document.getElementById("mtheme").replaceChildren(icon(dark ? "sun" : "moon", 18), h("span", {}, dark ? "Light mode" : "Dark mode"));
 }
-document.getElementById("themebtn").addEventListener("click", () => {
+const menu = document.getElementById("menu"), menubtn = document.getElementById("menubtn");
+function menuOpen(on) { menu.hidden = !on; menubtn.setAttribute("aria-expanded", on ? "true" : "false"); }
+menubtn.addEventListener("click", (e) => { e.stopPropagation(); menuOpen(menu.hidden); });
+menu.addEventListener("click", () => menuOpen(false));
+document.addEventListener("click", (e) => { if (!menu.hidden && !menu.contains(e.target)) menuOpen(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") menuOpen(false); });
+window.addEventListener("hashchange", () => menuOpen(false));
+document.getElementById("mtheme").addEventListener("click", () => {
   const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
   document.documentElement.setAttribute("data-theme", next);
   try { localStorage.setItem("tosh-theme", next); } catch (e) {}
