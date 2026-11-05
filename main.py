@@ -1860,7 +1860,7 @@ class AnalysisWorker:
             return None
         report = await self.analyzer.analyze(token)
         self.metrics.analyses += 1
-        if self.on_report is not None and report.status == "QUALIFIED":
+        if self.on_report is not None and report.status in ("QUALIFIED", "WATCH"):
             try:
                 await self.on_report(token, report)
             except Exception:
@@ -2177,6 +2177,7 @@ class Trader:
         self.wallet = str(acct.get("wallet") or "")
         self.buy_sol = float(acct.get("buy_sol") or cfg.trade_buy_sol)
         self.max_open = int(acct.get("max_open") or cfg.trade_max_open)
+        self.entry = "picks" if acct.get("entry") == "picks" else "buy"  # buy = BUY signals only; picks = every rising Top pick
         self.max_daily_loss = float(acct.get("max_daily_loss_sol") or cfg.trade_max_daily_loss_sol)
         self.rpc, self.balance_sol, self._bal_at = rpc, None, 0.0
         self.store, self.auto, self._seq = store, bool(acct.get("auto", True)), 0
@@ -2272,7 +2273,9 @@ class Trader:
     # ---- entry ----
     async def consider(self, token: "TokenRecord", report: "SecurityReport") -> None:
         """Called after every analysis. Buys only on a fresh BUY that is also rising at this moment."""
-        if self.mode == "off" or report.status != "QUALIFIED":
+        if self.mode == "off" or report.status not in ("QUALIFIED", "WATCH"):
+            return
+        if report.status == "WATCH" and self.entry != "picks":
             return
         c = self.cfg
         async with self._lock:
@@ -2288,6 +2291,10 @@ class Trader:
             live = live_state(stats, c.pick_fall_change_pct, c.pick_max_drawdown_pct, c.pick_quiet_seconds)
             if not live or live["state"] != "rising" or stats.mcap_now is None or stats.mcap_now > c.signal_max_mcap_sol:
                 return
+            if report.status == "WATCH":  # a pick without the full BUY evidence: still needs real, broad, buyer-led trading
+                if (stats.n_trades < 5 or stats.unique_buyers < 3 or (stats.buy_pressure_pct or 0) < 55
+                        or (stats.mcap_change_pct or 0) > c.signal_max_mcap_change_pct):
+                    return
             self.traded[mint] = self._clock()
             while len(self.traded) > 5000:
                 self.traded.popitem(last=False)
@@ -2388,7 +2395,7 @@ class Trader:
             out.append({**{k: p[k] for k in ("mint", "symbol", "sol_in", "entry_mcap", "peak_mcap", "sell_fails")},
                         "pnl_pct": round((mc / p["entry_mcap"] - 1) * 100, 1) if mc else None, "held_s": round(self._clock() - p["opened_at"])})
         return {"account": self.name, "wallet": self.wallet or None, "wallet_balance_sol": self.balance_sol, "buy_sol": self.buy_sol,
-                "mode": self.mode, "auto": self.auto, "paused": self.paused, "pause_reason": self.pause_reason, "open": out,
+                "mode": self.mode, "entry": self.entry, "auto": self.auto, "paused": self.paused, "pause_reason": self.pause_reason, "open": out,
                 "day_pnl_sol_estimate": round(self.day_pnl_sol, 4), "daily_loss_limit_sol": self.max_daily_loss,
                 "history": list(self.history)[:50], "note": "Profit is estimated from the market cap, not read from the wallet."}
 
@@ -2409,6 +2416,7 @@ class AccountIn(BaseModel):
     max_open: int = 3
     max_daily_loss_sol: float = 0.2
     confirm_live: bool = False
+    entry: Literal["buy", "picks"] = "buy"  # buy = only BUY signals, picks = also every rising Top pick
 
 
 class TradingManager:
@@ -2468,7 +2476,7 @@ class TradingManager:
     def public(a: dict) -> dict:
         k = a.get("api_key") or ""
         return {"name": a["name"], "mode": a["mode"], "wallet": a.get("wallet") or "", "buy_sol": a.get("buy_sol"),
-                "max_open": a.get("max_open"), "max_daily_loss_sol": a.get("max_daily_loss_sol"),
+                "max_open": a.get("max_open"), "max_daily_loss_sol": a.get("max_daily_loss_sol"), "entry": a.get("entry", "buy"),
                 "has_key": bool(k), "api_key_hint": ("…" + k[-4:]) if len(k) >= 8 else ""}
 
     async def upsert(self, a: AccountIn) -> dict:
@@ -2497,10 +2505,10 @@ class TradingManager:
             if t and t.positions and changed:
                 raise TradingError("Close the open trades (Sell all) before changing the mode or key", 409)
             new = {"name": name, "mode": a.mode, "api_key": key, "wallet": wallet, "buy_sol": a.buy_sol, "max_open": a.max_open,
-                   "max_daily_loss_sol": a.max_daily_loss_sol,
+                   "max_daily_loss_sol": a.max_daily_loss_sol, "entry": a.entry,
                    "auto": (old["auto"] if old and not changed else a.mode == "paper")}  # a new or switched real account starts OFF
             if t and not changed:
-                t.buy_sol, t.max_open, t.max_daily_loss, t.wallet = a.buy_sol, a.max_open, a.max_daily_loss_sol, wallet
+                t.buy_sol, t.max_open, t.max_daily_loss, t.wallet, t.entry = a.buy_sol, a.max_open, a.max_daily_loss_sol, wallet, a.entry
                 self.cfgs[name] = new
             else:
                 if t:
@@ -3682,6 +3690,8 @@ function settingsView() {
     const name = h("input", {value: v.name, maxlength: "24", autocomplete: "off", autocapitalize: "off", placeholder: "e.g. me", disabled: isNew ? null : "disabled"});
     const mode = h("select", {}, h("option", {value: "paper"}, "Demo (practice, no money)"), h("option", {value: "live"}, "Real (uses real money)"));
     mode.value = v.mode;
+    const entry = h("select", {}, h("option", {value: "buy"}, "Only BUY signals (safer, fewer trades)"), h("option", {value: "picks"}, "Every rising Top pick (more trades, riskier)"));
+    entry.value = v.entry || "buy";
     const key = h("input", {type: "password", autocomplete: "off", placeholder: a && a.has_key ? "Saved (" + a.api_key_hint + "). Leave blank to keep it" : "Paste your PumpPortal API key"});
     const wallet = h("input", {value: v.wallet, autocomplete: "off", autocapitalize: "off", spellcheck: "false", placeholder: "Public wallet address (to show the balance)"});
     const buy = h("input", {type: "number", step: "0.01", min: "0.001", value: v.buy_sol, inputmode: "decimal"});
@@ -3696,7 +3706,7 @@ function settingsView() {
       err.textContent = "";
       try {
         await send("POST", "/trading/accounts", {name: name.value.trim(), mode: mode.value, api_key: key.value.trim(), wallet: wallet.value.trim(),
-          buy_sol: parseFloat(buy.value), max_open: parseInt(open.value, 10), max_daily_loss_sol: parseFloat(loss.value), confirm_live: confirmBox.checked});
+          entry: entry.value, buy_sol: parseFloat(buy.value), max_open: parseInt(open.value, 10), max_daily_loss_sol: parseFloat(loss.value), confirm_live: confirmBox.checked});
         toast("Saved" + (mode.value === "live" && (isNew || !a || a.mode !== "live") ? ". Auto trading starts OFF, turn it on in Trades." : ""), 4000);
         loaded = false; await refresh();
       } catch (e) { err.textContent = e.message; }
@@ -3707,7 +3717,7 @@ function settingsView() {
     }}, "Remove");
     return h("div", {}, f("Account name", name), f("Mode", mode, "Start in Demo. Real mode needs the API key from pumpportal.fun."),
       f("PumpPortal API key", key, "Stored on your server only. Never shown again."), f("Wallet address", wallet, "PUBLIC address only. Never paste a private key here."),
-      f("Buy size per trade (SOL)", buy), f("Most trades open at once", open), f("Stop buying for the day after losing (SOL)", loss), confirmRow, err, h("div", {class: "btns"}, save, del));
+      f("What to trade", entry, "Rising Top picks are tokens that passed the security checks and are climbing now, but without the full BUY evidence."), f("Buy size per trade (SOL)", buy), f("Most trades open at once", open), f("Stop buying for the day after losing (SOL)", loss), confirmRow, err, h("div", {class: "btns"}, save, del));
   }
   function alertsCard() {
     const on = () => localStorage.getItem("tosh-notify") === "1";
