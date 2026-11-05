@@ -14,7 +14,7 @@ Detection and analysis only: no trading, no guarantees. Missing data is never tr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 import logging
-from collections import Counter, OrderedDict, deque
+from collections import OrderedDict, deque
 import sys
 from datetime import datetime, timezone
 import re
@@ -91,9 +91,9 @@ class Settings(BaseSettings):
 
     # Analysis workers
     analysis_enabled: bool = True
-    analysis_workers: int = 6
+    analysis_workers: int = 2
     analysis_queue_maxsize: int = 2000
-    analysis_retry_delays: str = "2,4,8,15,30"  # seconds between re-tries while evidence is unavailable
+    analysis_retry_delays: str = "5,20,60"  # seconds between re-tries while evidence is unavailable
 
     # Security thresholds. EXPERIMENTAL starting values, not calibrated. Authority/extension rules are NOT configurable.
     evidence_max_age_seconds: int = 900
@@ -107,84 +107,26 @@ class Settings(BaseSettings):
     # Live buy signal (trade feed). EXPERIMENTAL starting values, not calibrated on real results.
     signals_enabled: bool = True           # watch trades of WATCH tokens and allow QUALIFIED (= BUY light). False = never QUALIFIED
     signal_window_minutes: float = 30.0    # how long one token is watched for a buy signal
-    signal_max_tracked: int = 400          # most tokens watched at once
-    signal_review_seconds: int = 5         # how often a watched token is re-evaluated
+    signal_max_tracked: int = 150          # most tokens watched at once
+    signal_review_seconds: int = 30        # how often a watched token is re-evaluated
     security_recheck_seconds: int = 120    # RPC security checks are reused between signal reviews for this long
     review_save_seconds: int = 180         # unchanged re-reviews are saved at most this often (protects database quota)
-    signal_min_observe_seconds: int = 20
-    signal_min_trades: int = 6
-    signal_min_unique_buyers: int = 4
+    signal_min_observe_seconds: int = 90
+    signal_min_trades: int = 15
+    signal_min_unique_buyers: int = 8
     signal_min_distinct_sellers: int = 2
     signal_max_top_trader_pct: float = 35.0
     signal_max_wash_pct: float = 50.0
-    signal_momentum_window_seconds: int = 60
+    signal_momentum_window_seconds: int = 120
     signal_min_mcap_change_pct: float = 3.0
     signal_max_mcap_change_pct: float = 150.0
     signal_max_drawdown_pct: float = 20.0
     signal_min_buy_pressure_pct: float = 60.0
-    signal_min_new_buyers: int = 2
-    signal_max_trade_age_seconds: int = 20
+    signal_min_new_buyers: int = 3
+    signal_max_trade_age_seconds: int = 45
     signal_max_mcap_sol: float = 60.0
     signal_min_curve_sol: float = 5.0
     qualify_min_score: float = 65.0
-
-    # Speed lane. Watch trades from the first second after launch, hide falling coins from Top picks.
-    fast_track_enabled: bool = True        # start watching trades at launch instead of after the security verdict
-    nonblocking_retries: bool = True       # a token waiting for data no longer blocks an analysis worker
-    fast_lane_seconds: int = 90            # a launch that has not passed the security check by now stops being watched (keeps slots free for new launches)
-    signal_idle_drop_seconds: int = 120    # stop watching a token with no trade for this long (frees the slot)
-    pick_fall_change_pct: float = -1.0     # price change over the momentum window at or below this = falling
-    pick_max_drawdown_pct: float = 25.0    # this far below its peak = falling
-    pick_quiet_seconds: int = 30           # no trade for this long = quiet (not a live pick)
-
-    # Automated trading. Default is PAPER (simulated, no money). Live needs TRADING_MODE=live AND a PumpPortal key.
-    trading_mode: str = "paper"            # off | paper | live
-    pumpportal_api_key: str = ""           # Lightning wallet API key. Env var only, never commit it
-    trade_buy_sol: float = 0.05            # SOL per buy
-    trade_max_open: int = 3                # most positions held at once
-    trade_max_daily_loss_sol: float = 0.2  # buying stops for the day when estimated losses reach this
-    trade_slippage_pct: float = 25.0
-    trade_priority_fee_sol: float = 0.001
-    trade_pool: str = "pump"
-    trade_stop_loss_pct: float = 20.0
-    trade_take_profit_pct: float = 80.0
-    trade_trail_activate_pct: float = 20.0 # trailing stop switches on after this much profit
-    trade_trail_pct: float = 15.0          # ... and sells when price falls this far from the peak
-    trade_max_hold_seconds: int = 600
-    trade_stale_seconds: int = 45          # sell if nobody has traded it for this long
-    # Sniper (entry = "snipe"): buy seconds after launch once the first trades show it is climbing, sell the moment it turns down
-    # Launch sniper (entry = "launch"): buy the instant a coin is launched, judged only by what is known at second zero
-    launch_dev_buy_min_sol: float = 0.5    # the creator must put real money in ...
-    launch_dev_buy_max_sol: float = 4.0    # ... but not so much that they hold a dump-sized bag
-    launch_max_dev_supply_pct: float = 15.0
-    launch_min_mcap_sol: float = 25.0
-    launch_max_mcap_sol: float = 50.0
-    launch_max_creator_launches_per_hour: int = 2   # serial launchers are token farms
-    launch_max_same_symbol: int = 3        # the same ticker 4+ times in 10 minutes = spam wave
-    launch_max_per_minute: int = 4         # never more than this many launch buys a minute
-    launch_stale_seconds: int = 75         # sell only if NOBODY has traded it for this long (gives the market time to find it)
-    launch_max_hold_seconds: int = 300     # after this, sell unless it is clearly winning (winners ride until the trailing stop)
-    launch_hard_cap_seconds: int = 1200
-    launch_stop_loss_pct: float = 20.0     # wider than the momentum sniper: a fresh coin has a thin, jumpy price
-    launch_trail_pct: float = 20.0
-    snipe_window_seconds: int = 30         # only coins launched in the last N seconds are considered
-    snipe_min_trades: int = 2
-    snipe_min_buyers: int = 2
-    snipe_min_change_pct: float = 4.0      # must already be up this much since its first trade ("skyrocketing")
-    snipe_max_mcap_sol: float = 40.0       # do not chase a coin that is already this big
-    snipe_stop_loss_pct: float = 15.0
-    snipe_trail_pct: float = 12.0          # sell when price drops this far from its peak, from the first second
-    snipe_take_profit_pct: float = 300.0
-    snipe_max_hold_seconds: int = 120
-    snipe_stale_seconds: int = 12
-    snipe_slippage_pct: float = 30.0
-    snipe_priority_fee_sol: float = 0.001
-    snipe_paper_extra_slippage_pct: float = 8.0  # demo mode adds this per side: a real order lands 1-3 seconds after the decision
-    trade_paper_slippage_pct: float = 3.0  # paper mode assumes this slippage each way (plus the 0.5% fee)
-    # Several people / wallets: JSON list, e.g. [{"name":"me","api_key":"...","wallet":"PUBLIC_ADDRESS","buy_sol":0.05},{"name":"friend","api_key":"...","wallet":"...","mode":"paper"}]
-    # Each account trades its own wallet with its own limits. "mode" is optional (default = TRADING_MODE). Empty = one account from PUMPPORTAL_API_KEY.
-    trading_accounts: str = ""
-    trade_state_path: str = "trading_state.json"  # open positions survive a restart if this file survives (Render disks are wiped on deploy)
 
     @property
     def persist_status_set(self) -> set[str] | None:
@@ -280,7 +222,6 @@ class TokenRecord(BaseModel):
     latest_report_id: str | None = None
     opportunity_score: float | None = None  # PARTIAL evidence score 0-100 (see security report); None = not computed
     schema_version: int = 1
-    live: dict[str, Any] | None = None  # computed per request from the in-memory trade book, never stored
 
     @classmethod
     def from_event(cls, event: LaunchEvent) -> "TokenRecord":
@@ -762,13 +703,6 @@ class Repository(ABC):
     @abstractmethod
     async def count_recent_tokens_by_creator(self, creator: str, since: datetime) -> int: ...
 
-    async def kv_get(self, key: str) -> dict | None:
-        """Small app settings (trading accounts, trader state). Stored with the same database as the tokens."""
-        raise NotImplementedError
-
-    async def kv_set(self, key: str, value: dict) -> None:
-        raise NotImplementedError
-
     @abstractmethod
     async def ping(self) -> bool: ...
 
@@ -788,7 +722,6 @@ class InMemoryRepository(Repository):
         self.events: dict[str, dict] = {}
         self.jobs: dict[str, dict] = {}
         self.reports: dict[str, list[tuple[str, SecurityReport]]] = {}
-        self.kv: dict[str, dict] = {}
 
     async def record_launch_event(self, event: LaunchEvent) -> bool:
         key = event_doc_id(event)
@@ -850,12 +783,6 @@ class InMemoryRepository(Repository):
 
     async def count_recent_tokens_by_creator(self, creator: str, since: datetime) -> int:
         return sum(1 for t in self.tokens.values() if t.creator == creator and t.detected_at >= since)
-
-    async def kv_get(self, key: str) -> dict | None:
-        return json.loads(json.dumps(self.kv[key])) if key in self.kv else None
-
-    async def kv_set(self, key: str, value: dict) -> None:
-        self.kv[key] = json.loads(json.dumps(value, default=str))
 
     async def ping(self) -> bool:
         return True
@@ -996,12 +923,6 @@ class CachedRepository(Repository):
             return await self.inner.count_recent_tokens_by_creator(creator, since)
         return sum(1 for ts in self.creator_log.get(creator, []) if ts >= since)
 
-    async def kv_get(self, key: str) -> dict | None:
-        return await self.inner.kv_get(key)
-
-    async def kv_set(self, key: str, value: dict) -> None:
-        await self.inner.kv_set(key, value)
-
     async def ping(self) -> bool:
         return await self.inner.ping()
 
@@ -1020,7 +941,6 @@ class FirestoreRepository(Repository):
         self._tokens = client.collection(f"{prefix}tokens")
         self._events = client.collection(f"{prefix}token_launch_events")
         self._jobs = client.collection(f"{prefix}analysis_runs")
-        self._kv = client.collection(f"{prefix}app_settings")
 
     async def _create(self, ref, data: dict) -> bool:
         try:
@@ -1103,13 +1023,6 @@ class FirestoreRepository(Repository):
         # equality-only query (no composite index needed); the date filter is applied here
         query = self._tokens.where(filter=FieldFilter("creator", "==", creator)).limit(500)
         return sum([1 async for doc in query.stream() if doc.to_dict().get("detected_at") >= since])
-
-    async def kv_get(self, key: str) -> dict | None:
-        snap = await self._kv.document(key).get()
-        return snap.to_dict() if snap.exists else None
-
-    async def kv_set(self, key: str, value: dict) -> None:
-        await self._kv.document(key).set(json.loads(json.dumps(value, default=str)))
 
     async def ping(self) -> bool:
         try:
@@ -1452,8 +1365,6 @@ class TradeTracker:
         self._finished: OrderedDict[str, float] = OrderedDict()
         self.pending_sub: set[str] = set()
         self.pending_unsub: set[str] = set()
-        self._pinned: set[str] = set()
-        self.dumpers: set[str] = set()  # creators seen selling their own token
         self.trades_seen = 0
 
     def is_tracked(self, mint: str) -> bool:
@@ -1462,18 +1373,14 @@ class TradeTracker:
     def active(self) -> int:
         return len(self._tok)
 
-    def track(self, mint: str, creator: str | None = None, reviewable: bool = True, symbol: str | None = None) -> bool:
-        """True if this token is being watched. False if its window already ended or the tracker is full.
-        reviewable=False (launch fast lane): trades are recorded but the token is not re-analysed until the security
-        verdict turns it into a WATCH token, so early watching never multiplies RPC calls."""
+    def track(self, mint: str, creator: str | None = None) -> bool:
+        """True if this token is being watched. False if its window already ended or the tracker is full."""
         if mint in self._tok:
-            if reviewable:
-                self._tok[mint]["review"] = True
             return True
         if mint in self._finished or len(self._tok) >= self.max_tracked:
             return False
         now = self._clock()
-        self._tok[mint] = {"since": now, "creator": creator, "trades": deque(maxlen=self.max_trades), "last_review": now, "review": reviewable, "symbol": symbol}
+        self._tok[mint] = {"since": now, "creator": creator, "trades": deque(maxlen=self.max_trades), "last_review": now}
         self.pending_sub.add(mint)
         self.pending_unsub.discard(mint)
         return True
@@ -1487,23 +1394,12 @@ class TradeTracker:
         self.pending_sub.discard(mint)
         self.pending_unsub.add(mint)
 
-    def release(self, mint: str) -> None:
-        """Stop watching without closing the token's window: it can be watched again if analysis later clears it."""
-        if self._tok.pop(mint, None) is None:
-            return
-        self.pending_sub.discard(mint)
-        self.pending_unsub.add(mint)
-
     def add(self, trade: Trade) -> bool:
         rec = self._tok.get(trade.mint)
         if rec is None:
             return False
         rec["trades"].append(trade)
         self.trades_seen += 1
-        if trade.side == "sell" and rec.get("creator") and trade.wallet == rec["creator"]:
-            if len(self.dumpers) > 20000:
-                self.dumpers.pop()
-            self.dumpers.add(rec["creator"])
         return True
 
     def resubscribe_all(self) -> None:
@@ -1516,45 +1412,13 @@ class TradeTracker:
 
     def expired(self, now: float | None = None) -> list[str]:
         now = self._clock() if now is None else now
-        return [m for m, r in self._tok.items() if now - r["since"] >= self.window and m not in self._pinned]
-
-    def is_reviewable(self, mint: str) -> bool:
-        rec = self._tok.get(mint)
-        return bool(rec and rec.get("review", True))
-
-    def recent(self, max_age: float, now: float | None = None) -> list[tuple[str, str | None, str | None]]:
-        """(mint, creator, symbol) of watched tokens that launched within the last max_age seconds."""
-        now = self._clock() if now is None else now
-        return [(m, r.get("creator"), r.get("symbol")) for m, r in self._tok.items() if now - r["since"] <= max_age]
-
-    def stale_fast(self, after: float, now: float | None = None) -> list[str]:
-        """Launch-lane tokens (never confirmed by the security check) older than `after` seconds, not held by a trade."""
-        now = self._clock() if now is None else now
-        return [m for m, r in self._tok.items() if not r.get("review", True) and now - r["since"] >= after and m not in self._pinned]
-
-    def pin(self, mint: str) -> None:
-        self._pinned.add(mint)  # held positions are never dropped or expired while we own them
-
-    def unpin(self, mint: str) -> None:
-        self._pinned.discard(mint)
-
-    def idle(self, after: float, now: float | None = None) -> list[str]:
-        """Watched tokens nobody has traded for `after` seconds (or ever). Dropping them frees slots for live coins."""
-        now = self._clock() if now is None else now
-        out = []
-        for m, r in self._tok.items():
-            if m in self._pinned:
-                continue
-            last = r["trades"][-1].ts if r["trades"] else r["since"]
-            if now - last >= after:
-                out.append(m)
-        return out
+        return [m for m, r in self._tok.items() if now - r["since"] >= self.window]
 
     def due(self, interval: float, now: float | None = None) -> list[str]:
         now = self._clock() if now is None else now
         out = []
         for m, r in self._tok.items():
-            if r.get("review", True) and now - r["last_review"] >= interval:
+            if now - r["last_review"] >= interval:
                 r["last_review"] = now
                 out.append(m)
         return out
@@ -1565,46 +1429,6 @@ class TradeTracker:
             return None
         now = self._clock() if now is None else now
         return compute_stats(list(rec["trades"]), rec["creator"], rec["since"], now, self.momentum_window)
-
-
-def live_state(stats: TradeStats | None, fall_change_pct: float, max_drawdown_pct: float, quiet_seconds: float) -> dict | None:
-    """What the coin is doing right now. None = not being watched (its trades are unknown, so it is never a live pick)."""
-    if stats is None:
-        return None
-    if stats.n_trades < 3:
-        state = "new"            # watched, too few trades to say which way it is moving
-    elif stats.last_trade_age is None or stats.last_trade_age > quiet_seconds:
-        state = "quiet"
-    elif (stats.mcap_change_pct is not None and stats.mcap_change_pct <= fall_change_pct) or \
-         (stats.drawdown_pct is not None and stats.drawdown_pct > max_drawdown_pct):
-        state = "falling"
-    elif stats.mcap_change_pct is not None and stats.mcap_change_pct > 0:
-        state = "rising"
-    else:
-        state = "steady"
-    r = lambda v: None if v is None else round(v, 1)
-    return {"state": state, "change_pct": r(stats.mcap_change_pct), "drawdown_pct": r(stats.drawdown_pct),
-            "buy_pressure_pct": r(stats.buy_pressure_pct), "trades": stats.n_trades, "buyers": stats.unique_buyers,
-            "window_seconds": stats.window_seconds, "last_trade_age": r(stats.last_trade_age), "mcap_sol": r(stats.mcap_now)}
-
-
-STATE_RANK = {"rising": 4, "steady": 3, "new": 2, "quiet": 1, "unwatched": 0}  # "falling" is never listed as a pick
-
-
-def enrich_live(rows: list, tracker: "TradeTracker | None", cfg: Settings) -> list:
-    """Copies of the rows with live trend attached. Never mutates cached records."""
-    out = []
-    for t in rows:
-        live = live_state(tracker.snapshot(t.mint), cfg.pick_fall_change_pct, cfg.pick_max_drawdown_pct, cfg.pick_quiet_seconds) if tracker else None
-        live = live or {"state": "unwatched", "change_pct": None}  # no live trades for it (restart, or it went dead)
-        out.append(t.model_copy(update={"live": live}))
-    return out
-
-
-def pick_rank(t) -> tuple:
-    """BUY first, then the strongest live climb (capped so a one-candle spike does not outrank steady buying), then score."""
-    chg = (t.live or {}).get("change_pct") or 0.0
-    return (1 if t.status == "QUALIFIED" else 0, STATE_RANK.get((t.live or {}).get("state"), 0), min(max(chg, 0.0), 150.0), t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at)
 
 
 @dataclass
@@ -1825,8 +1649,6 @@ class SecurityAnalyzer:
         tr, p = self.tracker, self.policy
         if status in ("REJECTED", "REVOKED"):
             tr.untrack(token.mint)
-        elif status == "HOLD":
-            tr.release(token.mint)  # suspicious on-chain: free the slot, it can be watched again if later checks clear it
         if status != "WATCH":
             return status, reason, reasons, next_review, [], None
         tracked = tr.track(token.mint, token.creator)
@@ -1884,13 +1706,8 @@ class AnalysisWorker:
 
     def __init__(self, repo: Repository, analyzer: SecurityAnalyzer, queue: asyncio.Queue, health: HealthRegistry,
                  metrics: Metrics, *, retry_delays: list[float] | None = None, sleep=asyncio.sleep,
-                 save_all_attempts: bool = True, store_jobs: bool = True, review_save_seconds: float = 0.0,
-                 nonblocking_retries: bool = False, retry_state: dict | None = None, on_report=None) -> None:
-        self.on_report = on_report  # async (token, report): lets the trader react the moment a BUY appears
+                 save_all_attempts: bool = True, store_jobs: bool = True, review_save_seconds: float = 0.0) -> None:
         self.repo, self.analyzer, self.queue, self.health, self.metrics = repo, analyzer, queue, health, metrics
-        self.nonblocking_retries = nonblocking_retries
-        self._retry_state = retry_state if retry_state is not None else {}  # shared by all workers: mint -> attempt to resume at
-        self._retry_tasks: set = set()
         self.review_save_seconds = review_save_seconds
         self._last_saved: dict[str, float] = {}
         self.retry_delays = retry_delays if retry_delays is not None else [5.0, 20.0, 60.0]
@@ -1904,11 +1721,6 @@ class AnalysisWorker:
             return None
         report = await self.analyzer.analyze(token)
         self.metrics.analyses += 1
-        if self.on_report is not None and report.status in ("QUALIFIED", "WATCH"):
-            try:
-                await self.on_report(token, report)
-            except Exception:
-                log.exception("trade hook failed", extra={"mint": mint})
         # Lean mode: skip saving intermediate "insufficient data" retries (each save is a billable write).
         should_save = self.save_all_attempts or final or report.status != "INSUFFICIENT_DATA"
         if should_save and self.review_save_seconds > 0:
@@ -1928,30 +1740,11 @@ class AnalysisWorker:
             log.info("analysis complete", extra={"mint": mint, "status": report.status, "report_id": report_id})
         return report
 
-    def _retry_later(self, mint: str, attempt: int, delay: float) -> None:
-        """Wait OUTSIDE the worker, then put the mint back on the queue, so a slow token never blocks the others."""
-        self._retry_state[mint] = attempt
-
-        async def later():
-            await self._sleep(delay)
-            try:
-                self.queue.put_nowait(mint)
-            except asyncio.QueueFull:
-                self._retry_state.pop(mint, None)
-        task = asyncio.create_task(later())
-        self._retry_tasks.add(task)
-        task.add_done_callback(self._retry_tasks.discard)
-
     async def process(self, mint: str) -> None:
         report = None
         delays = [0.0, *self.retry_delays]
-        start = self._retry_state.pop(mint, 0) if self.nonblocking_retries else 0
-        for i in range(start, len(delays)):
-            delay = delays[i]
-            if delay and not (i == start and start > 0):  # a resumed attempt already waited its delay
-                if self.nonblocking_retries:
-                    self._retry_later(mint, i, delay)
-                    return
+        for i, delay in enumerate(delays):
+            if delay:
                 await self._sleep(delay)
             report = await self.analyze_once(mint, final=(i == len(delays) - 1))
             if report is None or report.status != "INSUFFICIENT_DATA":
@@ -1977,11 +1770,8 @@ class ReviewScheduler:
     """Re-queues watched tokens for a fresh signal check, and ends their watch window. When a window ends the token
     gets one last analysis with no live data, so a BUY signal can never outlive its evidence."""
 
-    def __init__(self, tracker: TradeTracker, analysis_queue: asyncio.Queue, *, interval: float = 30.0, sleep=asyncio.sleep,
-                 idle_drop_seconds: float = 0.0, fast_lane_seconds: float = 0.0) -> None:
-        self.fast_lane = fast_lane_seconds
+    def __init__(self, tracker: TradeTracker, analysis_queue: asyncio.Queue, *, interval: float = 30.0, sleep=asyncio.sleep) -> None:
         self.tracker, self.queue, self.interval, self._sleep = tracker, analysis_queue, interval, sleep
-        self.idle_drop = idle_drop_seconds
 
     def _enqueue(self, mint: str) -> None:
         if self.queue.maxsize and self.queue.qsize() > self.queue.maxsize * 0.8:
@@ -1992,17 +1782,9 @@ class ReviewScheduler:
             pass
 
     def tick(self) -> None:
-        if self.idle_drop > 0:
-            for mint in self.tracker.idle(self.idle_drop):
-                self.tracker.release(mint)  # dead coin: free the slot
-        if self.fast_lane > 0:
-            for mint in self.tracker.stale_fast(self.fast_lane):
-                self.tracker.release(mint)  # never passed the security check: make room for new launches
         for mint in self.tracker.expired():
-            reviewable = self.tracker.is_reviewable(mint)
             self.tracker.untrack(mint)
-            if reviewable:
-                self._enqueue(mint)  # one last analysis with no live data, so a BUY can never outlive its evidence
+            self._enqueue(mint)
         for mint in self.tracker.due(self.interval):
             self._enqueue(mint)
 
@@ -2086,7 +1868,7 @@ class PumpPortalListener:
                 for method, keys in (("subscribeTokenTrade", subs), ("unsubscribeTokenTrade", unsubs)):
                     for i in range(0, len(keys), 50):
                         await ws.send(json.dumps({"method": method, "keys": keys[i:i + 50]}))
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2143,12 +1925,7 @@ class TokenProcessor:
 
     def __init__(self, repo: Repository, queue: asyncio.Queue, health: HealthRegistry, metrics: Metrics,
                  *, max_attempts: int = 3, sleep=asyncio.sleep, analysis_queue: asyncio.Queue | None = None,
-                 store_events: bool = True, store_jobs: bool = True, max_new_per_day: int = 0,
-                 tracker: "TradeTracker | None" = None) -> None:
-        self.tracker = tracker  # set = start watching trades at launch (speed lane)
-        self.on_launch = None   # async (event): fired the instant a launch arrives, before any database work
-        self._fired: OrderedDict[str, None] = OrderedDict()
-        self._bg: set = set()
+                 store_events: bool = True, store_jobs: bool = True, max_new_per_day: int = 0) -> None:
         self.repo, self.queue, self.health, self.metrics = repo, queue, health, metrics
         self.max_attempts, self._sleep = max_attempts, sleep
         self.analysis_queue = analysis_queue
@@ -2157,13 +1934,6 @@ class TokenProcessor:
 
     async def handle(self, event: LaunchEvent) -> bool:
         """Idempotent: safe to retry and safe for duplicate / delayed / out-of-order events."""
-        if self.on_launch is not None and event.mint not in self._fired:
-            self._fired[event.mint] = None
-            while len(self._fired) > 3000:
-                self._fired.popitem(last=False)
-            task = asyncio.create_task(self.on_launch(event))
-            self._bg.add(task)
-            task.add_done_callback(self._bg.discard)
         today = utcnow().date()
         if today != self._day:
             self._day, self._day_count = today, 0
@@ -2178,8 +1948,6 @@ class TokenProcessor:
         if created:
             self._day_count += 1
             self.metrics.stored += 1
-            if self.tracker is not None:
-                self.tracker.track(event.mint, event.creator, reviewable=False, symbol=event.symbol)  # trades are recorded from second zero, before any verdict
             if self.analysis_queue is not None:
                 try:
                     self.analysis_queue.put_nowait(event.mint)
@@ -2211,613 +1979,6 @@ class TokenProcessor:
                 await self._handle_with_retry(event)
             finally:
                 self.queue.task_done()
-
-
-# ============================================================================
-# app/trader.py  (automated trading: paper by default, live only when explicitly switched on)
-# ============================================================================
-TRADE_API_URL = "https://pumpportal.fun/api/trade"
-
-
-class LaunchBook:
-    """What this process has seen: how often a creator launches, which tickers are being spammed."""
-
-    def __init__(self, clock=time.time) -> None:
-        self._clock = clock
-        self.creators: OrderedDict[str, deque] = OrderedDict()
-        self.symbols: OrderedDict[str, deque] = OrderedDict()
-
-    def _add(self, book: OrderedDict, key: str | None) -> None:
-        if not key:
-            return
-        now = self._clock()
-        q = book.setdefault(key, deque(maxlen=50))
-        q.append(now)
-        book.move_to_end(key)
-        while len(book) > 20000:
-            book.popitem(last=False)
-
-    def record(self, creator: str | None, symbol: str | None) -> None:
-        self._add(self.creators, creator)
-        self._add(self.symbols, (symbol or "").strip().upper() or None)
-
-    def _count(self, book: OrderedDict, key: str | None, within: float) -> int:
-        q = book.get(key or "")
-        if not q:
-            return 0
-        cutoff = self._clock() - within
-        return sum(1 for t in q if t >= cutoff)
-
-    def creator_launches(self, creator: str | None, within: float = 3600) -> int:
-        return self._count(self.creators, creator, within)
-
-    def symbol_launches(self, symbol: str | None, within: float = 600) -> int:
-        return self._count(self.symbols, (symbol or "").strip().upper() or None, within)
-
-
-class Trader:
-    """Buys when a token reaches BUY (QUALIFIED) AND is rising right now. Sells on stop loss, trailing stop, take profit,
-    max hold time, creator selling, or a dead/stale feed. mode: off | paper (simulated, no money) | live (real money via the
-    PumpPortal Lightning wallet). Every limit below is a hard cap. Prices come from the live trade feed (market cap in SOL),
-    so profit numbers are ESTIMATES, not wallet balances."""
-
-    def __init__(self, cfg: Settings, tracker: "TradeTracker", *, client=None, clock=time.time, sleep=asyncio.sleep,
-                 acct: dict | None = None, rpc=None, store=None) -> None:
-        acct = acct or {}
-        self.cfg, self.tracker, self._clock, self._sleep = cfg, tracker, clock, sleep
-        self.name = str(acct.get("name") or "main")
-        self.mode = str(acct.get("mode") or cfg.trading_mode)
-        self.api_key = str(acct.get("api_key") or cfg.pumpportal_api_key)
-        self.wallet = str(acct.get("wallet") or "")
-        self.buy_sol = float(acct.get("buy_sol") or cfg.trade_buy_sol)
-        self.max_open = int(acct.get("max_open") or cfg.trade_max_open)
-        self.entry = acct.get("entry") if acct.get("entry") in ("picks", "snipe", "launch") else "buy"
-        self._launch_buys: deque = deque(maxlen=50)  # buy = BUY signals only; picks = every rising Top pick
-        self.max_daily_loss = float(acct.get("max_daily_loss_sol") or cfg.trade_max_daily_loss_sol)
-        self.rpc, self.balance_sol, self._bal_at = rpc, None, 0.0
-        self.store, self.auto, self._seq = store, bool(acct.get("auto", True)), 0
-        self._why: OrderedDict[str, str] = OrderedDict()  # sniper: why each recent launch was not bought yet
-        self._bg: set = set()
-        self._client = client
-        self.positions: dict[str, dict] = {}
-        self.traded: OrderedDict[str, float] = OrderedDict()  # one entry per token, ever
-        self.history: deque = deque(maxlen=200)
-        self.paused = False
-        self.pause_reason = ""
-        self._day = utcnow().date().isoformat()
-        self.day_pnl_sol = 0.0
-        self._lock = asyncio.Lock()
-
-    # ---- state (kept in the same database as the tokens, so it survives deploys) ----
-    @property
-    def _key(self) -> str:
-        return "trader_state_" + re.sub(r"[^A-Za-z0-9_-]", "", self.name)
-
-    async def load(self) -> None:
-        if self.store is None:
-            return
-        try:
-            d = await self.store.kv_get(self._key)
-            if not d:
-                return
-            self.history = deque(d.get("history", []), maxlen=200)
-            self._seq = max([int(h.get("seq", 0)) for h in self.history] or [0])
-            self.traded = OrderedDict((m, 0.0) for m in d.get("traded", []))
-            if d.get("day") == self._day:
-                self.day_pnl_sol = float(d.get("day_pnl_sol", 0.0))
-            if d.get("mode") != self.mode and d.get("positions"):
-                log.warning("saved positions belong to a different trading mode and were ignored", extra={"account": self.name})
-                return
-            self.positions = d.get("positions", {})
-            for m, p in self.positions.items():
-                self.tracker.track(m, p.get("creator"))
-                self.tracker.pin(m)
-            if self.positions:
-                log.warning("restored open positions", extra={"account": self.name, "count": len(self.positions)})
-        except Exception as exc:
-            log.error("could not read trading state", extra={"account": self.name, "error": str(exc)})
-
-    def _save(self) -> None:
-        if self.store is None:
-            return
-        data = {"mode": self.mode, "day": self._day, "day_pnl_sol": self.day_pnl_sol, "positions": self.positions,
-                "traded": list(self.traded)[-3000:], "history": list(self.history)}
-
-        async def write():
-            try:
-                await self.store.kv_set(self._key, data)
-            except Exception as exc:
-                log.error("could not save trading state", extra={"account": self.name, "error": str(exc)})
-        task = asyncio.get_running_loop().create_task(write())
-        self._bg.add(task)
-        task.add_done_callback(self._bg.discard)
-
-    def _event(self, d: dict) -> None:
-        self._seq += 1
-        self.history.appendleft({"seq": self._seq, "t": utcnow().isoformat(), "account": self.name, **d})
-        self._save()  # positions and history are always written together
-
-    def _roll_day(self) -> None:
-        today = utcnow().date().isoformat()
-        if today != self._day:
-            self._day, self.day_pnl_sol = today, 0.0
-            if self.pause_reason == "daily loss limit":
-                self.paused, self.pause_reason = False, ""
-
-    # ---- execution ----
-    async def _order(self, action: str, mint: str, amount, in_sol: bool, snipe: bool = False) -> tuple[bool, str]:
-        if self.mode != "live":
-            return True, "paper"
-        body = {"action": action, "mint": mint, "amount": amount, "denominatedInSol": "true" if in_sol else "false",
-                "slippage": self.cfg.snipe_slippage_pct if snipe else self.cfg.trade_slippage_pct,
-                "priorityFee": self.cfg.snipe_priority_fee_sol if snipe else self.cfg.trade_priority_fee_sol, "pool": self.cfg.trade_pool}
-        try:
-            if self._client is None:
-                self._client = httpx.AsyncClient(timeout=10)
-            r = await self._client.post(TRADE_API_URL, params={"api-key": self.api_key}, json=body)
-            data = r.json() if r.content else {}
-            if r.status_code == 200 and data.get("signature") and not data.get("errors") and not data.get("error"):
-                return True, str(data["signature"])
-            return False, f"HTTP {r.status_code}: {str(data)[:200]}"
-        except Exception as exc:
-            return False, f"{type(exc).__name__}: {exc}"
-
-    def _net_pnl_sol(self, sol_in: float, entry: float, exit_: float, snipe: bool = False) -> float:
-        fee, slip = 0.005, (self.cfg.trade_paper_slippage_pct + (self.cfg.snipe_paper_extra_slippage_pct if snipe else 0)) / 100
-        gross = sol_in * (exit_ / entry) * ((1 - fee) * (1 - slip)) ** 2
-        return gross - sol_in - 2 * (self.cfg.snipe_priority_fee_sol if snipe else self.cfg.trade_priority_fee_sol)
-
-    # ---- entry ----
-    async def consider(self, token: "TokenRecord", report: "SecurityReport") -> None:
-        """Called after every analysis. Buys only on a fresh BUY that is also rising at this moment."""
-        if self.mode == "off" or report.status not in ("QUALIFIED", "WATCH"):
-            return
-        if self.entry in ("snipe", "launch") or (report.status == "WATCH" and self.entry != "picks"):
-            return
-        c = self.cfg
-        async with self._lock:
-            self._roll_day()
-            mint = token.mint
-            if self.paused or not self.auto or mint in self.traded or mint in self.positions or len(self.positions) >= self.max_open:
-                return
-            if self.day_pnl_sol <= -self.max_daily_loss:
-                self.paused, self.pause_reason = True, "daily loss limit"
-                log.warning("trading paused: daily loss limit reached", extra={"day_pnl_sol": round(self.day_pnl_sol, 4)})
-                return
-            stats = self.tracker.snapshot(mint)
-            live = live_state(stats, c.pick_fall_change_pct, c.pick_max_drawdown_pct, c.pick_quiet_seconds)
-            if not live or live["state"] != "rising" or stats.mcap_now is None or stats.mcap_now > c.signal_max_mcap_sol:
-                return
-            if report.status == "WATCH":  # a pick without the full BUY evidence: still needs real, broad, buyer-led trading
-                if (stats.n_trades < 5 or stats.unique_buyers < 3 or (stats.buy_pressure_pct or 0) < 55
-                        or (stats.mcap_change_pct or 0) > c.signal_max_mcap_change_pct):
-                    return
-            await self._enter(mint, token.symbol, token.creator, stats.mcap_now, snipe=False)
-
-    async def _enter(self, mint: str, symbol: str | None, creator: str | None, entry: float, snipe: bool, launch: bool = False) -> None:
-        """Place the buy and record the position. Caller holds the lock and has already checked every limit."""
-        self.traded[mint] = self._clock()
-        while len(self.traded) > 5000:
-            self.traded.popitem(last=False)
-        ok, info = await self._order("buy", mint, self.buy_sol, True, snipe)
-        if not ok:
-            log.error("BUY failed", extra={"mint": mint, "error": info})
-            self._event({"type": "buy_failed", "mint": mint, "symbol": symbol, "info": info})
-            return
-        self.tracker.track(mint, creator)
-        self.tracker.pin(mint)
-        self.positions[mint] = {"mint": mint, "symbol": symbol, "creator": creator, "sol_in": self.buy_sol, "snipe": snipe, "launch": launch,
-                                "entry_mcap": entry, "peak_mcap": entry, "opened_at": self._clock(), "buy_ref": info, "sell_fails": 0}
-        log.warning("BUY", extra={"mint": mint, "mode": self.mode, "sol": self.buy_sol, "account": self.name, "snipe": snipe, "entry_mcap": round(entry, 2)})
-        self._event({"type": "buy", "mint": mint, "symbol": symbol, "sol": self.buy_sol, "mcap": round(entry, 2), "mode": self.mode, "snipe": snipe, "launch": launch})
-
-    def _launch_filter(self, ev, book: "LaunchBook") -> str:
-        """Everything that can be known at second zero. Returns why NOT to buy, or "" to buy."""
-        c = self.cfg
-        if not ev.mint or not ev.creator:
-            return "bad_data"
-        if ev.pool not in (None, "pump"):
-            return "other_pool"
-        if ev.creator in self.tracker.dumpers:
-            return "known_dumper"
-        if book.creator_launches(ev.creator) > c.launch_max_creator_launches_per_hour:
-            return "serial_creator"
-        sym, name = (ev.symbol or "").strip(), (ev.name or "").strip()
-        if not (2 <= len(sym) <= 12 and 2 <= len(name) <= 40):
-            return "bad_name"
-        if book.symbol_launches(sym) > c.launch_max_same_symbol:
-            return "copycat"
-        if ev.sol_amount is None or ev.sol_amount < c.launch_dev_buy_min_sol:
-            return "dev_buy_small"
-        if ev.sol_amount > c.launch_dev_buy_max_sol:
-            return "dev_buy_big"
-        if ev.initial_buy_tokens:
-            pct = ev.initial_buy_tokens / 1e9 * 100
-            if pct > 100:  # raw units (6 decimals) instead of whole tokens
-                pct /= 1e6
-            if pct > c.launch_max_dev_supply_pct:
-                return "dev_supply"
-        if ev.market_cap_sol is None or not (c.launch_min_mcap_sol <= ev.market_cap_sol <= c.launch_max_mcap_sol):
-            return "mcap_out"
-        return ""
-
-    async def launch_consider(self, ev, book: "LaunchBook") -> None:
-        """Launch sniper: runs the instant a launch event arrives, before anyone has traded the coin."""
-        if self.mode == "off" or self.entry != "launch" or not self.auto or self.paused:
-            return
-        mint = ev.mint
-        if mint in self.traded or mint in self.positions:
-            return
-        why = self._launch_filter(ev, book)
-        async with self._lock:
-            self._roll_day()
-            now = self._clock()
-            if not why:
-                recent = sum(1 for t in self._launch_buys if now - t < 60)
-                if self.paused or len(self.positions) >= self.max_open:
-                    why = "full"
-                elif self.day_pnl_sol <= -self.max_daily_loss:
-                    self.paused, self.pause_reason = True, "daily loss limit"
-                    why = "full"
-                elif recent >= self.cfg.launch_max_per_minute:
-                    why = "rate_limit"
-            self._why[mint] = why or "buying"
-            while len(self._why) > 150:
-                self._why.popitem(last=False)
-            if why:
-                return
-            self._launch_buys.append(now)
-            self.tracker.track(mint, ev.creator, reviewable=False, symbol=ev.symbol)
-            await self._enter(mint, ev.symbol, ev.creator, ev.market_cap_sol, snipe=True, launch=True)
-
-    async def snipe_scan(self) -> None:
-        """Sniper: look at coins that launched seconds ago and buy the ones the first trades show are climbing."""
-        if self.mode == "off" or self.entry != "snipe" or not self.auto or self.paused:
-            return
-        c = self.cfg
-        for mint, creator, symbol in self.tracker.recent(c.snipe_window_seconds):
-            if mint in self.traded or mint in self.positions:
-                continue
-            stats = self.tracker.snapshot(mint)
-            if stats is None or stats.mcap_now is None or stats.n_trades < c.snipe_min_trades:
-                why = "few_trades"
-            elif stats.unique_buyers < c.snipe_min_buyers:
-                why = "one_buyer"
-            elif (stats.mcap_change_pct or 0) < c.snipe_min_change_pct:
-                why = "not_climbing"
-            elif stats.mcap_now > c.snipe_max_mcap_sol:
-                why = "too_big"
-            elif (stats.buy_pressure_pct or 0) < 60:
-                why = "sellers"
-            elif stats.creator_sold_sol > 0:
-                why = "creator_sold"
-            elif stats.last_trade_age is None or stats.last_trade_age > 8:
-                why = "quiet"
-            else:
-                why = ""
-            self._why[mint] = why or "buying"
-            self._why.move_to_end(mint)
-            while len(self._why) > 150:
-                self._why.popitem(last=False)
-            if why:
-                continue
-            async with self._lock:
-                self._roll_day()
-                if self.paused or mint in self.traded or mint in self.positions or len(self.positions) >= self.max_open:
-                    return
-                if self.day_pnl_sol <= -self.max_daily_loss:
-                    self.paused, self.pause_reason = True, "daily loss limit"
-                    return
-                await self._enter(mint, symbol, creator, stats.mcap_now, snipe=True)
-
-    # ---- exits ----
-    def _exit_reason(self, pos: dict, stats: "TradeStats | None") -> tuple[str | None, float | None]:
-        c, now = self.cfg, self._clock()
-        if pos.get("launch"):  # bought at launch: nobody else may have traded it yet, so "no price" is normal at first
-            have = stats is not None and stats.mcap_now is not None
-            mc = stats.mcap_now if have else pos["entry_mcap"]
-            pos["peak_mcap"] = max(pos["peak_mcap"], mc)
-            pnl = (mc / pos["entry_mcap"] - 1) * 100
-            peak_pnl = (pos["peak_mcap"] / pos["entry_mcap"] - 1) * 100
-            held = now - pos["opened_at"]
-            idle = held if not have or stats.last_trade_age is None else min(held, stats.last_trade_age)
-            pos["trades"] = stats.n_trades if stats is not None else 0
-            if pnl <= -c.launch_stop_loss_pct:
-                return f"stop loss ({pnl:.0f}%)", mc
-            if stats is not None and stats.creator_sold_sol > 0:
-                return "creator sold", mc
-            if pnl >= c.snipe_take_profit_pct:
-                return f"take profit (+{pnl:.0f}%)", mc
-            if peak_pnl >= 5 and mc <= pos["peak_mcap"] * (1 - c.launch_trail_pct / 100):
-                return f"turned down (peak {peak_pnl:+.0f}%, now {pnl:+.0f}%)", mc
-            if held >= c.launch_hard_cap_seconds:
-                return f"max hold time ({pnl:+.0f}%)", mc
-            if held >= c.launch_max_hold_seconds and pnl < 10:
-                return f"max hold time ({pnl:+.0f}%)", mc
-            if idle > c.launch_stale_seconds:
-                return f"nobody else came in ({pnl:+.0f}%)" if not have or stats.n_trades <= 1 else f"trading went quiet ({pnl:+.0f}%)", mc
-            return None, mc
-        if stats is None or stats.mcap_now is None:
-            return ("lost price feed", None) if now - pos["opened_at"] > 5 else (None, None)
-        mc = stats.mcap_now
-        pos["peak_mcap"] = max(pos["peak_mcap"], mc)
-        pnl = (mc / pos["entry_mcap"] - 1) * 100
-        peak_pnl = (pos["peak_mcap"] / pos["entry_mcap"] - 1) * 100
-        if pos.get("snipe"):  # tight exits: the moment it turns down, get out
-            if pnl <= -c.snipe_stop_loss_pct:
-                return f"stop loss ({pnl:.0f}%)", mc
-            if stats.creator_sold_sol > 0:
-                return "creator sold", mc
-            if pnl >= c.snipe_take_profit_pct:
-                return f"take profit (+{pnl:.0f}%)", mc
-            if mc <= pos["peak_mcap"] * (1 - c.snipe_trail_pct / 100):
-                return f"turned down (peak {peak_pnl:+.0f}%, now {pnl:+.0f}%)", mc
-            if now - pos["opened_at"] >= c.snipe_max_hold_seconds:
-                return f"max hold time ({pnl:+.0f}%)", mc
-            if stats.last_trade_age is not None and stats.last_trade_age > c.snipe_stale_seconds:
-                return f"trading went quiet ({pnl:+.0f}%)", mc
-            return None, mc
-        if pnl <= -c.trade_stop_loss_pct:
-            return f"stop loss ({pnl:.0f}%)", mc
-        if stats.creator_sold_sol > 0:
-            return "creator sold", mc
-        if pnl >= c.trade_take_profit_pct:
-            return f"take profit (+{pnl:.0f}%)", mc
-        if peak_pnl >= c.trade_trail_activate_pct and mc <= pos["peak_mcap"] * (1 - c.trade_trail_pct / 100):
-            return f"trailing stop (peak +{peak_pnl:.0f}%, now {pnl:+.0f}%)", mc
-        if now - pos["opened_at"] >= c.trade_max_hold_seconds:
-            return f"max hold time ({pnl:+.0f}%)", mc
-        if stats.last_trade_age is not None and stats.last_trade_age > c.trade_stale_seconds:
-            return f"trading went quiet ({pnl:+.0f}%)", mc
-        return None, mc
-
-    async def _sell(self, pos: dict, reason: str, mcap: float | None) -> bool:
-        ok, info = await self._order("sell", pos["mint"], "100%", False, bool(pos.get("snipe")))
-        if not ok:
-            pos["sell_fails"] += 1
-            log.error("SELL failed, will retry", extra={"mint": pos["mint"], "reason": reason, "error": info, "fails": pos["sell_fails"]})
-            return False
-        exit_mc = mcap if mcap else pos["peak_mcap"]
-        pnl = self._net_pnl_sol(pos["sol_in"], pos["entry_mcap"], exit_mc, bool(pos.get("snipe")))
-        self.day_pnl_sol += pnl
-        self.positions.pop(pos["mint"], None)
-        self.tracker.unpin(pos["mint"])
-        log.warning("SELL", extra={"mint": pos["mint"], "reason": reason, "est_pnl_sol": round(pnl, 4), "mode": self.mode})
-        self._event({"type": "sell", "mint": pos["mint"], "symbol": pos.get("symbol"), "reason": reason,
-                                 "est_pnl_sol": round(pnl, 4), "held_s": round(self._clock() - pos["opened_at"]), "mode": self.mode,
-                     "trades": pos.get("trades")})
-        if self.day_pnl_sol <= -self.max_daily_loss and not self.paused:
-            self.paused, self.pause_reason = True, "daily loss limit"
-        return True
-
-    async def check_exits(self) -> None:
-        async with self._lock:
-            for pos in list(self.positions.values()):
-                reason, mc = self._exit_reason(pos, self.tracker.snapshot(pos["mint"]))
-                if reason:
-                    await self._sell(pos, reason, mc)
-
-    async def sell_all(self, reason: str = "manual sell all") -> int:
-        async with self._lock:
-            n = 0
-            for pos in list(self.positions.values()):
-                st = self.tracker.snapshot(pos["mint"])
-                if await self._sell(pos, reason, st.mcap_now if st else None):
-                    n += 1
-            return n
-
-    async def run(self) -> None:
-        while True:
-            await self._sleep(0.5)
-            try:
-                await self.check_exits()
-                await self.snipe_scan()
-            except Exception:
-                log.exception("trader exit check failed")
-
-    async def refresh_balance(self) -> None:
-        """Real wallet balance from the Solana chain (needs the wallet's PUBLIC address; never the private key)."""
-        if self.rpc is None or not self.wallet or (self.balance_sol is not None and self._clock() - self._bal_at < 20):
-            return
-        try:
-            self.balance_sol = round(await self.rpc.get_balance(self.wallet) / 1e9, 4)
-            self._bal_at = self._clock()
-        except Exception:
-            self.balance_sol = None
-
-    def status(self) -> dict:
-        self._roll_day()
-        out = []
-        for p in self.positions.values():
-            st = self.tracker.snapshot(p["mint"])
-            mc = st.mcap_now if st and st.mcap_now else None
-            out.append({**{k: p[k] for k in ("mint", "symbol", "sol_in", "entry_mcap", "peak_mcap", "sell_fails")},
-                        "pnl_pct": round((mc / p["entry_mcap"] - 1) * 100, 1) if mc else None, "held_s": round(self._clock() - p["opened_at"])})
-        return {"account": self.name, "wallet": self.wallet or None, "wallet_balance_sol": self.balance_sol, "buy_sol": self.buy_sol,
-                "snipe_why": dict(Counter(self._why.values())) if self.entry in ("snipe", "launch") else None,
-                "mode": self.mode, "entry": self.entry, "auto": self.auto, "paused": self.paused, "pause_reason": self.pause_reason, "open": out,
-                "day_pnl_sol_estimate": round(self.day_pnl_sol, 4), "daily_loss_limit_sol": self.max_daily_loss,
-                "history": list(self.history)[:50], "note": "Profit is estimated from the market cap, not read from the wallet."}
-
-
-
-class TradingError(ValueError):
-    def __init__(self, msg: str, status: int = 422) -> None:
-        super().__init__(msg)
-        self.status = status
-
-
-class AccountIn(BaseModel):
-    name: str
-    mode: Literal["paper", "live"] = "paper"
-    api_key: str = ""          # blank on an existing account = keep the saved key
-    wallet: str = ""           # PUBLIC address only (used to show the balance)
-    buy_sol: float = 0.05
-    max_open: int = 3
-    max_daily_loss_sol: float = 0.2
-    confirm_live: bool = False
-    entry: Literal["buy", "picks", "launch", "snipe"] = "buy"  # buy = only BUY signals, picks = also rising Top picks, snipe = buy seconds after launch
-
-
-class TradingManager:
-    """The accounts people set up on the Settings screen. Each account = one wallet + its own Trader. Saved in the database."""
-
-    def __init__(self, cfg: Settings, tracker: "TradeTracker", repo: Repository, rpc) -> None:
-        self.cfg, self.tracker, self.repo, self.rpc = cfg, tracker, repo, rpc
-        self.traders: dict[str, Trader] = {}
-        self.cfgs: dict[str, dict] = {}
-        self._tasks: dict[str, asyncio.Task] = {}
-        self._lock = asyncio.Lock()
-        self.book = LaunchBook()
-
-    async def on_launch(self, ev) -> None:
-        """Every new launch, the instant it arrives. Feeds the creator/ticker history, then lets launch-sniper accounts decide."""
-        self.book.record(ev.creator, ev.symbol)
-        snipers = [t for t in self.traders.values() if t.entry == "launch"]
-        if snipers:
-            await asyncio.gather(*(t.launch_consider(ev, self.book) for t in snipers), return_exceptions=True)
-
-    async def _book_loop(self) -> None:
-        while True:  # remember creators who dumped, across restarts
-            await asyncio.sleep(60)
-            try:
-                await self.repo.kv_set("launch_book", {"dumpers": list(self.tracker.dumpers)[-3000:]})
-            except Exception as exc:
-                log.warning("could not save the dumper list", extra={"error": str(exc)})
-
-    def _seed(self) -> list[dict]:
-        out: list[dict] = []
-        try:
-            out = [dict(a) for a in (json.loads(self.cfg.trading_accounts) if self.cfg.trading_accounts.strip() else [])]
-        except ValueError:
-            log.error("TRADING_ACCOUNTS is not valid JSON and was ignored")
-        if not out and self.cfg.pumpportal_api_key:
-            out = [{"name": "main", "api_key": self.cfg.pumpportal_api_key}]
-        for a in out:
-            a["mode"] = a.get("mode") or self.cfg.trading_mode
-            a["mode"] = a["mode"] if a["mode"] in ("paper", "live") else "paper"
-            a["auto"] = a["mode"] == "paper"  # real-money accounts always start switched OFF
-        return out
-
-    async def start(self) -> None:
-        saved = None
-        try:
-            saved = await self.repo.kv_get("trading_accounts")
-        except Exception as exc:
-            log.error("could not read trading accounts", extra={"error": str(exc)})
-        try:
-            lb = await self.repo.kv_get("launch_book")
-            self.tracker.dumpers.update((lb or {}).get("dumpers", []))
-        except Exception:
-            pass
-        self._tasks["__book"] = asyncio.create_task(self._book_loop(), name="launch-book")
-        accts = saved["accounts"] if saved and "accounts" in saved else self._seed()
-        for a in accts:
-            if a.get("mode") == "live" and not a.get("api_key"):
-                continue
-            await self._spawn(a)
-        if saved is None and accts:
-            await self._persist()
-
-    async def stop(self) -> None:
-        for t in self._tasks.values():
-            t.cancel()
-        await asyncio.gather(*self._tasks.values(), return_exceptions=True)
-
-    async def _spawn(self, a: dict) -> None:
-        t = Trader(self.cfg, self.tracker, acct=a, rpc=self.rpc, store=self.repo)
-        await t.load()
-        self.traders[a["name"]], self.cfgs[a["name"]] = t, a
-        self._tasks[a["name"]] = asyncio.create_task(t.run(), name=f"trader-{a['name']}")
-        log.warning("TRADING ACCOUNT READY", extra={"account": a["name"], "mode": t.mode, "auto": t.auto})
-
-    async def _persist(self) -> None:
-        await self.repo.kv_set("trading_accounts", {"accounts": list(self.cfgs.values())})
-
-    @staticmethod
-    def public(a: dict) -> dict:
-        k = a.get("api_key") or ""
-        return {"name": a["name"], "mode": a["mode"], "wallet": a.get("wallet") or "", "buy_sol": a.get("buy_sol"),
-                "max_open": a.get("max_open"), "max_daily_loss_sol": a.get("max_daily_loss_sol"), "entry": a.get("entry", "buy"),
-                "has_key": bool(k), "api_key_hint": ("…" + k[-4:]) if len(k) >= 8 else ""}
-
-    async def upsert(self, a: AccountIn) -> dict:
-        async with self._lock:
-            name = a.name.strip()
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", name):
-                raise TradingError("Name: 1-24 letters, numbers, - or _")
-            old = self.cfgs.get(name)
-            key = a.api_key.strip() or (old or {}).get("api_key", "")
-            wallet = a.wallet.strip()
-            if wallet and not BASE58_ADDRESS.match(wallet):
-                raise TradingError("That does not look like a Solana wallet address (use the PUBLIC address)")
-            if not (0.001 <= a.buy_sol <= 2):
-                raise TradingError("Buy size must be between 0.001 and 2 SOL")
-            if not (1 <= a.max_open <= 10):
-                raise TradingError("Max open trades must be 1 to 10")
-            if not (0.001 <= a.max_daily_loss_sol <= 20):
-                raise TradingError("Daily loss limit must be between 0.001 and 20 SOL")
-            if a.mode == "live":
-                if not key:
-                    raise TradingError("Real mode needs the PumpPortal API key")
-                if not a.confirm_live and not (old and old["mode"] == "live"):
-                    raise TradingError("Tick the box to confirm you want to trade with real money")
-            t = self.traders.get(name)
-            changed = bool(old) and (a.mode != old["mode"] or key != old.get("api_key", ""))
-            if t and t.positions and changed:
-                raise TradingError("Close the open trades (Sell all) before changing the mode or key", 409)
-            new = {"name": name, "mode": a.mode, "api_key": key, "wallet": wallet, "buy_sol": a.buy_sol, "max_open": a.max_open,
-                   "max_daily_loss_sol": a.max_daily_loss_sol, "entry": a.entry,
-                   "auto": (old["auto"] if old and not changed else a.mode == "paper")}  # a new or switched real account starts OFF
-            if t and not changed:
-                t.buy_sol, t.max_open, t.max_daily_loss, t.wallet, t.entry = a.buy_sol, a.max_open, a.max_daily_loss_sol, wallet, a.entry
-                self.cfgs[name] = new
-            else:
-                if t:
-                    self._tasks.pop(name).cancel()
-                    self.traders.pop(name, None)
-                await self._spawn(new)
-            await self._persist()
-            return self.public(new)
-
-    async def remove(self, name: str) -> None:
-        async with self._lock:
-            t = self.traders.get(name)
-            if t is None:
-                raise TradingError("Unknown account", 404)
-            if t.positions:
-                raise TradingError("Close the open trades (Sell all) before removing this account", 409)
-            self._tasks.pop(name).cancel()
-            self.traders.pop(name, None)
-            self.cfgs.pop(name, None)
-            await self._persist()
-
-    async def set_auto(self, name: str, on: bool) -> None:
-        async with self._lock:
-            t = self.traders.get(name)
-            if t is None:
-                raise TradingError("Unknown account", 404)
-            t.auto = on
-            self.cfgs[name]["auto"] = on
-            await self._persist()
-
-    async def sell_all(self, name: str) -> int:
-        t = self.traders.get(name)
-        if t is None:
-            raise TradingError("Unknown account", 404)
-        t.auto = False
-        self.cfgs[name]["auto"] = False
-        await self._persist()
-        return await t.sell_all()
-
-    async def fan_out(self, token, report) -> None:
-        await asyncio.gather(*(t.consider(token, report) for t in self.traders.values()), return_exceptions=True)
-
-    async def status(self) -> dict:
-        trs = list(self.traders.values())
-        await asyncio.gather(*(t.refresh_balance() for t in trs))
-        return {"accounts": [{**t.status(), **self.public(self.cfgs[t.name])} for t in trs],
-                "feed": {"trades_received": self.tracker.trades_seen, "coins_watched": len(self.tracker._tok)}}
 
 
 # ============================================================================
@@ -3179,16 +2340,6 @@ svg{display:block}
 #tabbar a{position:relative;flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 0 7px;font-size:10.5px;font-weight:650;color:var(--mute);border-radius:28px;transition:background .3s var(--spring),color .2s,transform .35s var(--spring)}
 #tabbar a:active{transform:scale(.93)}
 #tabbar a.on{color:var(--blue);background:var(--g-bg2);box-shadow:inset 0 1.5px 0 var(--g-hi),inset 0 -1px 0 var(--g-lo),0 4px 14px rgba(0,0,0,.14)}
-#tabbar a[data-r="trades"]{flex:1.35;color:#fff;background:linear-gradient(135deg,#10b981 0%,#2563eb 100%);box-shadow:0 6px 18px rgba(37,99,235,.45),inset 0 1.5px 0 rgba(255,255,255,.35)}
-#tabbar a[data-r="trades"] svg{width:26px;height:26px}
-#tabbar a[data-r="trades"].on{color:#fff;background:linear-gradient(135deg,#34d399 0%,#3b82f6 100%);box-shadow:0 6px 22px rgba(59,130,246,.65),inset 0 1.5px 0 rgba(255,255,255,.45)}
-.menuwrap{position:relative}
-.menu{position:absolute;right:0;top:calc(100% + 10px);min-width:220px;padding:6px;border-radius:22px;z-index:60;background:rgba(24,28,38,.97);border:1px solid var(--g-line);box-shadow:0 18px 50px rgba(0,0,0,.5);-webkit-backdrop-filter:blur(28px);backdrop-filter:blur(28px)}
-[data-theme="light"] .menu{background:rgba(255,255,255,.98);box-shadow:0 18px 50px rgba(0,0,0,.18)}
-.menu[hidden]{display:none}
-.menu a,.menu button{display:flex;align-items:center;gap:12px;width:100%;box-sizing:border-box;padding:13px 14px;border:0;border-radius:16px;background:none;font:inherit;font-size:15px;font-weight:650;color:var(--text);text-align:left;text-decoration:none;cursor:pointer}
-.menu a:active,.menu button:active{background:rgba(128,128,128,.2)}
-@media(hover:hover){.menu a:hover,.menu button:hover{background:rgba(128,128,128,.16)}}
 @media(min-width:900px){#rail{display:flex}#tabbar{display:none}.page{padding-bottom:60px}.mob-only{display:none!important}}
 @media(max-width:899px){.desk-only{display:none!important}}
 
@@ -3308,13 +2459,6 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 .fact .k{position:relative;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);font-weight:700}
 .fact .v{position:relative;margin-top:3px;font-weight:650;font-size:14px;overflow:hidden;text-overflow:ellipsis}
 .btns{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
-.fld{display:grid;gap:6px;margin-top:12px}.fld label{font-size:12px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
-.fld input,.fld select{width:100%;box-sizing:border-box;padding:13px 14px;border-radius:16px;border:1px solid var(--line);background:rgba(128,128,128,.12);color:var(--text);font:inherit;font-size:16px;outline:0}
-.fld small{color:var(--dim);font-size:12px}
-.btn.go{color:#fff!important;background:var(--green)!important}.btn.stop{color:#fff!important;background:var(--red)!important}
-.chk{display:flex;gap:10px;align-items:flex-start;margin-top:14px;font-size:14px}.chk input{margin-top:3px}
-.err{color:var(--red);font-size:13.5px;margin-top:10px;font-weight:600}
-.trrow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 16px;border-top:1px solid var(--line);font-size:14px}.trrow:first-child{border-top:0}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:999px;font-weight:650;font-size:14px;transition:transform .35s var(--spring)}
 .btn:active{transform:scale(.94)}
 .acc{border-top:1px solid var(--line)}
@@ -3373,15 +2517,9 @@ footer{max-width:1080px;margin:0 auto;padding:0 20px 24px;color:var(--dim);font-
       <span class="desk-only dim" style="font-size:13px">Live security analysis for new Solana launches</span>
       <div class="tools">
         <span class="feed"><span id="pdot" class="dot"></span><span id="ptxt">Connecting…</span></span>
-        <a class="ibtn" href="#/settings" aria-label="Settings" id="setbtn"></a>
-        <div class="menuwrap">
-          <button class="ibtn" id="menubtn" aria-label="Menu" aria-haspopup="true" aria-expanded="false"></button>
-          <div class="menu" id="menu" hidden>
-            <button type="button" id="mtheme"></button>
-            <a href="#/system" id="msys"></a>
-            <a href="/logout" id="mout"></a>
-          </div>
-        </div>
+        <button class="ibtn" id="themebtn" aria-label="Switch theme"></button>
+        <a class="ibtn mob-only" href="#/system" aria-label="System health" id="sysbtn"></a>
+        <a class="ibtn" href="/logout" aria-label="Sign out" id="outbtn"></a>
       </div>
     </div></header>
     <div id="banner"></div>
@@ -3439,9 +2577,6 @@ const ICONS = {
   search:'<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   expand:'<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
   shrink:'<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
-  dots:'<circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/>',
-  bolt:'<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
-  sliders:'<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
   logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"/><path d="m16 8 4 4-4 4M20 12H9"/>'
 };
 
@@ -3595,7 +2730,7 @@ function tokRow(t, withReason, extra) {
       h("div", {class: "tt"}, h("b", {}, t.symbol || "—"), h("span", {}, t.name || "Unnamed")),
       h("div", {class: "ts"}, short(t.mint, 5) + " · " + ago(t.detected_at)),
       withReason && t.status_reason ? h("div", {class: "why"}, t.status_reason) : null),
-    h("div", {class: "tr"}, h("div", {class: "trr"}, t.live && t.live.change_pct == null && t.live.state && t.live.state !== "rising" ? h("span", {class: "score", style: "--c:#8b97aa", title: "No recent live trades for this token"}, t.live.state === "unwatched" ? "no live data" : t.live.state) : t.live && t.live.change_pct != null ? h("span", {class: "score", style: "--c:" + (t.live.state === "falling" ? "#f6465d" : t.live.change_pct > 0 ? "#34d399" : "#8b95a7"), title: "Price change over the last " + t.live.window_seconds + "s"}, (t.live.change_pct > 0 ? "+" : "") + t.live.change_pct + "%") : null, t.status === "QUALIFIED" && t.status_updated_at && (Date.now() - new Date(t.status_updated_at).getTime()) < 180000 ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
+    h("div", {class: "tr"}, h("div", {class: "trr"}, t.status === "QUALIFIED" && t.status_updated_at && (Date.now() - new Date(t.status_updated_at).getTime()) < 180000 ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
 }
 const skeleton = (n) => h("div", {class: "card list"}, Array.from({length: n || 6}, () => h("div", {class: "skrow"})));
 const empty = (iconName, title, text) => h("div", {class: "card empty"}, h("div", {class: "eic"}, icon(iconName, 26)), h("b", {}, title), text || "");
@@ -3658,8 +2793,8 @@ function homeView() {
       h("div", {}, sec("System", "Details", "#/system"), h("div", {class: "card pad"}, sys))),
     sec("Latest launches", "See all", "#/scanner"), latest);
   async function refresh() {
-    const [s, recent, hl, pk] = await Promise.all([api("/stats"), api("/tokens/recent?limit=200"), api("/system/health"), api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=live&hide_falling=1")]);
-    const fresh = pk.slice(0, 3);
+    const [s, recent, hl, pk] = await Promise.all([api("/stats"), api("/tokens/recent?limit=200"), api("/system/health"), api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=score")]);
+    const fresh = pk.filter((t) => Date.now() - new Date(t.detected_at).getTime() < 2 * 3600 * 1000).slice(0, 3);
     picks.replaceChildren(fresh.length ? h("div", {class: "card list"}, fresh.map((t) => tokRow(t, false, "pick"))) : empty("shield", "No picks in the last 2 hours", "A pick is a token that passed every security check built so far. Best evidence score first. Not a buy signal."));
     const c = s.counts;
     setNum(num, s.total);
@@ -3864,32 +2999,22 @@ function tokenView(mint) {
 }
 
 /* ---------- router ---------- */
-const NAV = [["", "Home", "home"], ["scanner", "Scanner", "radar"], ["trades", "Trades", "bolt"], ["passed", "Picks", "shield"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
-const TABS = NAV.filter(([r]) => r !== "review");  // the bottom bar has no Review tab; it is still on Home and in the side rail
+const NAV = [["", "Home", "home"], ["scanner", "Scanner", "radar"], ["passed", "Picks", "shield"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
 function buildNav() {
   const mk = (cls) => (r, l, ic) => h("a", {href: "#/" + r, "data-r": r}, icon(ic, cls === "rail" ? 20 : 22), cls === "rail" ? l : h("span", {}, l));
   document.getElementById("railnav").replaceChildren(...NAV.map(([r, l, ic]) => mk("rail")(r, l, ic)));
-  document.getElementById("railsys").replaceChildren(mk("rail")("settings", "Settings", "sliders"), mk("rail")("system", "System health", "pulse"));
-  document.getElementById("tabbar").replaceChildren(...TABS.map(([r, l, ic]) => mk("tab")(r, l, ic)));
+  document.getElementById("railsys").replaceChildren(mk("rail")("system", "System health", "pulse"));
+  document.getElementById("tabbar").replaceChildren(...NAV.map(([r, l, ic]) => mk("tab")(r, l, ic)));
   document.getElementById("logo1").replaceChildren(logo(36));
   document.getElementById("logo2").replaceChildren(logo(30));
-  document.getElementById("setbtn").replaceChildren(icon("sliders", 19));
-  document.getElementById("menubtn").replaceChildren(icon("dots", 20));
-  document.getElementById("msys").replaceChildren(icon("pulse", 18), h("span", {}, "System health"));
-  document.getElementById("mout").replaceChildren(icon("logout", 18), h("span", {}, "Sign out"));
+  document.getElementById("sysbtn").replaceChildren(icon("pulse", 19));
+  document.getElementById("outbtn").replaceChildren(icon("logout", 19));
 }
 function themeIcon() {
   const dark = document.documentElement.getAttribute("data-theme") !== "light";
-  document.getElementById("mtheme").replaceChildren(icon(dark ? "sun" : "moon", 18), h("span", {}, dark ? "Light mode" : "Dark mode"));
+  document.getElementById("themebtn").replaceChildren(icon(dark ? "sun" : "moon", 19));
 }
-const menu = document.getElementById("menu"), menubtn = document.getElementById("menubtn");
-function menuOpen(on) { menu.hidden = !on; menubtn.setAttribute("aria-expanded", on ? "true" : "false"); }
-menubtn.addEventListener("click", (e) => { e.stopPropagation(); menuOpen(menu.hidden); });
-menu.addEventListener("click", () => menuOpen(false));
-document.addEventListener("click", (e) => { if (!menu.hidden && !menu.contains(e.target)) menuOpen(false); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") menuOpen(false); });
-window.addEventListener("hashchange", () => menuOpen(false));
-document.getElementById("mtheme").addEventListener("click", () => {
+document.getElementById("themebtn").addEventListener("click", () => {
   const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
   document.documentElement.setAttribute("data-theme", next);
   try { localStorage.setItem("tosh-theme", next); } catch (e) {}
@@ -3901,176 +3026,19 @@ let timer = null, gen = 0;
 function build(name, arg) {
   switch (name) {
     case "scanner": return listView({title: "Scanner", subtitle: "Every new launch, newest first. Search or filter by security status.", url: "/tokens/recent?limit=200", search: true, icon: "radar", emptyTitle: "No tokens detected yet", emptyText: "If the backend is running, open System health to confirm the feed is connected."});
-    case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check, best evidence score first. Only a pulsing BUY chip means live buy conditions are met right now. Never a guarantee.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=live&hide_falling=1", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes the security checks. BUY needs live momentum, real buyers and sell evidence on top."});
+    case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check, best evidence score first. Only a pulsing BUY chip means live buy conditions are met right now. Never a guarantee.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=score", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes the security checks. BUY needs live momentum, real buyers and sell evidence on top."});
     case "review": case "investigating": return listView({title: "In review", subtitle: "Required evidence is missing, or something suspicious is unresolved.", url: "/tokens/recent?limit=200&status=INSUFFICIENT_DATA,HOLD", icon: "eye", emptyTitle: "Nothing in review", emptyText: "Tokens land here while data is being collected, or when something looks suspicious but is not proven."});
     case "rejected": return listView({title: "Rejected", subtitle: "A verified, serious security problem was found. Open a token to see the exact evidence.", url: "/tokens/recent?limit=200&status=REJECTED,REVOKED", icon: "ban", emptyTitle: "No rejected tokens", emptyText: "Rejections appear here with the on-chain evidence behind them."});
-    case "trades": return tradesView();
-    case "settings": return settingsView();
     case "system": return systemView();
     case "token": return tokenView(arg || "");
     default: return homeView();
   }
 }
-/* ---------- trading: trades screen, settings screen, trade alerts ---------- */
-async function send(method, path, body) {
-  const r = await fetch(API + path, {method, headers: {"Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined, cache: "no-store"});
-  if (r.status === 401) { location.href = "/login"; throw new Error("Signed out"); }
-  let j = {}; try { j = await r.json(); } catch (e) {}
-  if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : Array.isArray(j.detail) ? j.detail.map((d) => d.msg).join("; ") : "HTTP " + r.status);
-  return j;
-}
-const modeChip = (m) => h("span", {class: "pill", style: "--c:" + (m === "live" ? "#f6465d" : "#8b97aa")}, h("i"), m === "live" ? "REAL MONEY" : "DEMO");
-const WHY = {bad_data: "bad data", other_pool: "other pool", known_dumper: "known dumper", serial_creator: "serial launcher", bad_name: "odd name", copycat: "copycat ticker", dev_buy_small: "creator bought too little", dev_buy_big: "creator bought too much", dev_supply: "creator holds too much", mcap_out: "price out of range", full: "at max trades", rate_limit: "rate limit", few_trades: "no trades yet", one_buyer: "only one buyer", not_climbing: "not climbing", too_big: "too big", sellers: "sellers winning", creator_sold: "creator sold", quiet: "went quiet", buying: "buying now"};
-const whyText = (w) => { const e = Object.entries(w || {}).sort((x, y) => y[1] - x[1]); return e.length ? e.map(([k, n]) => n + " " + (WHY[k] || k)).join(" · ") : "waiting for new launches"; };
-const sol = (n) => n == null ? "—" : (n > 0 ? "+" : "") + Number(n).toFixed(4);
-const pnlColor = (n) => n == null ? "inherit" : n > 0 ? "var(--green)" : n < 0 ? "var(--red)" : "inherit";
-const heldFor = (s) => s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
-
-function tradesView() {
-  let tab = "open", data = null;
-  const box = h("div"), chips = h("div", {class: "filters"});
-  async function act(fn) { try { await fn(); await refresh(); } catch (e) { toast(e.message, 4000); } }
-  function card(a) {
-    const state = a.paused ? "Paused: " + a.pause_reason : a.auto ? "Auto trading is ON" : "Auto trading is OFF";
-    const head = h("div", {style: "display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"},
-      h("div", {style: "display:flex;align-items:center;gap:10px"}, h("b", {style: "font-size:18px"}, a.name), modeChip(a.mode)),
-      h("button", {class: "btn " + (a.auto ? "stop" : "go"), onclick: () => {
-        if (!a.auto && a.mode === "live" && !confirm("Start automatic trading with REAL money on " + a.name + "?")) return;
-        act(() => send("POST", "/trading/accounts/" + encodeURIComponent(a.name) + "/auto?on=" + (!a.auto)));
-      }}, a.auto ? "Stop auto trading" : "Start auto trading"));
-    const facts = h("dl", {class: "kv", style: "margin-top:14px"},
-      h("dt", {}, "Status"), h("dd", {}, state),
-      h("dt", {}, "Wallet balance"), h("dd", {}, a.wallet_balance_sol == null ? (a.wallet ? "—" : "add wallet in Settings") : a.wallet_balance_sol + " SOL"),
-      h("dt", {}, "Today (estimate)"), h("dd", {style: "color:" + pnlColor(a.day_pnl_sol_estimate)}, sol(a.day_pnl_sol_estimate) + " SOL"),
-      h("dt", {}, "Buy size"), h("dd", {}, a.buy_sol + " SOL"),
-      a.snipe_why && data.feed ? h("dt", {}, "Trade feed") : null, a.snipe_why && data.feed ? h("dd", {}, data.feed.trades_received + " trades from " + data.feed.coins_watched + " coins") : null,
-      a.snipe_why ? h("dt", {}, "Sniper sees") : null, a.snipe_why ? h("dd", {style: "white-space:normal;text-align:right"}, whyText(a.snipe_why)) : null);
-    let list;
-    if (tab === "open") {
-      list = a.open.length ? a.open.map((p) => h("a", {class: "trrow", href: "#/token/" + p.mint, style: "text-decoration:none;color:inherit"},
-        h("div", {}, h("b", {}, p.symbol || short(p.mint, 4)), h("div", {class: "dim", style: "font-size:12px"}, "held " + heldFor(p.held_s) + " · in " + p.sol_in + " SOL")),
-        h("b", {style: "color:" + pnlColor(p.pnl_pct)}, p.pnl_pct == null ? "—" : (p.pnl_pct > 0 ? "+" : "") + p.pnl_pct + "%")))
-        : [h("div", {class: "dim", style: "padding:16px"}, "No open trades right now.")];
-    } else {
-      list = a.history.length ? a.history.map((e) => h("div", {class: "trrow"},
-        h("div", {}, h("b", {}, (e.type === "buy" ? "BUY " : e.type === "sell" ? "SELL " : "BUY FAILED ") + (e.symbol || short(e.mint, 4))),
-          h("div", {class: "dim", style: "font-size:12px"}, (e.type === "sell" ? e.reason + " · held " + heldFor(e.held_s || 0) + (e.trades != null ? " · " + e.trades + " trades seen" : "") : e.type === "buy" ? e.sol + " SOL" : (e.info || "")) + " · " + ago(e.t))),
-        e.type === "sell" ? h("b", {style: "color:" + pnlColor(e.est_pnl_sol)}, sol(e.est_pnl_sol)) : null))
-        : [h("div", {class: "dim", style: "padding:16px"}, "No trades yet.")];
-    }
-    return h("div", {style: "margin-bottom:18px"}, h("div", {class: "card pad"}, head, facts,
-      a.open.length ? h("div", {class: "btns"}, h("button", {class: "btn", onclick: () => { if (confirm("Sell all open trades for " + a.name + " and stop auto trading?")) act(() => send("POST", "/trading/accounts/" + encodeURIComponent(a.name) + "/sell-all")); }}, "Sell all now")) : null),
-      h("div", {class: "card list", style: "margin-top:10px"}, list));
-  }
-  function draw() {
-    chips.replaceChildren(...[["open", "Open trades"], ["history", "History"]].map(([k, l]) => h("button", {class: "fchip" + (tab === k ? " on" : ""), onclick: () => { tab = k; draw(); }}, l)));
-    if (!data) return;
-    box.replaceChildren(...(data.accounts.length ? data.accounts.map(card) : [empty("pulse", data.off ? "Trading is switched off" : "No trading account yet", data.off ? "The server has TRADING_MODE=off." : "Open Settings (top right) and add your account. Start with Demo.")]));
-  }
-  const root = h("div", {}, h("h1", {class: "large"}, "Trades"), h("p", {class: "sub"}, "What the bot has bought and sold for each account. Profit is an estimate from the market cap, not your wallet."), h("div", {class: "searchbar"}, chips), box);
-  box.append(skeleton(2));
-  async function refresh() { data = await api("/trading/status"); draw(); }
-  return {root, refresh, every: 4000};
-}
-
-function settingsView() {
-  const box = h("div"), alerts = h("div");
-  let loaded = false;
-  function accountForm(a) {
-    const isNew = !a, v = a || {name: "", mode: "paper", wallet: "", buy_sol: 0.05, max_open: 3, max_daily_loss_sol: 0.2};
-    const f = (label, el, hint) => h("div", {class: "fld"}, h("label", {}, label), el, hint ? h("small", {}, hint) : null);
-    const name = h("input", {value: v.name, maxlength: "24", autocomplete: "off", autocapitalize: "off", placeholder: "e.g. me", disabled: isNew ? null : "disabled"});
-    const mode = h("select", {}, h("option", {value: "paper"}, "Demo (practice, no money)"), h("option", {value: "live"}, "Real (uses real money)"));
-    mode.value = v.mode;
-    const entry = h("select", {}, h("option", {value: "buy"}, "Only BUY signals (safer, fewer trades)"), h("option", {value: "picks"}, "Every rising Top pick (more trades, riskier)"), h("option", {value: "launch"}, "Launch sniper: buy the instant a coin launches (very risky)"), h("option", {value: "snipe"}, "Momentum sniper: buy after the first buyers (very risky)"));
-    entry.value = v.entry || "buy";
-    const key = h("input", {type: "password", autocomplete: "off", placeholder: a && a.has_key ? "Saved (" + a.api_key_hint + "). Leave blank to keep it" : "Paste your PumpPortal API key"});
-    const wallet = h("input", {value: v.wallet, autocomplete: "off", autocapitalize: "off", spellcheck: "false", placeholder: "Public wallet address (to show the balance)"});
-    const buy = h("input", {type: "number", step: "0.01", min: "0.001", value: v.buy_sol, inputmode: "decimal"});
-    const open = h("input", {type: "number", step: "1", min: "1", max: "10", value: v.max_open, inputmode: "numeric"});
-    const loss = h("input", {type: "number", step: "0.05", min: "0.001", value: v.max_daily_loss_sol, inputmode: "decimal"});
-    const confirmBox = h("input", {type: "checkbox"});
-    const confirmRow = h("label", {class: "chk"}, confirmBox, h("span", {}, "I understand the bot will trade with real money and I can lose all of it."));
-    const err = h("div", {class: "err"});
-    const sync = () => { confirmRow.style.display = mode.value === "live" && !(a && a.mode === "live") ? "flex" : "none"; };
-    mode.addEventListener("change", sync); sync();
-    const save = h("button", {class: "btn go", onclick: async () => {
-      err.textContent = "";
-      try {
-        await send("POST", "/trading/accounts", {name: name.value.trim(), mode: mode.value, api_key: key.value.trim(), wallet: wallet.value.trim(),
-          entry: entry.value, buy_sol: parseFloat(buy.value), max_open: parseInt(open.value, 10), max_daily_loss_sol: parseFloat(loss.value), confirm_live: confirmBox.checked});
-        toast("Saved" + (mode.value === "live" && (isNew || !a || a.mode !== "live") ? ". Auto trading starts OFF, turn it on in Trades." : ""), 4000);
-        loaded = false; await refresh();
-      } catch (e) { err.textContent = e.message; }
-    }}, isNew ? "Add account" : "Save changes");
-    const del = isNew ? null : h("button", {class: "btn", onclick: async () => {
-      if (!confirm("Remove account " + v.name + "? Its wallet is not touched.")) return;
-      try { await send("DELETE", "/trading/accounts/" + encodeURIComponent(v.name)); toast("Removed"); loaded = false; await refresh(); } catch (e) { err.textContent = e.message; }
-    }}, "Remove");
-    return h("div", {}, f("Account name", name), f("Mode", mode, "Start in Demo. Real mode needs the API key from pumpportal.fun."),
-      f("PumpPortal API key", key, "Stored on your server only. Never shown again."), f("Wallet address", wallet, "PUBLIC address only. Never paste a private key here."),
-      f("What to trade", entry, "Launch sniper buys within a second or two of launch, before anyone else has bought, judged only by the creator and the launch itself. Momentum sniper waits for the first buyers. Both skip the security checks and sell the moment it turns down. Try Demo first."), f("Buy size per trade (SOL)", buy), f("Most trades open at once", open), f("Stop buying for the day after losing (SOL)", loss), confirmRow, err, h("div", {class: "btns"}, save, del));
-  }
-  function alertsCard() {
-    const on = () => localStorage.getItem("tosh-notify") === "1";
-    const b = h("button", {class: "btn"}, "");
-    const paint = () => { b.textContent = on() ? "Alerts on this device: ON (tap to turn off)" : "Turn on trade alerts"; };
-    b.addEventListener("click", async () => {
-      if (on()) { localStorage.setItem("tosh-notify", "0"); paint(); return; }
-      if ("Notification" in window && Notification.permission === "default") { try { await Notification.requestPermission(); } catch (e) {} }
-      localStorage.setItem("tosh-notify", "1"); paint();
-      toast("Alerts on" + ("Notification" in window && Notification.permission === "granted" ? "" : ". Pop-ups are blocked by this browser, you will still see in-app alerts"), 4000);
-    });
-    paint();
-    alerts.replaceChildren(h("div", {class: "card pad"}, h("b", {}, "Trade alerts"), h("p", {class: "dim", style: "margin:6px 0 0;font-size:13.5px"}, "Get a message the moment the bot buys, sells or a buy fails. Works while this page is open in your browser or installed on your phone. The in-app banner always shows."), h("div", {class: "btns"}, b)));
-  }
-  async function refresh() {
-    if (loaded) return;
-    const d = await api("/trading/status");
-    loaded = true;
-    const parts = [];
-    if (d.off) parts.push(empty("pulse", "Trading is switched off", "The server has TRADING_MODE=off. Change it in Render to allow trading."));
-    else {
-      d.accounts.forEach((a) => parts.push(h("details", {class: "card acc"}, h("summary", {}, h("b", {}, a.name), modeChip(a.mode), h("span", {class: "dim", style: "margin-left:auto"}, a.buy_sol + " SOL/trade")), h("div", {style: "padding:0 16px 16px"}, accountForm(a)))));
-      parts.push(h("div", {class: "card pad", style: "margin-top:14px"}, h("b", {}, "Add an account"), accountForm(null)));
-    }
-    box.replaceChildren(...parts);
-    alertsCard();
-  }
-  const root = h("div", {}, h("h1", {class: "large"}, "Settings"), h("p", {class: "sub"}, "Set up each person's trading account. Switch between Demo and Real, and choose how much to trade."), alerts, h("div", {style: "height:14px"}), box);
-  return {root, refresh, every: 60000};
-}
-
-let tradeSeen = null;
-async function tradeWatcher() {
-  try {
-    const d = await api("/trading/status");
-    const base = tradeSeen === null; if (base) tradeSeen = {};
-    const msgs = [];
-    for (const a of d.accounts) {
-      const top = Math.max(0, ...a.history.map((e) => e.seq || 0));
-      const prev = tradeSeen[a.name] === undefined ? top : tradeSeen[a.name];
-      tradeSeen[a.name] = top;
-      a.history.filter((e) => e.seq > prev).sort((x, y) => x.seq - y.seq).forEach((e) => {
-        const who = a.name + (a.mode === "live" ? " (REAL)" : " (demo)");
-        msgs.push(e.type === "buy" ? who + ": bought " + (e.symbol || "token") + " for " + e.sol + " SOL"
-          : e.type === "sell" ? who + ": sold " + (e.symbol || "token") + ", " + e.reason + ", est " + sol(e.est_pnl_sol) + " SOL"
-          : who + ": BUY FAILED " + (e.symbol || "token") + " " + (e.info || ""));
-      });
-    }
-    if (!msgs.length) return;
-    toast(msgs[msgs.length - 1] + (msgs.length > 1 ? "  (+" + (msgs.length - 1) + " more)" : ""), 7000);
-    if (localStorage.getItem("tosh-notify") === "1" && "Notification" in window && Notification.permission === "granted") {
-      try { new Notification("Tosh Bot", {body: msgs.slice(-3).join("\n")}); } catch (e) {}
-    }
-  } catch (e) { /* the banner already reports connection problems */ }
-}
-
 let seenPicks = null, newPicks = 0;
 function updateTitle() { document.title = (newPicks ? "(" + newPicks + ") " : "") + "Tosh Bot"; }
 async function pickWatcher() {
   try {
-    const rows = await api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=live&hide_falling=1");
+    const rows = await api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=score");
     if (seenPicks === null) { seenPicks = new Set(rows.map((t) => t.mint)); return; }
     const fresh = rows.filter((t) => !seenPicks.has(t.mint));
     fresh.forEach((t) => seenPicks.add(t.mint));
@@ -4120,7 +3088,7 @@ async function pill2() {
 }
 buildNav(); themeIcon();
 window.addEventListener("hashchange", route);
-route(); pill2(); setInterval(pill2, 10000); pickWatcher(); setInterval(pickWatcher, 3000); tradeWatcher(); setInterval(tradeWatcher, 4000);
+route(); pill2(); setInterval(pill2, 10000); pickWatcher(); setInterval(pickWatcher, 15000);
 </script>
 </body>
 </html>
@@ -4401,21 +3369,12 @@ def build_api_router(auth) -> APIRouter:
     @router.get("/tokens/recent", response_model=list[TokenRecord])
     async def recent_tokens(request: Request, limit: int = Query(50, ge=1, le=200),
                             status: str | None = Query(None, description="Comma-separated statuses"),
-                            sort: str | None = Query(None, description="'score' = best evidence score first, 'live' = BUY first then strongest live climb"),
-                            live: bool = Query(False, description="attach live trend (rising / falling / quiet) from the in-memory trade book"),
-                            hide_falling: bool = Query(False, description="drop coins that are falling, quiet or not being watched (implies live)")):
+                            sort: str | None = Query(None, description="'score' = best evidence score first")):
         statuses = [x.strip().upper() for x in status.split(",") if x.strip()] if status else None
         if statuses and any(x not in VALID_STATUSES for x in statuses):
             raise HTTPException(status_code=422, detail="Unknown status")
-        st = request.app.state
-        rows = await st.repo.list_recent_tokens(200 if hide_falling else limit, statuses)
-        if live or hide_falling:
-            rows = enrich_live(rows, getattr(st, "tracker", None), st.settings)
-        if hide_falling:
-            rows = [t for t in rows if (t.live or {}).get("state") != "falling"][:limit]
-        if sort == "live":
-            rows = sorted(rows, key=pick_rank, reverse=True)
-        elif sort == "score":
+        rows = await request.app.state.repo.list_recent_tokens(limit, statuses)
+        if sort == "score":
             rows = sorted(rows, key=lambda t: (t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at), reverse=True)
         return rows
 
@@ -4460,41 +3419,6 @@ def build_api_router(auth) -> APIRouter:
     @router.get("/tokens/{mint}/security/history", response_model=list[SecurityReport])
     async def security_history(request: Request, mint: str, limit: int = Query(20, ge=1, le=100)):
         return await request.app.state.repo.list_reports(_valid_mint(mint), limit)
-
-    def _mgr(request: Request) -> "TradingManager":
-        m = getattr(request.app.state, "trading", None)
-        if m is None:
-            raise HTTPException(status_code=404, detail="Trading is switched off on the server (TRADING_MODE=off)")
-        return m
-
-    async def _guard(coro):
-        try:
-            return await coro
-        except TradingError as exc:
-            raise HTTPException(status_code=exc.status, detail=str(exc))
-
-    @router.get("/trading/status")
-    async def trading_status(request: Request) -> dict:
-        m = getattr(request.app.state, "trading", None)
-        return await m.status() if m else {"accounts": [], "off": True}
-
-    @router.post("/trading/accounts")
-    async def trading_save_account(request: Request, body: AccountIn) -> dict:
-        return await _guard(_mgr(request).upsert(body))
-
-    @router.delete("/trading/accounts/{name}")
-    async def trading_delete_account(request: Request, name: str) -> dict:
-        await _guard(_mgr(request).remove(name))
-        return {"removed": name}
-
-    @router.post("/trading/accounts/{name}/auto")
-    async def trading_auto(request: Request, name: str, on: bool = Query(...)) -> dict:
-        await _guard(_mgr(request).set_auto(name, on))
-        return {"name": name, "auto": on}
-
-    @router.post("/trading/accounts/{name}/sell-all")
-    async def trading_sell_all(request: Request, name: str) -> dict:
-        return {"sold": await _guard(_mgr(request).sell_all(name)), "auto": False}
 
     @router.get("/system/health")
     async def system_health(request: Request) -> dict:
@@ -4547,51 +3471,28 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
 
         solana = rpc or SolanaRPC(settings.solana_rpc_url, health, timeout=settings.rpc_timeout_seconds,
                                   max_concurrency=settings.rpc_max_concurrency)
+        processor = TokenProcessor(repo, queue, health, metrics, max_attempts=settings.processor_max_attempts,
+                                   analysis_queue=analysis_queue if settings.analysis_enabled else None,
+                                   store_events=settings.store_launch_events, store_jobs=settings.store_jobs,
+                                   max_new_per_day=settings.max_new_tokens_per_day)
+        tasks = [asyncio.create_task(processor.run(), name="processor")]
         analysis_tasks: list[asyncio.Task] = []
         tracker = None
         if settings.analysis_enabled and settings.listener_enabled and settings.signals_enabled:
             tracker = TradeTracker(settings.signal_window_minutes * 60, settings.signal_max_tracked,
                                    momentum_window=settings.signal_momentum_window_seconds)
         app.state.tracker = tracker
-        processor = TokenProcessor(repo, queue, health, metrics, max_attempts=settings.processor_max_attempts,
-                                   analysis_queue=analysis_queue if settings.analysis_enabled else None,
-                                   store_events=settings.store_launch_events, store_jobs=settings.store_jobs,
-                                   max_new_per_day=settings.max_new_tokens_per_day,
-                                   tracker=tracker if settings.fast_track_enabled else None)
-        tasks = [asyncio.create_task(processor.run(), name="processor")]
-        retry_state: dict = {}
-        if settings.trading_mode not in ("off", "paper", "live"):
-            raise RuntimeError("TRADING_MODE must be off, paper or live")
-        manager = None
-        if tracker is not None and settings.trading_mode != "off":  # TRADING_MODE=off is a master kill switch
-            manager = TradingManager(settings, tracker, repo, solana)
-            await manager.start()
-        app.state.trading = manager
-        if manager is not None:
-            processor.on_launch = manager.on_launch
         if settings.analysis_enabled:
             analyzer = SecurityAnalyzer(solana, repo, policy_from_settings(settings), tracker=tracker,
                                         security_cache_seconds=settings.security_recheck_seconds)
             for i in range(settings.analysis_workers):
                 worker = AnalysisWorker(repo, analyzer, analysis_queue, health, metrics, retry_delays=settings.retry_delay_list,
                                         save_all_attempts=settings.save_all_attempts, store_jobs=settings.store_jobs,
-                                        review_save_seconds=settings.review_save_seconds if tracker else 0.0,
-                                        nonblocking_retries=settings.nonblocking_retries, retry_state=retry_state,
-                                        on_report=manager.fan_out if manager else None)
+                                        review_save_seconds=settings.review_save_seconds if tracker else 0.0)
                 analysis_tasks.append(asyncio.create_task(worker.run(), name=f"analysis-{i}"))
             if tracker is not None:
                 analysis_tasks.append(asyncio.create_task(
-                    ReviewScheduler(tracker, analysis_queue, interval=settings.signal_review_seconds,
-                                    idle_drop_seconds=settings.signal_idle_drop_seconds if settings.fast_track_enabled else 0.0,
-                                    fast_lane_seconds=settings.fast_lane_seconds if settings.fast_track_enabled else 0.0).run(), name="signal-reviews"))
-            if tracker is not None:  # after a restart, start watching the recent WATCH tokens again right away
-                try:
-                    cutoff = utcnow() - timedelta(minutes=settings.signal_window_minutes)
-                    for t in await repo.list_recent_tokens(200, ["WATCH", "QUALIFIED"]):
-                        if t.detected_at >= cutoff and tracker.track(t.mint, t.creator):
-                            analysis_queue.put_nowait(t.mint)
-                except Exception as exc:
-                    log.warning("could not re-watch recent picks", extra={"error": str(exc)})
+                    ReviewScheduler(tracker, analysis_queue, interval=settings.signal_review_seconds).run(), name="signal-reviews"))
             try:  # resume jobs left pending by a restart (only possible when jobs are stored)
                 for mint in (await repo.list_pending_jobs(500) if settings.store_jobs else []):
                     analysis_queue.put_nowait(mint)
@@ -4623,8 +3524,6 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             if rpc is None:
                 await solana.aclose()
             await app.state.images.aclose()
-            if manager is not None:
-                await manager.stop()
             await repo.aclose()
 
     app = FastAPI(title="Tosh Bot API", version="0.2.0", lifespan=lifespan)
