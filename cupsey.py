@@ -595,15 +595,29 @@ def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 20
 
     with httpx.Client(timeout=25) as c:
         data = None
-        try:
-            res = _rpc(c, rpc_url, "getTransactionsForAddress", [address, {
-                "transactionDetails": "full", "encoding": "jsonParsed", "maxSupportedTransactionVersion": 1,
-                "sortOrder": "desc", "limit": 100, "commitment": "confirmed",
-                "filters": {"status": "succeeded", "tokenAccounts": "balanceChanged"}}])
-            data = (res or {}).get("data") or []
-            info["source"] = "helius_filtered (successful transactions touching the wallet or changing its token balances)"
-        except Exception as exc:   # not Helius, plan without this method, etc.
-            info["helius_filtered_unavailable"] = f"{type(exc).__name__}: {exc}"[:140].replace(rpc_url, "<rpc>")
+        # Strictest filter first: successful, wallet really took part in a token transfer (swaps/transfers only).
+        # If the provider rejects it, retry with the looser filter, then fall back to the standard path below.
+        attempts = [("successful token transfers involving the wallet", {"status": "succeeded", "tokenAccounts": "balanceChanged", "tokenTransfer": {}}),
+                    ("successful transactions touching the wallet or changing its token balances", {"status": "succeeded", "tokenAccounts": "balanceChanged"})]
+        helius_max = max(100, min(scan, 500))
+        for label, flt in attempts:
+            try:
+                rows, token = [], None
+                while len(rows) < helius_max:
+                    cfg = {"transactionDetails": "full", "encoding": "jsonParsed", "maxSupportedTransactionVersion": 1,
+                           "sortOrder": "desc", "limit": 100, "commitment": "confirmed", "filters": flt}
+                    if token:
+                        cfg["paginationToken"] = token
+                    res = _rpc(c, rpc_url, "getTransactionsForAddress", [address, cfg]) or {}
+                    rows += res.get("data") or []
+                    token = res.get("paginationToken")
+                    if not token or not res.get("data"):
+                        break
+                data = rows
+                info["source"] = "helius_filtered: " + label
+                break
+            except Exception as exc:   # not Helius, plan without this method, filter unsupported...
+                info.setdefault("helius_filter_errors", []).append(f"{label}: {type(exc).__name__}: {exc}"[:150].replace(rpc_url, "<rpc>"))
         if data is not None:
             for t in data:
                 safe_ingest(t)
