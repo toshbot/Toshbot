@@ -12,6 +12,7 @@ In code:  from cupsey import seed_registry, decode_transaction, Ledger, Threshol
 SOL values are ESTIMATES (may include ATA rent, close refunds, tips). Alert thresholds are unapproved placeholders.
 """
 import argparse
+import asyncio
 import html
 import json
 import os
@@ -546,10 +547,73 @@ class PageTests(unittest.TestCase):
         self.assertIn("1.500 SOL", render_page(out, None, rec))
 
 
+class TrackerTests(unittest.TestCase):
+    def make(self):
+        t = Tracker(W, "https://rpc.invalid/?api-key=SECRET", interval=5)
+        return t
+
+    def test_ingest_builds_feed_and_dedupes(self):
+        t = self.make()
+        txs = [buy(2.0, 1000), sell(3.0, 1000, 1000), tx(10, 10, fee=5000)]   # buy, sell, noise
+        self.assertEqual(t.ingest(txs), 3)
+        self.assertEqual(t.ingest(txs), 0)   # same transactions again are skipped
+        s = t.snapshot()
+        self.assertEqual(s["kinds"].get("BUY"), 1); self.assertEqual(s["kinds"].get("SELL"), 1)
+        self.assertEqual([x["cls"] for x in s["events"]], ["FULL SELL", "BUY"])   # newest first
+        self.assertTrue(s["events"][0]["big"]); self.assertEqual(s["open"], []); self.assertEqual(s["closed"], 1)
+
+    def test_out_of_order_input_is_sorted(self):
+        t = self.make()
+        a, b = buy(1.0, 100), sell(1.5, 100, 100)
+        b["slot"], a["slot"] = 5, 4
+        t.ingest([b, a])   # sell arrives first in the list
+        self.assertEqual(t.ledger.closed[0].complete, True)
+
+    def test_noise_is_counted_as_foreign_when_not_signed_by_wallet(self):
+        t = self.make()
+        x = tx(10, 10, fee=0); x["transaction"]["message"]["accountKeys"] = [{"pubkey": "S" * 44}, {"pubkey": W}]
+        t.ingest([x]); self.assertEqual(t.snapshot()["foreign"], 1)
+
+    def test_malformed_transaction_does_not_stop_tracking(self):
+        t = self.make(); t.ingest([{"slot": 1}, buy(1.0, 10)])
+        self.assertEqual(t.kinds["BUY"], 1)
+
+    def test_cycle_backfills_then_polls_incrementally_and_hides_rpc_url(self):
+        t = self.make(); calls = []
+
+        async def fake(since, cap):
+            calls.append(since); return [buy(1.0, 10)] if len(calls) == 1 else [sell(1.2, 10, 10)]
+        t._fetch = fake
+        asyncio.run(t.cycle()); asyncio.run(t.cycle())
+        self.assertEqual(calls[0], None); self.assertIsNotNone(calls[1])   # second call only asks for what is new
+        self.assertEqual(t.snapshot()["closed"], 1)
+
+    def test_helius_failure_on_first_call_switches_to_standard(self):
+        t = self.make()
+
+        async def boom(method, params):
+            if method == "getTransactionsForAddress":
+                raise RuntimeError("method not found")
+            return []
+        t._rpc = boom
+        asyncio.run(t._fetch(None, 100)); self.assertEqual(t.mode, "standard")
+
+    def test_live_page_states(self):
+        rec = seed_registry().get(DEFAULT_ADDRESS) or seed_registry().get(SEED_ADDRESS)
+        self.assertIn("not running", render_live(None, rec))
+        t = self.make(); t.ingest([tx(10, 10, fee=0)]); t.last_ok = time.time()
+        page = render_live(t.snapshot(), rec)
+        self.assertIn("No buys or sells found yet", page); self.assertIn("Why nothing yet", page); self.assertIn('http-equiv="refresh"', page)
+        t.ingest([buy(5.0, 10, mint=M2)])
+        page = render_live(t.snapshot(), rec)
+        self.assertIn("Open positions", page); self.assertIn("5.000", page); self.assertNotIn("SECRET", page)
+
+
 # ============================================================================
 # ON-CHAIN VERIFIER  ->  browser: /cupsey/verify   |  terminal: python cupsey.py verify <address>
 # ============================================================================
-DEFAULT_ADDRESS = "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"
+SEED_ADDRESS = "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"
+DEFAULT_ADDRESS = (os.getenv("CUPSEY_WALLET") or SEED_ADDRESS).strip()   # set CUPSEY_WALLET on Render to watch a different wallet
 PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 
 
@@ -710,6 +774,223 @@ def verify(argv) -> int:
 
 
 # ============================================================================
+# LIVE TRACKER (background loop: polls the wallet, decodes new transactions, keeps a trade feed in memory)
+# ============================================================================
+class Tracker:
+    """Runs forever inside the web app. Reads only (no keys, no signing). Memory only: after a restart it re-reads recent history."""
+
+    def __init__(self, address: str, rpc_url: str, interval: float = 20.0, backfill: int = 1000, thresholds: "Thresholds | None" = None) -> None:
+        self.address, self.rpc_url = address, rpc_url
+        self.interval, self.backfill = max(5.0, interval), max(100, backfill)
+        self.thresholds = thresholds or Thresholds.from_env()
+        self.ledger = Ledger()
+        self.events: list[dict] = []          # newest first, trades + transfers only
+        self.kinds: Counter = Counter()
+        self.reasons: Counter = Counter()
+        self.checked = self.polls = self.foreign = 0   # foreign = transactions NOT signed by the wallet (spam/dust/others)
+        self.started = time.time()
+        self.last_poll: float | None = None
+        self.last_ok: float | None = None
+        self.last_error = ""
+        self.newest: int | None = None
+        self.oldest: int | None = None
+        self.last_trade: int | None = None
+        self.mode = "helius"
+        self.backfilled = False
+        self.last_sig: str | None = None
+        self.client = None
+
+    # ---- network
+    async def _rpc(self, method: str, params: list):
+        for attempt in range(4):
+            r = await self.client.post(self.rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            if r.status_code == 429:
+                await asyncio.sleep(1 + attempt)
+                continue
+            r.raise_for_status()
+            body = r.json()
+            if "error" in body:
+                raise RuntimeError("rpc error: " + str(body["error"])[:150])
+            return body["result"]
+        raise RuntimeError("rate limited by the RPC provider")
+
+    async def _fetch_helius(self, since: int | None, cap: int) -> list:
+        rows, token = [], None
+        flt: dict = {"status": "succeeded", "tokenAccounts": "balanceChanged"}
+        if since:
+            flt["blockTime"] = {"gte": since}
+        while len(rows) < cap:
+            cfg = {"transactionDetails": "full", "encoding": "jsonParsed", "maxSupportedTransactionVersion": 1,
+                   "sortOrder": "desc", "limit": 100, "commitment": "confirmed", "filters": flt}
+            if token:
+                cfg["paginationToken"] = token
+            res = await self._rpc("getTransactionsForAddress", [self.address, cfg]) or {}
+            rows += res.get("data") or []
+            token = res.get("paginationToken")
+            if not token or not res.get("data"):
+                break
+        return rows
+
+    async def _fetch_standard(self, cap: int) -> list:
+        cfg: dict = {"limit": 100, "commitment": "confirmed"}
+        if self.last_sig:
+            cfg["until"] = self.last_sig
+        sigs = await self._rpc("getSignaturesForAddress", [self.address, cfg]) or []
+        if sigs:
+            self.last_sig = sigs[0]["signature"]
+        ok = [s["signature"] for s in sigs if not s.get("err")][:min(cap, 60)]
+        sem = asyncio.Semaphore(4)
+
+        async def one(sig):
+            async with sem:
+                try:
+                    return await self._rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}])
+                except Exception:
+                    return None
+        return [t for t in await asyncio.gather(*(one(s) for s in ok)) if t]
+
+    async def _fetch(self, since: int | None, cap: int) -> list:
+        if self.mode == "helius":
+            try:
+                return await self._fetch_helius(since, cap)
+            except Exception as exc:
+                if since and "blockTime" in str(exc):   # provider dislikes the time filter: re-read the latest page, duplicates are skipped
+                    return await self._fetch_helius(None, 100)
+                if self.polls == 0:   # first ever call failed: this RPC is probably not Helius
+                    self.mode = "standard"
+                    self.last_error = "Helius method not available on this RPC; using the slower standard method."
+                else:
+                    raise
+        return await self._fetch_standard(cap)
+
+    # ---- processing
+    def ingest(self, txs: list) -> int:
+        txs = sorted(txs, key=lambda t: (t.get("slot") or 0, t.get("blockTime") or 0))   # oldest first so positions build correctly
+        new = 0
+        for t in txs:
+            try:
+                d = decode_transaction(t, self.address)
+                keys = _keys(t)
+                signed = bool(keys) and keys[0] == self.address
+            except Exception:
+                self.kinds["ERROR"] += 1
+                continue
+            ev = self.ledger.apply(d)
+            if ev is None:
+                continue
+            new += 1
+            self.checked += 1
+            self.foreign += 0 if signed else 1
+            self.kinds[d.kind] += 1
+            self.reasons[f"{d.kind}: {d.note or 'ok'}"] += 1
+            if d.block_time:
+                self.newest = max(self.newest or 0, d.block_time)
+                self.oldest = min(self.oldest or d.block_time, d.block_time)
+            if d.kind in ("BUY", "SELL", "TRANSFER") and d.mint:
+                big, why = is_significant(ev, self.thresholds)
+                self.events.insert(0, {"cls": ev.classification, "mint": d.mint, "sol": ev.sol_value, "pct": ev.pct_of_position,
+                                       "pnl": ev.realized_pnl_sol, "time": d.block_time, "sig": d.signature, "big": big, "why": why})
+                if d.kind in ("BUY", "SELL"):
+                    self.last_trade = max(self.last_trade or 0, d.block_time or 0)
+        del self.events[300:]
+        return new
+
+    async def cycle(self) -> None:
+        if not self.backfilled:
+            self.ingest(await self._fetch(None, self.backfill))
+            self.backfilled = True
+        else:
+            self.ingest(await self._fetch(self.newest, 300))
+        self.last_ok = time.time()
+
+    async def run(self) -> None:
+        import httpx
+        async with httpx.AsyncClient(timeout=25) as c:
+            self.client = c
+            while True:
+                try:
+                    await self.cycle()
+                    if not self.last_error.startswith("Helius method"):
+                        self.last_error = ""
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:   # never let one bad poll stop tracking; never echo the RPC URL (holds the API key)
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    self.last_error = (f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "") + f": {exc}")[:200].replace(self.rpc_url, "<rpc>")
+                self.polls += 1
+                self.last_poll = time.time()
+                await asyncio.sleep(self.interval)
+
+    def snapshot(self) -> dict:
+        opens = [asdict(p) for p in self.ledger.open.values() if p.qty > EPS]
+        opens.sort(key=lambda p: p.get("opened_at") or 0, reverse=True)
+        return {"address": self.address, "started": self.started, "last_poll": self.last_poll, "last_ok": self.last_ok, "error": self.last_error,
+                "interval": self.interval, "mode": self.mode, "polls": self.polls, "backfilled": self.backfilled, "checked": self.checked,
+                "foreign": self.foreign, "kinds": dict(self.kinds), "reasons": self.reasons.most_common(5), "newest": self.newest,
+                "oldest": self.oldest, "last_trade": self.last_trade, "events": self.events[:40], "open": opens[:20],
+                "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
+
+
+def _ago(ts) -> str:
+    if not ts:
+        return "never"
+    sec = max(0, int(time.time() - ts))
+    return f"{sec}s ago" if sec < 90 else f"{sec // 60}m ago" if sec < 5400 else f"{sec // 3600}h ago" if sec < 172800 else f"{sec // 86400}d ago"
+
+
+def render_live(s: dict | None, rec: "WalletRecord") -> str:
+    """HTML for /cupsey from the live tracker state. No network calls here, so refreshing the page costs nothing."""
+    e = html.escape
+    short = lambda m: e((m or "?")[:5] + "..." + (m or "")[-4:])
+    body = []
+    if not s:
+        body.append('<div class="card warn"><b>Tracker is not running.</b><br>Check that CUPSEY_TRACKING is not set to false, then redeploy.</div>')
+    else:
+        k = s["kinds"]
+        trades = [x for x in s["events"] if x["cls"] != "TRANSFER"]
+        up = "Live" if s["last_ok"] and time.time() - s["last_ok"] < s["interval"] * 4 + 30 else "Not reading"
+        body.append(f'<div class="card"><b>{up}</b> &middot; reads the wallet every {s["interval"]:.0f}s &middot; last good read {e(_ago(s["last_ok"]))}'
+                    f'<div class="sub">Tracking since {e(_ago(s["started"]))} &middot; method: {e(s["mode"])} &middot; this page refreshes itself</div></div>')
+        if s["error"]:
+            body.append(f'<div class="card warn"><b>Problem reading the blockchain.</b><br>{e(s["error"])}</div>')
+        body.append('<div class="card"><div class="big">%d</div>buys/sells seen<div class="sub">%d transactions read &middot; %d transfers &middot; last real trade: %s &middot; newest activity of any kind: %s</div></div>'
+                    % (k.get("BUY", 0) + k.get("SELL", 0), s["checked"], k.get("TRANSFER", 0), e(_ago(s["last_trade"])), e(_ago(s["newest"]))))
+        if s["open"]:
+            rows = "".join('<tr><td><a href="https://solscan.io/token/%s" target="_blank">%s</a></td><td>%.2f SOL</td><td>%.2f SOL</td><td>%s</td></tr>'
+                           % (e(p["mint"]), short(p["mint"]), p["cost_sol"], p["bought_sol"], e(_ago(p["opened_at"]))) for p in s["open"])
+            body.append(f'<div class="card"><b>Open positions ({len(s["open"])})</b><table><tr><th>Token</th><th>Holding cost</th><th>Bought</th><th>Opened</th></tr>{rows}</table></div>')
+        if trades:
+            rows = "".join('<tr><td class="%s">%s%s</td><td><a href="https://solscan.io/tx/%s" target="_blank">%s</a></td><td>%.3f</td><td>%s</td></tr>'
+                           % ("sell" if "SELL" in x["cls"] else "buy", e(x["cls"].title()), " &#9733;" if x["big"] else "", e(x["sig"]), short(x["mint"]), x["sol"], e(_ago(x["time"])))
+                           for x in trades[:25])
+            body.append(f'<div class="card"><b>Latest trades</b><table><tr><th>Type</th><th>Token</th><th>SOL</th><th>When</th></tr>{rows}</table>'
+                        f'<div class="sub">&#9733; = passes the size filter (placeholder values). SOL sizes are estimates. Tap a token for the transaction.</div></div>')
+        else:
+            body.append('<div class="card warn"><b>No buys or sells found yet.</b><br>The tracker is reading this wallet continuously and will show a trade here the moment the blockchain shows tokens swapped for SOL. Nothing is guessed.</div>')
+        noise = s["checked"] - sum(k.get(x, 0) for x in ("BUY", "SELL", "TRANSFER"))
+        if s["checked"] and not trades:
+            body.append('<div class="card"><b>Why nothing yet?</b><div class="sub">%d of %d transactions were not signed by this wallet (someone else touching it), and %d had no token trade in them.%s<br>%s</div></div>'
+                        % (s["foreign"], s["checked"], noise,
+                           " If almost everything is noise, this address is probably NOT his trading wallet: set CUPSEY_WALLET on Render to the right one." if s["foreign"] > 0.8 * s["checked"] else "",
+                           e(" | ".join(f"{n} x {r}" for r, n in s["reasons"]))))
+    badge = e(rec.status.replace("_", " "))
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="15">
+<title>Cupsey monitor</title><style>
+:root{{--bg:#0b0b0c;--card:#17181a;--fg:#f2f2f2;--mute:#9a9aa0;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#e9b44c}}
+@media(prefers-color-scheme:light){{:root{{--bg:#f4f4f6;--card:#fff;--fg:#111;--mute:#666}}}}
+body{{margin:0;padding:16px;font:16px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg)}}
+.card{{background:var(--card);border-radius:16px;padding:16px;margin:12px 0}}.warn{{border:1px solid var(--warn)}}
+.big{{font-size:44px;font-weight:700}}.sub{{color:var(--mute);font-size:13px;margin-top:6px;word-break:break-all}}
+table{{width:100%;border-collapse:collapse;margin-top:8px}}td,th{{text-align:left;padding:8px 4px;font-size:14px}}th{{color:var(--mute)}}
+.buy{{color:var(--ok);font-weight:600}}.sell{{color:var(--bad);font-weight:600}}a{{color:#5b9dff}}.badge{{background:#2b2d31;color:var(--warn);border-radius:999px;padding:3px 10px;font-size:12px;display:inline-block}}
+</style></head><body><h2>Cupsey monitor</h2>
+<div class="card"><div class="badge">{badge}</div><div class="sub">{e(rec.address)}</div>
+<div class="sub">Attribution comes from third parties and is not yet confirmed on-chain by us. Phone alerts are not switched on yet; this page is the live view.</div>
+<div class="sub"><a href="https://solscan.io/account/{e(rec.address)}" target="_blank">Open on Solscan</a> &middot; <a href="/cupsey">Refresh</a> &middot; <a href="/cupsey/wallets">Wallets</a> &middot; <a href="/dashboard">Old Tosh scanner</a></div></div>
+{"".join(body)}</body></html>"""
+
+
+# ============================================================================
 # WEB ROUTES (called once from main.py; protected by the dashboard login)
 # ============================================================================
 def render_page(out: dict | None, error: str | None, rec: "WalletRecord") -> str:
@@ -754,27 +1035,35 @@ table{{width:100%;border-collapse:collapse;margin-top:8px}}td,th{{text-align:lef
 
 
 def register_cupsey_routes(app, auth) -> None:
-    """Adds /cupsey/wallets and /cupsey/verify. Imports FastAPI lazily so this file stays stdlib-only otherwise."""
+    """Adds /cupsey (live page), /cupsey/wallets and /cupsey/verify, and starts the background tracker with the app."""
     import asyncio
+    from contextlib import asynccontextmanager
     from fastapi import Depends, Query, Request
     from fastapi.responses import HTMLResponse, JSONResponse
 
     registry = seed_registry()
-    cache: dict = {}
+    if not registry.get(DEFAULT_ADDRESS):   # wallet chosen through CUPSEY_WALLET
+        registry.add(WalletRecord(DEFAULT_ADDRESS, "Cupsey (set by CUPSEY_WALLET)", "POSSIBLY_ASSOCIATED", notes="Address supplied by the owner; not verified."))
+    tracker: Tracker | None = None
+    if os.getenv("CUPSEY_TRACKING", "true").lower() not in ("0", "false", "no", "off"):
+        tracker = Tracker(DEFAULT_ADDRESS, app.state.settings.solana_rpc_url, float(os.getenv("CUPSEY_POLL_SECONDS", "20")),
+                          int(os.getenv("CUPSEY_BACKFILL_TX", "1000")))
+        inner = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def with_tracker(a):
+            async with inner(a) as state:
+                task = asyncio.create_task(tracker.run(), name="cupsey-tracker")
+                try:
+                    yield state
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        app.router.lifespan_context = with_tracker
 
     @app.get("/cupsey", include_in_schema=False, dependencies=[Depends(auth)])
-    async def cupsey_page(request: Request):
-        url = request.app.state.settings.solana_rpc_url
-        out = err = None
-        if cache.get("out") and time.time() - cache["at"] < 60:   # protects your RPC credits and free-tier CPU
-            out = cache["out"]
-        else:
-            try:
-                out = await asyncio.to_thread(run_verification, DEFAULT_ADDRESS, url, 40, 500)
-                cache.update(out=out, at=time.time())
-            except Exception as exc:
-                err = (f"{type(exc).__name__}: {exc}")[:200].replace(url, "<rpc>")
-        return HTMLResponse(render_page(out, err, registry.get(DEFAULT_ADDRESS)))
+    async def cupsey_page():
+        return HTMLResponse(render_live(tracker.snapshot() if tracker else None, registry.get(DEFAULT_ADDRESS)), headers={"Cache-Control": "no-store"})
 
     @app.get("/cupsey/wallets", include_in_schema=False, dependencies=[Depends(auth)])
     async def cupsey_wallets():
