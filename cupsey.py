@@ -556,15 +556,28 @@ def run_verification(address: str, rpc_url: str, limit: int = 40) -> dict:
     import httpx  # only needed here
     if not _B58.match(address):
         raise ValueError("not a valid Solana address")
-    kinds, mints, inflows, samples, times = Counter(), set(), Counter(), [], []
+    kinds, mints, inflows, samples, times, errors = Counter(), set(), Counter(), [], [], []
     with httpx.Client(timeout=20) as c:
         sigs = _rpc(c, rpc_url, "getSignaturesForAddress", [address, {"limit": limit, "commitment": "confirmed"}])
         for s in sigs:
-            t = _rpc(c, rpc_url, "getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}])
-            if not t:
-                kinds["MISSING"] += 1
+            try:
+                # 255 = accept every transaction version (legacy, v0, v1 and any newer one)
+                t = _rpc(c, rpc_url, "getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 255, "commitment": "confirmed"}])
+                if not t:
+                    kinds["MISSING"] += 1
+                    continue
+                d = decode_transaction(t, address)
+                inflow_items = []
+                for ins in t["transaction"]["message"].get("instructions", []):
+                    p = ins.get("parsed")
+                    if ins.get("program") == "system" and isinstance(p, dict) and p.get("type") == "transfer" and p["info"].get("destination") == address:
+                        inflow_items.append((p["info"]["source"], p["info"]["lamports"] / LAMPORTS))
+            except Exception as exc:   # one bad transaction must not abort the whole check
+                kinds["ERROR"] += 1
+                msg = (f"{type(exc).__name__}: {exc}")[:160].replace(rpc_url, "<rpc>")
+                if msg not in errors and len(errors) < 3:
+                    errors.append(msg)
                 continue
-            d = decode_transaction(t, address)
             kinds[d.kind] += 1
             if d.block_time:
                 times.append(d.block_time)
@@ -572,13 +585,11 @@ def run_verification(address: str, rpc_url: str, limit: int = 40) -> dict:
                 mints.add(d.mint)
             if d.kind in ("BUY", "SELL") and len(samples) < 15:
                 samples.append({"signature": d.signature, "kind": d.kind, "mint": d.mint, "sol": round(d.quote_sol, 4), "time_utc": datetime.fromtimestamp(d.block_time, timezone.utc).isoformat() if d.block_time else None})
-            for ins in t["transaction"]["message"].get("instructions", []):
-                p = ins.get("parsed")
-                if ins.get("program") == "system" and isinstance(p, dict) and p.get("type") == "transfer" and p["info"].get("destination") == address:
-                    inflows[p["info"]["source"]] += p["info"]["lamports"] / LAMPORTS
+            for src, sol in inflow_items:
+                inflows[src] += sol
     iso = lambda x: datetime.fromtimestamp(x, timezone.utc).isoformat()
     return {"address": address, "checked_at": datetime.now(timezone.utc).isoformat(), "transactions_examined": len(sigs),
-            "kinds": dict(kinds), "distinct_tokens": len(mints),
+            "kinds": dict(kinds), "errors_sample": errors, "distinct_tokens": len(mints),
             "oldest": iso(min(times)) if times else None, "newest": iso(max(times)) if times else None,
             "rpc_is_public_default": rpc_url == PUBLIC_RPC,
             "largest_sol_inflow_sources": [{"source": k, "sol": round(v, 3)} for k, v in inflows.most_common(5)],
