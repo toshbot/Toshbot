@@ -552,81 +552,107 @@ def _rpc(client, url, method, params):
 
 
 def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 2000) -> dict:
-    """Blocking. Scans the last `scan` signatures (cheap), then decodes `limit` successful transactions sampled evenly
-    across that window (so a recent burst of spam cannot hide the real trades). Never changes any status."""
+    """Blocking. Decodes the wallet's recent REAL activity and returns evidence. Never changes any status.
+
+    Path 1 (fast): Helius getTransactionsForAddress, filtered to successful transactions that touch the wallet or change
+    its token balances (removes failed-transaction spam), full data in ONE call.
+    Path 2 (fallback, any RPC): scan signatures, skip failed ones, sample evenly across the window."""
     import httpx  # only needed here
     if not _B58.match(address):
         raise ValueError("not a valid Solana address")
     kinds, mints, inflows, samples, times, errors = Counter(), set(), Counter(), [], [], []
     reasons, other_samples = Counter(), []
-    with httpx.Client(timeout=20) as c:
-        sigs, before = [], None
-        while len(sigs) < scan:
-            cfg = {"limit": min(100, scan - len(sigs)), "commitment": "confirmed"}
-            if before:
-                cfg["before"] = before
-            page = _rpc(c, rpc_url, "getSignaturesForAddress", [address, cfg])
-            if not page:
-                break
-            sigs += page
-            before = page[-1]["signature"]
-            if len(page) < cfg["limit"] or sum(1 for x in sigs if not x.get("err")) >= 3 * limit:
-                break
-        ok = [x for x in sigs if not x.get("err")]
-        fails = [x for x in sigs if x.get("err")]
-        failed_samples = []
-        for f in fails[::max(1, len(fails) // 5)][:5]:   # who is sending the failed transactions, and why do they fail?
-            try:
-                t = _rpc(c, rpc_url, "getTransaction", [f["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 255, "commitment": "confirmed"}])
-                msg = t["transaction"]["message"]
-                keys = [k["pubkey"] if isinstance(k, dict) else k for k in msg.get("accountKeys", [])]
-                failed_samples.append({"signature": f["signature"], "fee_payer_is_wallet": bool(keys) and keys[0] == address,
-                                       "fee_payer": keys[0] if keys else None, "error": str(f.get("err"))[:80],
-                                       "programs": sorted({i.get("programId", "?") for i in msg.get("instructions", [])})[:4]})
-            except Exception as exc:
-                failed_samples.append({"signature": f["signature"], "error": f"could not read: {type(exc).__name__}"})
-        picked = ok[::max(1, len(ok) // max(1, limit))][:limit]   # evenly spaced, newest first
-        for s in picked:
-            try:
-                # 255 = accept every transaction version (legacy, v0, v1 and any newer one)
-                t = _rpc(c, rpc_url, "getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 255, "commitment": "confirmed"}])
+    info: dict = {}
+
+    def ingest(t) -> None:
+        d = decode_transaction(t, address)
+        found = []   # parse first: a malformed transaction raises here, before any counter is touched
+        for ins in t["transaction"]["message"].get("instructions", []):
+            p = ins.get("parsed")
+            if ins.get("program") == "system" and isinstance(p, dict) and p.get("type") == "transfer" and p["info"].get("destination") == address:
+                found.append((p["info"]["source"], p["info"]["lamports"] / LAMPORTS))
+        kinds[d.kind] += 1
+        reasons[f"{d.kind}: {d.note or 'ok'}"] += 1
+        if d.kind in ("OTHER", "UNKNOWN") and len(other_samples) < 5:
+            other_samples.append({"signature": d.signature, "kind": d.kind, "note": d.note, "quote_sol": round(d.quote_sol, 6)})
+        if d.block_time:
+            times.append(d.block_time)
+        if d.mint:
+            mints.add(d.mint)
+        if d.kind in ("BUY", "SELL") and len(samples) < 15:
+            samples.append({"signature": d.signature, "kind": d.kind, "mint": d.mint, "sol": round(d.quote_sol, 4), "time_utc": datetime.fromtimestamp(d.block_time, timezone.utc).isoformat() if d.block_time else None})
+        for src, sol in found:
+            inflows[src] += sol
+
+    def safe_ingest(t) -> None:
+        try:
+            ingest(t)
+        except Exception as exc:   # one bad transaction must not abort the whole check
+            kinds["ERROR"] += 1
+            msg = (f"{type(exc).__name__}: {exc}")[:160].replace(rpc_url, "<rpc>")
+            if msg not in errors and len(errors) < 3:
+                errors.append(msg)
+
+    with httpx.Client(timeout=25) as c:
+        data = None
+        try:
+            res = _rpc(c, rpc_url, "getTransactionsForAddress", [address, {
+                "transactionDetails": "full", "encoding": "jsonParsed", "maxSupportedTransactionVersion": 1,
+                "sortOrder": "desc", "limit": 100, "commitment": "confirmed",
+                "filters": {"status": "succeeded", "tokenAccounts": "balanceChanged"}}])
+            data = (res or {}).get("data") or []
+            info["source"] = "helius_filtered (successful transactions touching the wallet or changing its token balances)"
+        except Exception as exc:   # not Helius, plan without this method, etc.
+            info["helius_filtered_unavailable"] = f"{type(exc).__name__}: {exc}"[:140].replace(rpc_url, "<rpc>")
+        if data is not None:
+            for t in data:
+                safe_ingest(t)
+            window = {"returned": len(data)}
+        else:
+            info["source"] = "standard_signatures (failed transactions skipped, sampled across the window)"
+            sigs, before = [], None
+            while len(sigs) < scan:
+                cfg = {"limit": min(100, scan - len(sigs)), "commitment": "confirmed"}
+                if before:
+                    cfg["before"] = before
+                page = _rpc(c, rpc_url, "getSignaturesForAddress", [address, cfg])
+                if not page:
+                    break
+                sigs += page
+                before = page[-1]["signature"]
+                if len(page) < cfg["limit"] or sum(1 for x in sigs if not x.get("err")) >= 3 * limit:
+                    break
+            ok = [x for x in sigs if not x.get("err")]
+            fails = [x for x in sigs if x.get("err")]
+            failed_samples = []
+            for f in fails[::max(1, len(fails) // 5)][:5]:   # who sends the failed transactions, and why do they fail?
+                try:
+                    t = _rpc(c, rpc_url, "getTransaction", [f["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 255, "commitment": "confirmed"}])
+                    msg = t["transaction"]["message"]
+                    keys = [k["pubkey"] if isinstance(k, dict) else k for k in msg.get("accountKeys", [])]
+                    failed_samples.append({"signature": f["signature"], "fee_payer_is_wallet": bool(keys) and keys[0] == address, "fee_payer": keys[0] if keys else None,
+                                           "error": str(f.get("err"))[:80], "programs": sorted({i.get("programId", "?") for i in msg.get("instructions", [])})[:4]})
+                except Exception as exc:
+                    failed_samples.append({"signature": f["signature"], "error": f"could not read: {type(exc).__name__}"})
+            for sg in ok[::max(1, len(ok) // max(1, limit))][:limit]:
+                try:
+                    t = _rpc(c, rpc_url, "getTransaction", [sg["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 255, "commitment": "confirmed"}])
+                except Exception as exc:
+                    kinds["ERROR"] += 1
+                    errors.append(f"{type(exc).__name__}: {exc}"[:160].replace(rpc_url, "<rpc>")) if len(errors) < 3 else None
+                    continue
                 if not t:
                     kinds["MISSING"] += 1
                     continue
-                d = decode_transaction(t, address)
-                inflow_items = []
-                for ins in t["transaction"]["message"].get("instructions", []):
-                    p = ins.get("parsed")
-                    if ins.get("program") == "system" and isinstance(p, dict) and p.get("type") == "transfer" and p["info"].get("destination") == address:
-                        inflow_items.append((p["info"]["source"], p["info"]["lamports"] / LAMPORTS))
-            except Exception as exc:   # one bad transaction must not abort the whole check
-                kinds["ERROR"] += 1
-                msg = (f"{type(exc).__name__}: {exc}")[:160].replace(rpc_url, "<rpc>")
-                if msg not in errors and len(errors) < 3:
-                    errors.append(msg)
-                continue
-            kinds[d.kind] += 1
-            reasons[f"{d.kind}: {d.note or 'ok'}"] += 1
-            if d.kind in ("OTHER", "UNKNOWN") and len(other_samples) < 5:
-                other_samples.append({"signature": d.signature, "kind": d.kind, "note": d.note, "quote_sol": round(d.quote_sol, 6)})
-            if d.block_time:
-                times.append(d.block_time)
-            if d.mint:
-                mints.add(d.mint)
-            if d.kind in ("BUY", "SELL") and len(samples) < 15:
-                samples.append({"signature": d.signature, "kind": d.kind, "mint": d.mint, "sol": round(d.quote_sol, 4), "time_utc": datetime.fromtimestamp(d.block_time, timezone.utc).isoformat() if d.block_time else None})
-            for src, sol in inflow_items:
-                inflows[src] += sol
+                safe_ingest(t)
+            sig_times = [x["blockTime"] for x in sigs if x.get("blockTime")]
+            window = {"scanned": len(sigs), "failed": len(fails), "succeeded": len(ok),
+                      "failed_error_types": dict(Counter(str(x.get("err"))[:60] for x in fails).most_common(3)), "failed_samples": failed_samples,
+                      "span_seconds": (max(sig_times) - min(sig_times)) if sig_times else None}
     iso = lambda x: datetime.fromtimestamp(x, timezone.utc).isoformat()
-    sig_times = [x["blockTime"] for x in sigs if x.get("blockTime")]
-    return {"address": address, "checked_at": datetime.now(timezone.utc).isoformat(),
-            "signature_window": {"scanned": len(sigs), "failed": len(sigs) - len(ok), "succeeded": len(ok),
-                                 "failed_error_types": dict(Counter(str(x.get("err"))[:60] for x in fails).most_common(3)),
-                                 "failed_samples": failed_samples,
-                                 "oldest": iso(min(sig_times)) if sig_times else None, "newest": iso(max(sig_times)) if sig_times else None,
-                                 "span_seconds": (max(sig_times) - min(sig_times)) if sig_times else None},
-            "transactions_decoded": len(picked), "kinds": dict(kinds), "reasons": dict(reasons), "other_samples": other_samples,
-            "errors_sample": errors, "distinct_tokens": len(mints),
+    return {"address": address, "checked_at": datetime.now(timezone.utc).isoformat(), **info, "window": window,
+            "kinds": dict(kinds), "reasons": dict(reasons), "other_samples": other_samples, "errors_sample": errors,
+            "distinct_tokens": len(mints),
             "decoded_oldest": iso(min(times)) if times else None, "decoded_newest": iso(max(times)) if times else None,
             "rpc_is_public_default": rpc_url == PUBLIC_RPC,
             "largest_sol_inflow_sources": [{"source": k, "sol": round(v, 3)} for k, v in inflows.most_common(5)],
@@ -646,7 +672,7 @@ def verify(argv) -> int:
     out = run_verification(a.address, url, a.limit, a.scan)
     path = f"{a.address}_evidence.json"
     json.dump(out, open(path, "w"), indent=2)
-    print(json.dumps({k: out[k] for k in ("signature_window", "kinds", "reasons")}, indent=2))
+    print(json.dumps({k: out[k] for k in ("source", "window", "kinds", "decoded_newest")}, indent=2))
     print("wrote", path)
     return 0
 
