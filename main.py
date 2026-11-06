@@ -2072,7 +2072,7 @@ async def require_dashboard_auth(request: Request) -> None:
             pass
     accept = request.headers.get("accept", "")
     is_browser = "text/html" in accept or "sec-fetch-dest" in request.headers
-    if is_browser and "text/html" in accept and request.url.path.rstrip("/") == "/dashboard":
+    if is_browser and "text/html" in accept and request.url.path.rstrip("/") in ("/dashboard", "/cupsey"):
         raise HTTPException(status_code=303, detail="Sign in required", headers={"Location": "/login"})
     if is_browser:   # a background fetch from the page: plain 401 so the browser never shows its own ugly popup
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -3537,7 +3537,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root() -> dict:
-        return {"service": "toshbot", "status": "ok", "health": "/health", "dashboard": "/dashboard"}
+        return {"service": "toshbot", "status": "ok", "health": "/health", "cupsey": "/cupsey", "dashboard": "/dashboard"}
 
     @app.api_route("/health", methods=["GET", "HEAD"])
     async def liveness() -> dict:
@@ -3556,14 +3556,14 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         cfg = request.app.state.settings
         token = request.cookies.get(SESSION_COOKIE, "")
         if not cfg.dashboard_password or (token and session_valid(cfg, token)):
-            return RedirectResponse("/dashboard", status_code=303)
+            return RedirectResponse("/cupsey", status_code=303)
         return HTMLResponse(render_login_page(), headers=LOGIN_HEADERS)
 
     @app.post("/login", include_in_schema=False)
     async def login_submit(request: Request):
         cfg = request.app.state.settings
         if not cfg.dashboard_password:
-            return RedirectResponse("/dashboard", status_code=303)
+            return RedirectResponse("/cupsey", status_code=303)
         ip = _client_ip(request)
         if _login_locked(ip):
             return HTMLResponse(render_login_page("Too many attempts. Wait a few minutes and try again."), status_code=429, headers=LOGIN_HEADERS)
@@ -3577,7 +3577,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             await asyncio.sleep(0.4)   # slows down guessing
             return HTMLResponse(render_login_page("Wrong username or password.", user), status_code=401, headers=LOGIN_HEADERS)
         _LOGIN_FAILS.pop(ip, None)
-        resp = RedirectResponse("/dashboard", status_code=303)
+        resp = RedirectResponse("/cupsey", status_code=303)
         resp.set_cookie(SESSION_COOKIE, make_session(cfg), max_age=SESSION_TTL, httponly=True,
                         secure=cfg.environment == "production", samesite="lax", path="/")
         return resp

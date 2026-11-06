@@ -12,6 +12,7 @@ In code:  from cupsey import seed_registry, decode_transaction, Ledger, Threshol
 SOL values are ESTIMATES (may include ATA rent, close refunds, tips). Alert thresholds are unapproved placeholders.
 """
 import argparse
+import html
 import json
 import os
 import re
@@ -530,6 +531,21 @@ class RegistryTests(unittest.TestCase):
 
 
 
+class PageTests(unittest.TestCase):
+    def test_page_escapes_and_handles_empty(self):
+        rec = seed_registry().get("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f")
+        out = {"kinds": {"TRANSFER": 4}, "recent_activity": [{"kind": "TRANSFER", "mint": "X", "sol": 0, "time": 1, "signature": "s"}], "window": {"returned": 100},
+               "source": "<script>alert(1)</script>", "decoded_oldest": "a", "decoded_newest": "b", "checked_at": "c"}
+        page = render_page(out, None, rec)
+        self.assertIn("No buys or sells found", page); self.assertNotIn("<script>alert", page)
+        self.assertIn("Could not read", render_page(None, "boom", rec))
+
+    def test_page_shows_trades(self):
+        rec = seed_registry().get("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f")
+        out = {"kinds": {"BUY": 1}, "recent_activity": [{"kind": "BUY", "mint": "A" * 44, "sol": -1.5, "time": 1, "signature": "s"}], "window": {"returned": 5}}
+        self.assertIn("1.500 SOL", render_page(out, None, rec))
+
+
 # ============================================================================
 # ON-CHAIN VERIFIER  ->  browser: /cupsey/verify   |  terminal: python cupsey.py verify <address>
 # ============================================================================
@@ -561,7 +577,7 @@ def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 20
     if not _B58.match(address):
         raise ValueError("not a valid Solana address")
     kinds, mints, inflows, samples, times, errors = Counter(), set(), Counter(), [], [], []
-    reasons, other_samples = Counter(), []
+    reasons, other_samples, recent = Counter(), [], []
     info: dict = {}
 
     def ingest(t) -> None:
@@ -573,6 +589,8 @@ def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 20
                 found.append((p["info"]["source"], p["info"]["lamports"] / LAMPORTS))
         kinds[d.kind] += 1
         reasons[f"{d.kind}: {d.note or 'ok'}"] += 1
+        if d.kind in ("BUY", "SELL", "TRANSFER") and len(recent) < 25:
+            recent.append({"kind": d.kind, "mint": d.mint, "sol": round(d.quote_sol, 4), "time": d.block_time, "signature": d.signature})
         if d.kind in ("OTHER", "UNKNOWN") and len(other_samples) < 5:
             other_samples.append({"signature": d.signature, "kind": d.kind, "note": d.note, "quote_sol": round(d.quote_sol, 6)})
         if d.block_time:
@@ -670,7 +688,7 @@ def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 20
             "decoded_oldest": iso(min(times)) if times else None, "decoded_newest": iso(max(times)) if times else None,
             "rpc_is_public_default": rpc_url == PUBLIC_RPC,
             "largest_sol_inflow_sources": [{"source": k, "sol": round(v, 3)} for k, v in inflows.most_common(5)],
-            "sample_trades": samples,
+            "sample_trades": samples, "recent_activity": recent,
             "next_steps": ["Compare sample_trades times with trades Cupsey posted himself on X",
                            "Check whether any inflow source is a known exchange or his old wallet",
                            "Only then add on_chain_correlation evidence and consider promotion"]}
@@ -694,13 +712,69 @@ def verify(argv) -> int:
 # ============================================================================
 # WEB ROUTES (called once from main.py; protected by the dashboard login)
 # ============================================================================
+def render_page(out: dict | None, error: str | None, rec: "WalletRecord") -> str:
+    """Plain HTML page for /cupsey. Everything dynamic is escaped."""
+    e = html.escape
+    def ago(ts):
+        if not ts:
+            return "unknown"
+        sec = max(0, int(time.time() - ts))
+        return f"{sec // 86400}d ago" if sec >= 86400 else f"{sec // 3600}h ago" if sec >= 3600 else f"{sec // 60}m ago"
+    body = []
+    if error or not out:
+        body.append(f'<div class="card warn"><b>Could not read the blockchain right now.</b><br>{e(error or "unknown error")}</div>')
+    else:
+        k = out.get("kinds", {})
+        trades = [r for r in out.get("recent_activity", []) if r["kind"] in ("BUY", "SELL")]
+        newest = out.get("decoded_newest")
+        body.append('<div class="card"><div class="big">%d</div>buys/sells found<div class="sub">in the latest %s transactions checked &middot; transfers in/out: %d</div></div>'
+                    % (k.get("BUY", 0) + k.get("SELL", 0), e(str((out.get("window") or {}).get("returned", out.get("transactions_decoded", "?")))), k.get("TRANSFER", 0)))
+        if not trades:
+            body.append('<div class="card warn"><b>No buys or sells found in this window.</b><br>Either he has not traded recently, or this is not his active wallet. We do not guess: nothing is shown as a trade unless the blockchain shows tokens swapped for SOL.</div>')
+        else:
+            rows = "".join('<tr><td class="%s">%s</td><td>%s</td><td>%s SOL</td><td>%s</td></tr>' % (r["kind"].lower(), r["kind"], e((r["mint"] or "?")[:6] + "..." + (r["mint"] or "")[-4:]),
+                           e(f'{abs(r["sol"]):.3f}'), e(ago(r["time"]))) for r in trades[:15])
+            body.append(f'<div class="card"><b>Recent trades</b><table><tr><th>Type</th><th>Token</th><th>Size</th><th>When</th></tr>{rows}</table><div class="sub">SOL sizes are estimates.</div></div>')
+        body.append(f'<div class="card sub">Window: {e(str(out.get("decoded_oldest")))} to {e(str(out.get("decoded_newest")))} (UTC)<br>Source: {e(str(out.get("source", "")))}<br>Checked: {e(str(out.get("checked_at", ""))[:19])} UTC</div>')
+    badge = e(rec.status.replace("_", " "))
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cupsey monitor</title><style>
+:root{{--bg:#0b0b0c;--card:#17181a;--fg:#f2f2f2;--mute:#9a9aa0;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#e9b44c}}
+@media(prefers-color-scheme:light){{:root{{--bg:#f4f4f6;--card:#fff;--fg:#111;--mute:#666}}}}
+body{{margin:0;padding:16px;font:16px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg)}}
+.card{{background:var(--card);border-radius:16px;padding:16px;margin:12px 0}}.warn{{border:1px solid var(--warn)}}
+.big{{font-size:44px;font-weight:700}}.sub{{color:var(--mute);font-size:13px;margin-top:6px;word-break:break-all}}
+table{{width:100%;border-collapse:collapse;margin-top:8px}}td,th{{text-align:left;padding:8px 4px;font-size:14px}}th{{color:var(--mute)}}
+.buy{{color:var(--ok);font-weight:600}}.sell{{color:var(--bad);font-weight:600}}a{{color:#5b9dff}}.badge{{background:#2b2d31;color:var(--warn);border-radius:999px;padding:3px 10px;font-size:12px}}
+</style></head><body><h2>Cupsey monitor</h2>
+<div class="card"><div class="badge">{badge}</div><div class="sub">{e(rec.address)}</div>
+<div class="sub">Attribution comes from third parties and is not yet confirmed on-chain by us. Live alerts are not switched on yet.</div>
+<div class="sub"><a href="https://solscan.io/account/{e(rec.address)}" target="_blank">Open on Solscan</a> &middot; <a href="/cupsey">Refresh</a> &middot; <a href="/cupsey/wallets">Wallets</a> &middot; <a href="/dashboard">Old Tosh scanner</a></div></div>
+{"".join(body)}</body></html>"""
+
+
 def register_cupsey_routes(app, auth) -> None:
     """Adds /cupsey/wallets and /cupsey/verify. Imports FastAPI lazily so this file stays stdlib-only otherwise."""
     import asyncio
     from fastapi import Depends, Query, Request
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse
 
     registry = seed_registry()
+    cache: dict = {}
+
+    @app.get("/cupsey", include_in_schema=False, dependencies=[Depends(auth)])
+    async def cupsey_page(request: Request):
+        url = request.app.state.settings.solana_rpc_url
+        out = err = None
+        if cache.get("out") and time.time() - cache["at"] < 60:   # protects your RPC credits and free-tier CPU
+            out = cache["out"]
+        else:
+            try:
+                out = await asyncio.to_thread(run_verification, DEFAULT_ADDRESS, url, 40, 500)
+                cache.update(out=out, at=time.time())
+            except Exception as exc:
+                err = (f"{type(exc).__name__}: {exc}")[:200].replace(url, "<rpc>")
+        return HTMLResponse(render_page(out, err, registry.get(DEFAULT_ADDRESS)))
 
     @app.get("/cupsey/wallets", include_in_schema=False, dependencies=[Depends(auth)])
     async def cupsey_wallets():
