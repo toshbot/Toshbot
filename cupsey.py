@@ -99,7 +99,7 @@ def seed_registry() -> WalletRegistry:
     reg = WalletRegistry()
     reg.add(WalletRecord(
         address="2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", label="Cupsey (current main wallet, attributed)",
-        status="STRONGLY_SUPPORTED",
+        status="UNVERIFIED",   # third-party claims only; on-chain check (2026-11-06) found no activity signed by this wallet in the window read
         evidence=[
             Evidence("social_claim", "X @dippy_eth", "Pointed to this address as Cupsey's new wallet the day after his drain (Sep 17 2025)",
                      "https://x.com/dippy_eth/status/1968435704096010348", "2026-11-06"),
@@ -110,7 +110,14 @@ def seed_registry() -> WalletRegistry:
             Evidence("third_party_label", "Solscan label", "Labelled 'cupseyyyyy' on Pump.fun; undated balance ~1,105 SOL",
                      "https://solscan.io/account/2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "2026-11-06"),
         ],
-        notes="No self-confirmation found. Sources may copy each other. Needs on-chain verification (verify_wallet.py).",
+        notes="No self-confirmation found. Sources may copy each other. Verification run 2026-11-06: 500 recent transactions, none signed by this wallet (only referenced in others' swaps). Stays UNVERIFIED.",
+    ))
+    reg.add(WalletRecord(
+        address="suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK", label="Cupsey (aggregator label, now the default watched wallet)",
+        status="UNVERIFIED",
+        evidence=[Evidence("aggregator", "SolanaTracker KOL leaderboard", "Lists this address under the name Cupsey with his X handle; ~$34M realized PnL, last trade Apr 2026 in the docs sample",
+                           "https://docs.solanatracker.io/data-api/pnl-v2/leaderboard/get-kol-leaderboard", "2026-11-06")],
+        notes="Third-party label only; no self-confirmation. Chosen because the previous address showed no activity signed by itself. Verify on-chain before trusting.",
     ))
     reg.add(WalletRecord(
         address="DiLBRo3fAvzWcd7sp3ZHHX1sWMnmG7nBi6gAfZrgs7Qg", label="Cupsey (old wallet, drained Sep 2025)",
@@ -249,6 +256,8 @@ def _no_token_outcome(role: dict, native: float, wsol, ownerless: int, has_walle
     if not role["in_account_keys"] and not has_wallet_tokens:
         return "OTHER", "wallet_not_involved", "wallet is in neither the account list nor the token balances (unrelated transaction)"
     if abs(native) < DUST_SOL and not (native > 0 and role["is_signer"] is False):   # tiny incoming SOL from a stranger is dust, not 'nothing'
+        if role["is_signer"] is False:
+            return "OTHER", "referenced_only", "wallet is only listed as an account in someone else's transaction; nothing moved for it"
         return "OTHER", "no_value_movement", "no token balance change (SOL-only or unrelated)"
     if native > 0:
         who = "wallet did not sign: incoming dust/airdrop/third-party transfer" if role["is_signer"] is False else "no token trade"
@@ -609,12 +618,19 @@ class SignificanceTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
+    def test_default_wallet_is_registered_and_unverified(self):
+        rec = seed_registry().get(CUPSEY_ADDRESS)
+        self.assertIsNotNone(rec); self.assertEqual(rec.status, "UNVERIFIED"); self.assertFalse(seed_registry().alert_eligible(CUPSEY_ADDRESS))
+        if not os.getenv("CUPSEY_WALLET"):
+            self.assertEqual(DEFAULT_ADDRESS, CUPSEY_ADDRESS)
+
     def test_seed_standards(self):
         r = seed_registry()
-        self.assertTrue(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"))
-        self.assertFalse(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "CONFIRMED"))
+        self.assertFalse(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"))   # unverified: never alert-eligible
+        self.assertEqual(r.get("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f").status, "UNVERIFIED")
+        self.assertTrue(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "UNVERIFIED"))
         self.assertFalse(r.alert_eligible("DiLBRo3fAvzWcd7sp3ZHHX1sWMnmG7nBi6gAfZrgs7Qg", "UNVERIFIED"))
-        self.assertEqual(r.monitored(), ["2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"])
+        self.assertEqual(r.monitored(), [])
 
     def test_cannot_confirm_without_proof(self):
         r = seed_registry()
@@ -817,6 +833,10 @@ class DecoderReasonTests(unittest.TestCase):
         idle = decode_transaction(rtx([W, X], 1, pre=[SOL10, 0], post=[SOL10 - 5000, 0], fee=5000), W)
         self.assertEqual((idle.kind, idle.reason), ("OTHER", "no_value_movement"))
 
+    def test_read_only_reference_is_labelled_referenced_only(self):
+        t = rtx([R, S, W], 1, pre=[SOL10, 0, SOL10], post=[SOL10, 0, SOL10], fee=0)
+        self.assertEqual(decode_transaction(t, W).reason, "referenced_only")
+
     def test_wallet_not_involved(self):
         self.assertEqual(decode_transaction(rtx([R, X], 1), W).reason, "wallet_not_involved")
 
@@ -989,6 +1009,18 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(smp["message_header"]["numRequiredSignatures"], 1)
         self.assertEqual([r["delta_lamports"] for r in smp["sol_balances"]], [-5000, 0])   # fee payer changed, wallet row always present
 
+    def test_scan_digs_past_spam_until_wallet_signed_transactions_found(self):
+        spam = [rtx([R, W], 1, pre=[SOL10, SOL10], post=[SOL10, SOL10], fee=0) for _ in range(100)]
+        pages = {None: (spam, "p2"), "p2": (spam, "p3"), "p3": ([_buy_tx() for _ in range(5)], "p4"), "p4": (spam, None)}
+
+        def h(params):
+            data, nxt = pages[params[1].get("paginationToken")]
+            return {"data": data, "paginationToken": nxt}
+        fake = FakeRpc({"getTransactionsForAddress": h})
+        out = run_verification(W, URL, limit=5, client=fake)
+        self.assertEqual(len(fake.calls), 3); self.assertEqual(out["kinds"].get("BUY"), 5)   # stops once 5 signed found; never reads page 4
+        self.assertEqual(out["kinds"]["OTHER"], 200)
+
     def test_attribution_is_reported_unverified(self):
         out = run_verification(W, URL, client=FakeRpc({"getTransactionsForAddress": {"data": []}}))
         a = out["attribution"]
@@ -1004,7 +1036,8 @@ class VerifierTests(unittest.TestCase):
 # ON-CHAIN VERIFIER  ->  browser: /cupsey/verify   |  terminal: python cupsey.py verify <address>
 # ============================================================================
 SEED_ADDRESS = "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"
-DEFAULT_ADDRESS = (os.getenv("CUPSEY_WALLET") or SEED_ADDRESS).strip()   # set CUPSEY_WALLET on Render to watch a different wallet
+CUPSEY_ADDRESS = "suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK"   # default watched wallet (aggregator label, UNVERIFIED)
+DEFAULT_ADDRESS = (os.getenv("CUPSEY_WALLET") or CUPSEY_ADDRESS).strip()   # CUPSEY_WALLET on Render still overrides this if you ever set it
 PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 # The ONLY filter sent to Helius getTransactionsForAddress. (A 'tokenTransfer' filter is not valid and made the provider reject the call.)
 HELIUS_FILTER = {"status": "succeeded", "tokenAccounts": "balanceChanged"}
@@ -1234,6 +1267,13 @@ class DiagnosticSamples:
         return out
 
 
+def _safe_signed(t, address: str) -> bool:
+    try:
+        return wallet_role(t, address)["is_signer"] is True
+    except Exception:
+        return False
+
+
 def _attribution(address: str) -> dict:
     rec = seed_registry().get(address)
     independent = [e for e in (rec.evidence if rec else []) if e.kind in CONFIRM_KINDS and e.independent]
@@ -1310,11 +1350,12 @@ def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 20
         data = None
         label = "successful transactions touching the wallet or changing its token balances"
         try:
-            rows, token, helius_max = [], None, max(100, min(scan, 500))
+            rows, token, helius_max, signed_found = [], None, max(100, min(scan, 3000)), 0
             while len(rows) < helius_max:
                 page, token = _helius_page(_rpc(c, rpc_url, "getTransactionsForAddress", [address, _helius_cfg(token)]))
                 rows += page
-                if not token or not page:
+                signed_found += sum(1 for t in page if _safe_signed(t, address))
+                if not token or not page or signed_found >= limit:   # keep digging past spam until enough of the wallet's OWN transactions are found
                     break
             data = rows
             info["source"] = "helius_filtered: " + label
@@ -1697,7 +1738,7 @@ def register_cupsey_routes(app, auth) -> None:
     tracker: Tracker | None = None
     if os.getenv("CUPSEY_TRACKING", "true").lower() not in ("0", "false", "no", "off"):
         tracker = Tracker(DEFAULT_ADDRESS, app.state.settings.solana_rpc_url, float(os.getenv("CUPSEY_POLL_SECONDS", "20")),
-                          int(os.getenv("CUPSEY_BACKFILL_TX", "1000")))
+                          int(os.getenv("CUPSEY_BACKFILL_TX", "3000")))
         inner = app.router.lifespan_context
 
         @asynccontextmanager
