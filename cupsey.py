@@ -551,15 +551,30 @@ def _rpc(client, url, method, params):
     raise RuntimeError("rate limited by the RPC provider (try again, or use a dedicated RPC URL)")
 
 
-def run_verification(address: str, rpc_url: str, limit: int = 40) -> dict:
-    """Blocking. Decodes the wallet's recent transactions and returns evidence. Never changes any status."""
+def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 500) -> dict:
+    """Blocking. Scans the last `scan` signatures (cheap), then decodes `limit` successful transactions sampled evenly
+    across that window (so a recent burst of spam cannot hide the real trades). Never changes any status."""
     import httpx  # only needed here
     if not _B58.match(address):
         raise ValueError("not a valid Solana address")
     kinds, mints, inflows, samples, times, errors = Counter(), set(), Counter(), [], [], []
+    reasons, other_samples = Counter(), []
     with httpx.Client(timeout=20) as c:
-        sigs = _rpc(c, rpc_url, "getSignaturesForAddress", [address, {"limit": limit, "commitment": "confirmed"}])
-        for s in sigs:
+        sigs, before = [], None
+        while len(sigs) < scan:
+            cfg = {"limit": min(100, scan - len(sigs)), "commitment": "confirmed"}
+            if before:
+                cfg["before"] = before
+            page = _rpc(c, rpc_url, "getSignaturesForAddress", [address, cfg])
+            if not page:
+                break
+            sigs += page
+            before = page[-1]["signature"]
+            if len(page) < cfg["limit"]:
+                break
+        ok = [x for x in sigs if not x.get("err")]
+        picked = ok[::max(1, len(ok) // max(1, limit))][:limit]   # evenly spaced, newest first
+        for s in picked:
             try:
                 # 255 = accept every transaction version (legacy, v0, v1 and any newer one)
                 t = _rpc(c, rpc_url, "getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 255, "commitment": "confirmed"}])
@@ -579,6 +594,9 @@ def run_verification(address: str, rpc_url: str, limit: int = 40) -> dict:
                     errors.append(msg)
                 continue
             kinds[d.kind] += 1
+            reasons[f"{d.kind}: {d.note or 'ok'}"] += 1
+            if d.kind in ("OTHER", "UNKNOWN") and len(other_samples) < 5:
+                other_samples.append({"signature": d.signature, "kind": d.kind, "note": d.note, "quote_sol": round(d.quote_sol, 6)})
             if d.block_time:
                 times.append(d.block_time)
             if d.mint:
@@ -588,9 +606,14 @@ def run_verification(address: str, rpc_url: str, limit: int = 40) -> dict:
             for src, sol in inflow_items:
                 inflows[src] += sol
     iso = lambda x: datetime.fromtimestamp(x, timezone.utc).isoformat()
-    return {"address": address, "checked_at": datetime.now(timezone.utc).isoformat(), "transactions_examined": len(sigs),
-            "kinds": dict(kinds), "errors_sample": errors, "distinct_tokens": len(mints),
-            "oldest": iso(min(times)) if times else None, "newest": iso(max(times)) if times else None,
+    sig_times = [x["blockTime"] for x in sigs if x.get("blockTime")]
+    return {"address": address, "checked_at": datetime.now(timezone.utc).isoformat(),
+            "signature_window": {"scanned": len(sigs), "failed": len(sigs) - len(ok),
+                                 "oldest": iso(min(sig_times)) if sig_times else None, "newest": iso(max(sig_times)) if sig_times else None,
+                                 "span_seconds": (max(sig_times) - min(sig_times)) if sig_times else None},
+            "transactions_decoded": len(picked), "kinds": dict(kinds), "reasons": dict(reasons), "other_samples": other_samples,
+            "errors_sample": errors, "distinct_tokens": len(mints),
+            "decoded_oldest": iso(min(times)) if times else None, "decoded_newest": iso(max(times)) if times else None,
             "rpc_is_public_default": rpc_url == PUBLIC_RPC,
             "largest_sol_inflow_sources": [{"source": k, "sol": round(v, 3)} for k, v in inflows.most_common(5)],
             "sample_trades": samples,
@@ -603,12 +626,13 @@ def verify(argv) -> int:
     ap = argparse.ArgumentParser(prog="cupsey.py verify")
     ap.add_argument("address", nargs="?", default=DEFAULT_ADDRESS)
     ap.add_argument("--limit", type=int, default=40)
+    ap.add_argument("--scan", type=int, default=500)
     a = ap.parse_args(argv)
     url = os.getenv("SOLANA_RPC_URL") or PUBLIC_RPC
-    out = run_verification(a.address, url, a.limit)
+    out = run_verification(a.address, url, a.limit, a.scan)
     path = f"{a.address}_evidence.json"
     json.dump(out, open(path, "w"), indent=2)
-    print(json.dumps({k: out[k] for k in ("transactions_examined", "kinds", "newest")}, indent=2))
+    print(json.dumps({k: out[k] for k in ("signature_window", "kinds", "reasons")}, indent=2))
     print("wrote", path)
     return 0
 
@@ -629,10 +653,10 @@ def register_cupsey_routes(app, auth) -> None:
         return JSONResponse([asdict(r) for r in registry.all()])
 
     @app.get("/cupsey/verify", include_in_schema=False, dependencies=[Depends(auth)])
-    async def cupsey_verify(request: Request, address: str = DEFAULT_ADDRESS, limit: int = Query(40, ge=5, le=100), download: bool = False):
+    async def cupsey_verify(request: Request, address: str = DEFAULT_ADDRESS, limit: int = Query(40, ge=5, le=100), scan: int = Query(500, ge=50, le=1000), download: bool = False):
         url = request.app.state.settings.solana_rpc_url
         try:
-            out = await asyncio.to_thread(run_verification, address, url, limit)
+            out = await asyncio.to_thread(run_verification, address, url, limit, scan)
         except Exception as exc:   # never echo the RPC URL (it may contain your API key)
             status = getattr(getattr(exc, "response", None), "status_code", None)
             msg = f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "") + (f": {exc}" if isinstance(exc, (ValueError, RuntimeError)) else "")
