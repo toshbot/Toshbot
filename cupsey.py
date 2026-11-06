@@ -99,7 +99,7 @@ def seed_registry() -> WalletRegistry:
     reg = WalletRegistry()
     reg.add(WalletRecord(
         address="2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", label="Cupsey (current main wallet, attributed)",
-        status="UNVERIFIED",   # third-party claims only; on-chain check (2026-11-06) found no activity signed by this wallet in the window read
+        status="POSSIBLY_ASSOCIATED",   # several third-party sources agree, but no self-confirmation: never alert-eligible by default
         evidence=[
             Evidence("social_claim", "X @dippy_eth", "Pointed to this address as Cupsey's new wallet the day after his drain (Sep 17 2025)",
                      "https://x.com/dippy_eth/status/1968435704096010348", "2026-11-06"),
@@ -109,15 +109,16 @@ def seed_registry() -> WalletRegistry:
                      "https://kolexplorer.com/kol/cupsey", "2026-11-06"),
             Evidence("third_party_label", "Solscan label", "Labelled 'cupseyyyyy' on Pump.fun; undated balance ~1,105 SOL",
                      "https://solscan.io/account/2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "2026-11-06"),
+            Evidence("aggregator", "Kolscan", "Profile named Cupsey for this address; its 281.53 SOL balance matched our own chain read (same wallet data, not proof of identity)", "", "2026-11-06"),
         ],
-        notes="No self-confirmation found. Sources may copy each other. Verification run 2026-11-06: 500 recent transactions, none signed by this wallet (only referenced in others' swaps). Stays UNVERIFIED.",
+        notes="No self-confirmation found. Sources may copy each other. On-chain read 2026-11-06: the newest ~500 transactions (about 90 minutes) were only references in others' Pump.fun trades; Kolscan shows real trades about once a day or less, so a short window shows none. Not confirmed.",
     ))
     reg.add(WalletRecord(
-        address="suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK", label="Cupsey (aggregator label, now the default watched wallet)",
+        address="suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK", label="Cupsey? (SolanaTracker label; looks inactive)",
         status="UNVERIFIED",
         evidence=[Evidence("aggregator", "SolanaTracker KOL leaderboard", "Lists this address under the name Cupsey with his X handle; ~$34M realized PnL, last trade Apr 2026 in the docs sample",
                            "https://docs.solanatracker.io/data-api/pnl-v2/leaderboard/get-kol-leaderboard", "2026-11-06")],
-        notes="Third-party label only; no self-confirmation. Chosen because the previous address showed no activity signed by itself. Verify on-chain before trusting.",
+        notes="Third-party label only. On-chain read 2026-11-06: nothing signed by this wallet in ~8 hours; SolanaTracker's own sample shows a last trade in Apr 2026. Not watched.",
     ))
     reg.add(WalletRecord(
         address="DiLBRo3fAvzWcd7sp3ZHHX1sWMnmG7nBi6gAfZrgs7Qg", label="Cupsey (old wallet, drained Sep 2025)",
@@ -618,19 +619,20 @@ class SignificanceTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
-    def test_default_wallet_is_registered_and_unverified(self):
-        rec = seed_registry().get(CUPSEY_ADDRESS)
-        self.assertIsNotNone(rec); self.assertEqual(rec.status, "UNVERIFIED"); self.assertFalse(seed_registry().alert_eligible(CUPSEY_ADDRESS))
+    def test_default_wallet_is_registered_monitored_but_not_alert_eligible(self):
+        rec = seed_registry().get(DEFAULT_ADDRESS)
+        self.assertIsNotNone(rec); self.assertEqual(rec.status, "POSSIBLY_ASSOCIATED"); self.assertFalse(seed_registry().alert_eligible(DEFAULT_ADDRESS))
         if not os.getenv("CUPSEY_WALLET"):
-            self.assertEqual(DEFAULT_ADDRESS, CUPSEY_ADDRESS)
+            self.assertEqual(DEFAULT_ADDRESS, SEED_ADDRESS)
+        self.assertEqual(seed_registry().get(OTHER_LABELLED_ADDRESS).status, "UNVERIFIED")
 
     def test_seed_standards(self):
         r = seed_registry()
-        self.assertFalse(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"))   # unverified: never alert-eligible
-        self.assertEqual(r.get("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f").status, "UNVERIFIED")
-        self.assertTrue(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "UNVERIFIED"))
+        self.assertFalse(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"))   # not confirmed: never alert-eligible by default
+        self.assertTrue(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "POSSIBLY_ASSOCIATED"))
+        self.assertFalse(r.alert_eligible("2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "CONFIRMED"))
         self.assertFalse(r.alert_eligible("DiLBRo3fAvzWcd7sp3ZHHX1sWMnmG7nBi6gAfZrgs7Qg", "UNVERIFIED"))
-        self.assertEqual(r.monitored(), [])
+        self.assertEqual(r.monitored(), ["2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"])
 
     def test_cannot_confirm_without_proof(self):
         r = seed_registry()
@@ -1036,8 +1038,8 @@ class VerifierTests(unittest.TestCase):
 # ON-CHAIN VERIFIER  ->  browser: /cupsey/verify   |  terminal: python cupsey.py verify <address>
 # ============================================================================
 SEED_ADDRESS = "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f"
-CUPSEY_ADDRESS = "suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK"   # default watched wallet (aggregator label, UNVERIFIED)
-DEFAULT_ADDRESS = (os.getenv("CUPSEY_WALLET") or CUPSEY_ADDRESS).strip()   # CUPSEY_WALLET on Render still overrides this if you ever set it
+OTHER_LABELLED_ADDRESS = "suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK"   # also labelled Cupsey by SolanaTracker; looks inactive, not watched
+DEFAULT_ADDRESS = (os.getenv("CUPSEY_WALLET") or SEED_ADDRESS).strip()   # set CUPSEY_WALLET on Render to watch a different wallet
 PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 # The ONLY filter sent to Helius getTransactionsForAddress. (A 'tokenTransfer' filter is not valid and made the provider reject the call.)
 HELIUS_FILTER = {"status": "succeeded", "tokenAccounts": "balanceChanged"}
@@ -1658,8 +1660,8 @@ def render_live(s: dict | None, rec: "WalletRecord") -> str:
             signed, foreign, unk = s.get("signed", 0), s["foreign"], s.get("signer_unknown", 0)
             hint = ""
             if signed == 0 and unk == 0 and foreign > 0.8 * s["checked"]:
-                hint = (" Nothing in this window was initiated by the wallet itself. That fits a receive-only or inactive address, but it does not show who owns it"
-                        " or whether it trades elsewhere: check the address on Solscan before switching CUPSEY_WALLET.")
+                hint = (" Nothing in this window was initiated by the wallet itself. That fits a quiet wallet (busy addresses get flooded with spam that hides older trades, so this view only covers recent hours),"
+                        " but it does not show who owns it or whether it trades elsewhere: check the address on Solscan.")
             codes = " | ".join(f"{n} x {c}" for c, n in s.get("reason_codes", [])[:5])
             body.append('<div class="card"><b>Why nothing yet?</b><div class="sub">Of %d transactions read: %d were signed by this wallet, %d were started by someone else '
                         '(for example incoming dust or airdrops), %d had no signer data. %d had no token trade in them.%s<br>%s<br>%s</div></div>'
