@@ -551,7 +551,7 @@ def _rpc(client, url, method, params):
     raise RuntimeError("rate limited by the RPC provider (try again, or use a dedicated RPC URL)")
 
 
-def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 500) -> dict:
+def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 2000) -> dict:
     """Blocking. Scans the last `scan` signatures (cheap), then decodes `limit` successful transactions sampled evenly
     across that window (so a recent burst of spam cannot hide the real trades). Never changes any status."""
     import httpx  # only needed here
@@ -570,9 +570,21 @@ def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 50
                 break
             sigs += page
             before = page[-1]["signature"]
-            if len(page) < cfg["limit"]:
+            if len(page) < cfg["limit"] or sum(1 for x in sigs if not x.get("err")) >= 3 * limit:
                 break
         ok = [x for x in sigs if not x.get("err")]
+        fails = [x for x in sigs if x.get("err")]
+        failed_samples = []
+        for f in fails[::max(1, len(fails) // 5)][:5]:   # who is sending the failed transactions, and why do they fail?
+            try:
+                t = _rpc(c, rpc_url, "getTransaction", [f["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 255, "commitment": "confirmed"}])
+                msg = t["transaction"]["message"]
+                keys = [k["pubkey"] if isinstance(k, dict) else k for k in msg.get("accountKeys", [])]
+                failed_samples.append({"signature": f["signature"], "fee_payer_is_wallet": bool(keys) and keys[0] == address,
+                                       "fee_payer": keys[0] if keys else None, "error": str(f.get("err"))[:80],
+                                       "programs": sorted({i.get("programId", "?") for i in msg.get("instructions", [])})[:4]})
+            except Exception as exc:
+                failed_samples.append({"signature": f["signature"], "error": f"could not read: {type(exc).__name__}"})
         picked = ok[::max(1, len(ok) // max(1, limit))][:limit]   # evenly spaced, newest first
         for s in picked:
             try:
@@ -608,7 +620,9 @@ def run_verification(address: str, rpc_url: str, limit: int = 40, scan: int = 50
     iso = lambda x: datetime.fromtimestamp(x, timezone.utc).isoformat()
     sig_times = [x["blockTime"] for x in sigs if x.get("blockTime")]
     return {"address": address, "checked_at": datetime.now(timezone.utc).isoformat(),
-            "signature_window": {"scanned": len(sigs), "failed": len(sigs) - len(ok),
+            "signature_window": {"scanned": len(sigs), "failed": len(sigs) - len(ok), "succeeded": len(ok),
+                                 "failed_error_types": dict(Counter(str(x.get("err"))[:60] for x in fails).most_common(3)),
+                                 "failed_samples": failed_samples,
                                  "oldest": iso(min(sig_times)) if sig_times else None, "newest": iso(max(sig_times)) if sig_times else None,
                                  "span_seconds": (max(sig_times) - min(sig_times)) if sig_times else None},
             "transactions_decoded": len(picked), "kinds": dict(kinds), "reasons": dict(reasons), "other_samples": other_samples,
@@ -626,7 +640,7 @@ def verify(argv) -> int:
     ap = argparse.ArgumentParser(prog="cupsey.py verify")
     ap.add_argument("address", nargs="?", default=DEFAULT_ADDRESS)
     ap.add_argument("--limit", type=int, default=40)
-    ap.add_argument("--scan", type=int, default=500)
+    ap.add_argument("--scan", type=int, default=2000)
     a = ap.parse_args(argv)
     url = os.getenv("SOLANA_RPC_URL") or PUBLIC_RPC
     out = run_verification(a.address, url, a.limit, a.scan)
@@ -653,7 +667,7 @@ def register_cupsey_routes(app, auth) -> None:
         return JSONResponse([asdict(r) for r in registry.all()])
 
     @app.get("/cupsey/verify", include_in_schema=False, dependencies=[Depends(auth)])
-    async def cupsey_verify(request: Request, address: str = DEFAULT_ADDRESS, limit: int = Query(40, ge=5, le=100), scan: int = Query(500, ge=50, le=1000), download: bool = False):
+    async def cupsey_verify(request: Request, address: str = DEFAULT_ADDRESS, limit: int = Query(40, ge=5, le=100), scan: int = Query(2000, ge=50, le=5000), download: bool = False):
         url = request.app.state.settings.solana_rpc_url
         try:
             out = await asyncio.to_thread(run_verification, address, url, limit, scan)
