@@ -3588,6 +3588,17 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         resp.delete_cookie(SESSION_COOKIE, path="/")
         return resp
 
+    # Cupsey monitoring add-on (cupsey.py). Optional: if the file is missing or fails, the rest of the app is unaffected.
+    try:
+        from cupsey import register_cupsey_routes
+        register_cupsey_routes(app, require_dashboard_auth)
+    except ModuleNotFoundError as exc:
+        if exc.name != "cupsey":
+            raise
+        log.info("cupsey.py not found; Cupsey routes disabled")
+    except Exception as exc:
+        log.error("cupsey routes failed to load", extra={"error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+
     return app
 
 
