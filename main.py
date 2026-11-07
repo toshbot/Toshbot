@@ -14,7 +14,7 @@ Detection and analysis only: no trading, no guarantees. Missing data is never tr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 import logging
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 import sys
 from datetime import datetime, timezone
 import re
@@ -128,6 +128,16 @@ class Settings(BaseSettings):
     signal_min_curve_sol: float = 5.0
     qualify_min_score: float = 65.0
 
+    # Popularity ("buzz"). Only ever RANKS tokens that already passed the security checks; it never relaxes a security rule or a BUY condition.
+    buzz_enabled: bool = True
+    buzz_interval_seconds: float = 45.0     # how often the popularity of the top candidates is refreshed
+    buzz_max_tokens: int = 40               # how many candidates are scored per round (best evidence score first)
+    buzz_rank_weight: float = 0.25          # share of the Top picks ranking that comes from popularity (0 = ignore it)
+    buzz_dexscreener: bool = True           # free DEX Screener market data (trades, boosts, token profile)
+    buzz_telegram_members: bool = True      # Telegram group size via your bot token (public groups and channels only)
+    buzz_pumpfun_comments: bool = False     # UNOFFICIAL pump.fun comments endpoint. Off by default: not verified, may break or be blocked
+    buzz_comments_url: str = "https://frontend-api-v3.pump.fun/replies/{mint}?limit=50&offset=0"
+
     @property
     def persist_status_set(self) -> set[str] | None:
         items = {x.strip().upper() for x in self.persist_statuses.split(",") if x.strip()}
@@ -238,6 +248,13 @@ class TokenRecord(BaseModel):
             detected_at=event.received_at,
             status_updated_at=event.received_at,
         )
+
+
+class HotToken(TokenRecord):
+    """A token as returned by the API, with its popularity attached. Built per request, never stored."""
+
+    buzz: dict[str, Any] | None = None
+    rank: float | None = None
 
 
 # ============================================================================
@@ -2459,6 +2476,8 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 .board .lt.on.wait{background:#6b7686}
 @keyframes pbuy{0%,100%{box-shadow:0 0 0 0 rgba(46,189,133,.7)}50%{box-shadow:0 0 0 12px rgba(46,189,133,0)}}
 @keyframes psell{0%,100%{box-shadow:0 0 0 0 rgba(246,70,93,.7)}50%{box-shadow:0 0 0 12px rgba(246,70,93,0)}}
+.buzz{display:inline-flex;align-items:center;gap:4px;margin-right:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.02em;color:var(--c);background:rgba(128,128,128,.14)}
+.buzz.hot{--c:#ff7a45;background:rgba(255,122,69,.16)}.buzz.warm{--c:#f5a524}.buzz.quiet{--c:var(--gray)}
 .buychip{display:inline-block;margin-right:6px;padding:3px 9px;border-radius:999px;background:#2ebd85;color:#fff;font-weight:800;font-size:11px;letter-spacing:.05em;animation:pbuy 1.2s ease-in-out infinite}
 @media (prefers-reduced-motion:reduce){.board .lt.on,.buychip{animation:none}}
 .action .sell{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
@@ -2731,13 +2750,18 @@ function scoreChip(sc) {
   const c = sc >= 70 ? "#34d399" : sc >= 50 ? "#4c9bff" : "#ffb340";
   return h("span", {class: "score", style: "--c:" + c, title: "Partial evidence score, not a prediction"}, Math.round(sc));
 }
+function buzzChip(t) {
+  const b = t && t.buzz;
+  if (!b || b.score == null || b.level === "quiet") return null;
+  return h("span", {class: "buzz " + b.level, title: "Popularity " + Math.round(b.score) + "/100. Attention, not safety and not a prediction."}, b.level === "hot" ? "Hot " + Math.round(b.score) : "Buzz " + Math.round(b.score));
+}
 function tokRow(t, withReason, extra) {
   return h("a", {class: "tok" + (extra ? " " + extra : ""), href: "#/token/" + t.mint}, avatar(t, 44),
     h("div", {class: "tmain"},
       h("div", {class: "tt"}, h("b", {}, t.symbol || "—"), h("span", {}, t.name || "Unnamed")),
       h("div", {class: "ts"}, short(t.mint, 5) + " · " + ago(t.detected_at)),
       withReason && t.status_reason ? h("div", {class: "why"}, t.status_reason) : null),
-    h("div", {class: "tr"}, h("div", {class: "trr"}, t.status === "QUALIFIED" && t.status_updated_at && (Date.now() - new Date(t.status_updated_at).getTime()) < 180000 ? h("span", {class: "buychip"}, "BUY") : null, scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
+    h("div", {class: "tr"}, h("div", {class: "trr"}, t.status === "QUALIFIED" && t.status_updated_at && (Date.now() - new Date(t.status_updated_at).getTime()) < 180000 ? h("span", {class: "buychip"}, "BUY") : null, buzzChip(t), scoreChip(t.opportunity_score), pill(t.status)), icon("chev", 16)));
 }
 const skeleton = (n) => h("div", {class: "card list"}, Array.from({length: n || 6}, () => h("div", {class: "skrow"})));
 const empty = (iconName, title, text) => h("div", {class: "card empty"}, h("div", {class: "eic"}, icon(iconName, 26)), h("b", {}, title), text || "");
@@ -2802,9 +2826,9 @@ function homeView() {
     sec("Latest launches", "See all", "#/scanner"), latest);
   async function refresh() {
     api("/cupsey").then((d) => cup.replaceChildren(cupseyStrip(d))).catch((e) => { if (!e.noCache && !cup.querySelector(".tok")) cup.replaceChildren(empty("wallet", "Cupsey monitor unavailable", "Open the Cupsey tab for details.")); });   // never blocks the rest of Home
-    const [s, recent, hl, pk] = await Promise.all([api("/stats"), api("/tokens/recent?limit=200"), api("/system/health"), api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=score")]);
+    const [s, recent, hl, pk] = await Promise.all([api("/stats"), api("/tokens/recent?limit=200"), api("/system/health"), api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=hot")]);
     const fresh = pk.filter((t) => Date.now() - new Date(t.detected_at).getTime() < 2 * 3600 * 1000).slice(0, 3);
-    picks.replaceChildren(fresh.length ? h("div", {class: "card list"}, fresh.map((t) => tokRow(t, false, "pick"))) : empty("shield", "No picks in the last 2 hours", "A pick is a token that passed every security check built so far. Best evidence score first. Not a buy signal."));
+    picks.replaceChildren(fresh.length ? h("div", {class: "card list"}, fresh.map((t) => tokRow(t, false, "pick"))) : empty("shield", "No picks in the last 2 hours", "A pick is a token that passed every security check built so far, ranked by evidence score plus popularity. Not a buy signal."));
     const c = s.counts;
     setNum(num, s.total);
     setNum(cPassed._n, c.WATCH + c.QUALIFIED); setNum(cReview._n, c.INSUFFICIENT_DATA + c.HOLD); setNum(cRej._n, c.REJECTED + c.REVOKED);
@@ -2959,6 +2983,18 @@ function actionBase(status, hist) {
   }
 }
 
+function buzzCard(b) {
+  const link = (k, label) => b.links && b.links[k] ? h("a", {class: "btn", href: b.links[k], target: "_blank", rel: "noopener noreferrer"}, label, icon("ext", 14)) : null;
+  return h("section", {class: "card pad", style: "margin-top:14px"},
+    h("div", {style: "display:flex;align-items:center;gap:10px;flex-wrap:wrap"}, h("b", {}, "Popularity"), buzzChip({buzz: b}) || h("span", {class: "buzz quiet"}, "Quiet " + Math.round(b.score)),
+      h("span", {class: "dim", style: "font-size:12.5px"}, "data coverage " + Math.round((b.coverage || 0) * 100) + "%")),
+    h("div", {style: "margin-top:10px"}, (b.components || []).map((c) => h("div", {style: "margin:8px 0"},
+      h("div", {style: "display:flex;justify-content:space-between;font-size:13px"}, h("span", {}, c.name), h("b", {}, Math.round(c.score))),
+      h("div", {class: "dim", style: "font-size:12px"}, c.detail)))),
+    (b.warnings || []).length ? h("ul", {class: "warns"}, b.warnings.map((x) => h("li", {}, x))) : null,
+    h("div", {style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"}, link("x", "X"), link("telegram", "Telegram"), link("website", "Website")),
+    h("p", {class: "dim", style: "font-size:12px;margin:10px 0 0"}, b.note || ""));
+}
 function tokenView(mint) {
   const top = h("div"), bottom = h("div");
   top.append(skeleton(3));
@@ -2967,10 +3003,11 @@ function tokenView(mint) {
   let lastKey = "";
   async function refresh() {
     const t = await api("/tokens/" + encodeURIComponent(mint));
-    let r = null, hist = [];
+    let r = null, hist = [], bz = null;
+    try { bz = (await api("/tokens/" + encodeURIComponent(mint) + "/buzz")).buzz; } catch (e) { /* popularity is optional */ }
     try { r = await api("/tokens/" + encodeURIComponent(mint) + "/security"); hist = await api("/tokens/" + encodeURIComponent(mint) + "/security/history?limit=20"); }
     catch (e) { if (e.status !== 404) throw e; }
-    const key = t.status + "|" + (r ? r.analyzed_at : "none") + "|" + hist.length;
+    const key = t.status + "|" + (r ? r.analyzed_at : "none") + "|" + hist.length + "|" + (bz ? bz.updated_at : "none");
     if (key === lastKey) return;   // nothing new: leave the page (and any opened sections) untouched
     lastKey = key;
     const fact = (k, v, copy) => h("div", {class: "fact"}, h("div", {class: "k"}, k), h("div", {class: "v" + (copy ? " mono" : "")}, v));
@@ -2991,6 +3028,7 @@ function tokenView(mint) {
         a.sell ? h("p", {class: "sell", style: "font-weight:650"}, a.sell) : null,
         h("p", {class: "dim", style: "font-size:12px"}, "BUY lights only when every live condition holds right now and goes off the moment one fails. AVOID lights for rejected or suspicious tokens. It is a signal from public trade data, not a guarantee. Not financial advice.")); })(),
       r && r.opportunity ? evidenceCard(r.opportunity) : null,
+      bz ? buzzCard(bz) : null,
       h("div", {class: "facts"}, fact("Detected", fmt(t.detected_at)), fact("Launch time", t.launch_timestamp ? fmt(t.launch_timestamp) : "Not supplied"), fact("Creator", short(t.creator, 6), true), fact("Bonding curve", short(t.bonding_curve, 6), true)),
       h("div", {class: "btns"},
         h("a", {class: "btn", href: axiomUrl(t), target: "_blank", rel: "noopener noreferrer"}, "Axiom", icon("ext", 15)),
@@ -3131,7 +3169,7 @@ let timer = null, gen = 0;
 function build(name, arg) {
   switch (name) {
     case "scanner": return listView({title: "Scanner", subtitle: "Every new launch, newest first. Search or filter by security status.", url: "/tokens/recent?limit=200", search: true, icon: "radar", emptyTitle: "No tokens detected yet", emptyText: "If the backend is running, open System health to confirm the feed is connected."});
-    case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check, best evidence score first. Only a pulsing BUY chip means live buy conditions are met right now. Never a guarantee.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=score", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes the security checks. BUY needs live momentum, real buyers and sell evidence on top."});
+    case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check, ranked by evidence score plus popularity (Hot / Buzz chips). Popularity never lowers a security rule. Only a pulsing BUY chip means live buy conditions are met right now. Never a guarantee.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=hot", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes the security checks. BUY needs live momentum, real buyers and sell evidence on top."});
     case "review": case "investigating": return listView({title: "In review", subtitle: "Required evidence is missing, or something suspicious is unresolved.", url: "/tokens/recent?limit=200&status=INSUFFICIENT_DATA,HOLD", icon: "eye", emptyTitle: "Nothing in review", emptyText: "Tokens land here while data is being collected, or when something looks suspicious but is not proven."});
     case "rejected": return listView({title: "Rejected", subtitle: "A verified, serious security problem was found. Open a token to see the exact evidence.", url: "/tokens/recent?limit=200&status=REJECTED,REVOKED", icon: "ban", emptyTitle: "No rejected tokens", emptyText: "Rejections appear here with the on-chain evidence behind them."});
     case "cupsey": return cupseyView();
@@ -3144,7 +3182,7 @@ let seenPicks = null, newPicks = 0;
 function updateTitle() { document.title = (newPicks ? "(" + newPicks + ") " : "") + "Tosh Bot"; }
 async function pickWatcher() {
   try {
-    const rows = await api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=score");
+    const rows = await api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=hot");
     if (seenPicks === null) { seenPicks = new Set(rows.map((t) => t.mint)); return; }
     const fresh = rows.filter((t) => !seenPicks.has(t.mint));
     fresh.forEach((t) => seenPicks.add(t.mint));
@@ -3393,6 +3431,16 @@ class TokenImageService:
             for task in pending:
                 task.cancel()
 
+    async def get_metadata(self, uri: str) -> dict | None:
+        """The token's metadata JSON (name, links...) through the same hardened fetcher as pictures. None if it is not JSON."""
+        try:
+            async with self._sem:
+                raw = await asyncio.wait_for(self._first_ok(ipfs_candidates(uri), METADATA_MAX_BYTES), timeout=15)
+            meta = json.loads(raw[:METADATA_MAX_BYTES].decode("utf-8", errors="strict"))
+            return meta if isinstance(meta, dict) else None
+        except Exception:
+            return None
+
     # ---- picture handling -----------------------------------------------------
     @staticmethod
     async def _finalize(data: bytes, kind: str) -> tuple[bytes, str]:
@@ -3469,20 +3517,347 @@ class TokenImageService:
         return await asyncio.shield(task)
 
 
+# ============================================================================
+# POPULARITY ("buzz"): how much real attention a token that already passed security is getting
+# ============================================================================
+BUZZ_WEIGHTS = {"crowd": 40, "community": 25, "market": 20, "chatter": 15}
+_TG_HANDLE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+_X_HANDLE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+
+
+def _clean_url(value: Any) -> str | None:
+    """Only plain https links are kept. The app never opens them (links are shown, and Telegram is asked by handle)."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if v and "://" not in v and "." in v:
+        v = "https://" + v.lstrip("/")
+    if len(v) > 200 or not v.lower().startswith("https://") or any(c in v for c in " \n\r\t<>\"'"):
+        return None
+    return v
+
+
+def telegram_handle(url: str | None) -> str | None:
+    """t.me/<public name> -> name. Invite links (joinchat, +abc) have no public name and return None."""
+    from urllib.parse import urlsplit
+    if not url:
+        return None
+    p = urlsplit(url)
+    if (p.hostname or "").lower() not in ("t.me", "telegram.me", "www.t.me"):
+        return None
+    seg = [x for x in p.path.split("/") if x]
+    return seg[0] if seg and _TG_HANDLE.match(seg[0]) and seg[0].lower() not in ("joinchat", "addstickers") else None
+
+
+def x_link_ok(url: str | None) -> bool:
+    from urllib.parse import urlsplit
+    if not url:
+        return False
+    p = urlsplit(url)
+    if (p.hostname or "").lower() not in ("x.com", "twitter.com", "www.x.com", "www.twitter.com", "mobile.twitter.com"):
+        return False
+    seg = [x for x in p.path.split("/") if x]
+    return bool(seg) and (bool(_X_HANDLE.match(seg[0])) or (seg[0] == "i" and len(seg) >= 3 and seg[1] == "communities"))
+
+
+def extract_links(*sources: dict | None) -> dict:
+    """Pick the X / Telegram / website links out of the token metadata and DEX Screener profile. Missing = None."""
+    out: dict[str, str | None] = {"x": None, "telegram": None, "website": None}
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        cands = {"x": [src.get("twitter"), src.get("x")], "telegram": [src.get("telegram")], "website": [src.get("website")]}
+        for s in src.get("socials") or []:
+            if isinstance(s, dict):
+                kind = str(s.get("type") or "").lower()
+                cands["x" if kind in ("twitter", "x") else "telegram" if kind == "telegram" else "website"].append(s.get("url"))
+        for w in src.get("websites") or []:
+            if isinstance(w, dict):
+                cands["website"].append(w.get("url"))
+        for kind, vals in cands.items():
+            for v in vals:
+                u = _clean_url(v)
+                if not out[kind] and u and (kind != "x" or x_link_ok(u)) and (kind != "telegram" or telegram_handle(u)):
+                    out[kind] = u
+    return out
+
+
+def buzz_crowd(stats: "TradeStats | None") -> dict | None:
+    """Who is trading it right now (from the live trade feed): independent buyers, new buyers, buy pressure, discounted for round-trip or one-wallet volume."""
+    if stats is None or stats.n_trades < 5:
+        return None
+    ub, nb = min(1.0, stats.unique_buyers / 40), min(1.0, stats.new_buyers / 10)
+    pressure = _clamp(((stats.buy_pressure_pct if stats.buy_pressure_pct is not None else 50.0) - 40) / 40 * 100) / 100
+    base = 100 * (0.45 * ub + 0.30 * nb + 0.25 * pressure)
+    auth = _clamp(100 - 1.5 * stats.top_trader_pct - stats.wash_pct) / 100
+    return {"name": "crowd", "weight": BUZZ_WEIGHTS["crowd"], "score": round(base * (0.5 + 0.5 * auth), 1), "organic": auth >= 0.5,
+            "detail": f"{stats.unique_buyers} independent buyers, {stats.new_buyers} new in {stats.window_seconds}s, "
+                      f"buy pressure {stats.buy_pressure_pct if stats.buy_pressure_pct is not None else 0:.0f}%"}
+
+
+def buzz_community(links: dict | None, tg_members: int | None) -> dict | None:
+    """Real social presence: X, Telegram and website links, plus the Telegram group's size. None until the metadata has been read."""
+    if links is None:
+        return None
+    pts = (25 if links.get("x") else 0) + (15 if links.get("telegram") else 0) + (10 if links.get("website") else 0)
+    if tg_members:
+        pts += 50 * max(0.0, min(1.0, (math.log10(max(tg_members, 1)) - 1.7) / 2.0))   # 50 members = 0, ~5,000 = full
+    have = [k for k in ("x", "telegram", "website") if links.get(k)]
+    return {"name": "community", "weight": BUZZ_WEIGHTS["community"], "score": round(min(100.0, pts), 1),
+            "detail": ("links: " + ", ".join(have) if have else "no X, Telegram or website link") + (f", Telegram group {tg_members:,} members" if tg_members else "")}
+
+
+def buzz_market(dex: dict | None) -> dict | None:
+    """DEX Screener view: recent trade count and buy share, and whether the token has a profile. Paid boosts count a little and are flagged."""
+    if not dex:
+        return None
+    b5, s5, b1, s1 = (int(dex.get(k) or 0) for k in ("buys_m5", "sells_m5", "buys_h1", "sells_h1"))
+    ratio = b1 / (b1 + s1) if (b1 + s1) else 0.5
+    pts = 100 * (0.40 * min(1.0, (b1 + s1) / 300) + 0.25 * min(1.0, (b5 + s5) / 60) + 0.20 * _clamp((ratio - 0.4) / 0.4 * 100) / 100)
+    pts += (10 if dex.get("profile") else 0) + min(5, 2 * int(dex.get("boosts") or 0))
+    return {"name": "market", "weight": BUZZ_WEIGHTS["market"], "score": round(min(100.0, pts), 1), "boosted": int(dex.get("boosts") or 0) > 0,
+            "detail": f"{b1 + s1} trades in 1h ({ratio * 100:.0f}% buys), {b5 + s5} in 5m" + (", has a DEX Screener profile" if dex.get("profile") else "")
+                      + (f", {int(dex['boosts'])} paid boost(s)" if dex.get("boosts") else "")}
+
+
+def buzz_chatter(comments: int | None) -> dict | None:
+    if comments is None:
+        return None
+    return {"name": "chatter", "weight": BUZZ_WEIGHTS["chatter"], "score": round(100 * min(1.0, comments / 40), 1), "detail": f"{comments} recent comments on pump.fun"}
+
+
+def combine_buzz(parts: list[dict | None], links: dict | None, now: datetime | None = None) -> dict | None:
+    """Weighted average over the sources that exist. A missing source is never guessed: its weight is dropped and `coverage` says how much of the picture we have."""
+    comps = [p for p in parts if p]
+    if not comps:
+        return None
+    total = sum(c["weight"] for c in comps)
+    score = sum(c["weight"] * c["score"] for c in comps) / total
+    warnings: list[str] = []
+    crowd = next((c for c in comps if c["name"] == "crowd"), None)
+    if crowd and not crowd.get("organic", True):
+        score = min(score, 40.0)
+        warnings.append("Trading looks one-sided or round-trip, so the popularity score is capped. Hype can be manufactured.")
+    if any(c.get("boosted") for c in comps):
+        warnings.append("This token has paid DEX Screener boosts. Paid attention is not organic interest.")
+    coverage = total / sum(BUZZ_WEIGHTS.values())
+    if coverage < 0.4:
+        warnings.append("Limited data so far, treat the popularity score loosely.")
+    score = round(score, 1)
+    return {"score": score, "level": "hot" if score >= 70 else "warm" if score >= 50 else "quiet", "coverage": round(coverage, 2),
+            "components": [{k: v for k, v in c.items() if k not in ("organic", "boosted")} for c in comps], "links": links or {}, "warnings": warnings,
+            "updated_at": (now or utcnow()).isoformat(),
+            "note": "Popularity is attention, not safety and not a prediction. It only ranks tokens that already passed the security checks."}
+
+
+def rank_score(evidence: float | None, buzz: dict | None, weight: float) -> float | None:
+    """Top picks order: the evidence score, nudged by popularity. Popularity needs enough coverage to count and can never create a pick on its own."""
+    if evidence is None:
+        return None
+    if not buzz or buzz.get("coverage", 0) < 0.4 or weight <= 0:
+        return evidence
+    w = max(0.0, min(0.6, weight))
+    return round((1 - w) * evidence + w * buzz["score"], 1)
+
+
+class BuzzEngine:
+    """Background popularity scoring for the Top picks candidates (WATCH / QUALIFIED). Memory only. Every outside call is capped, cached,
+    time-limited and fails quietly: a source being down only lowers `coverage`, it never breaks the dashboard."""
+
+    def __init__(self, repo: "Repository", tracker: "TradeTracker | None", images: "TokenImageService | None", settings: "Settings",
+                 tg_token: str = "", client=None, clock=time.time) -> None:
+        self.repo, self.tracker, self.images, self.cfg, self._clock = repo, tracker, images, settings, clock
+        self.tg_token = tg_token
+        self.client = client
+        self.cache: dict[str, dict] = {}
+        self._links: dict[str, dict | None] = {}
+        self._dex: dict[str, tuple[float, dict | None]] = {}
+        self._tg: dict[str, tuple[float, int | None]] = {}
+        self._cm: dict[str, tuple[float, int | None]] = {}
+        self._sem = asyncio.Semaphore(3)
+        self._dex_blocked_until = 0.0
+        self.rounds = 0
+        self.last_round: float | None = None
+        self.errors: Counter = Counter()
+
+    def get(self, mint: str) -> dict | None:
+        return self.cache.get(mint)
+
+    def _http(self):
+        if self.client is None:
+            self.client = httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=4.0), follow_redirects=False, headers={"User-Agent": "ToshBot/0.3 (+popularity)"})
+        return self.client
+
+    async def aclose(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+
+    @staticmethod
+    def _bound(d: dict, n: int = 3000) -> None:
+        if len(d) > n:
+            for k in list(d)[: n // 3]:
+                d.pop(k, None)
+
+    async def _meta_links(self, token: "TokenRecord") -> dict | None:
+        if token.mint in self._links:
+            return self._links[token.mint]
+        if not token.uri or self.images is None:
+            return None
+        meta = await self.images.get_metadata(token.uri)
+        if meta is None:
+            return None   # not readable (yet): stay "unknown", never "no links"
+        self._bound(self._links)
+        self._links[token.mint] = extract_links(meta)
+        return self._links[token.mint]
+
+    async def _dex_info(self, mint: str) -> dict | None:
+        now = self._clock()
+        hit = self._dex.get(mint)
+        if hit and now - hit[0] < 90:
+            return hit[1]
+        if not self.cfg.buzz_dexscreener or now < self._dex_blocked_until or not BASE58_ADDRESS.match(mint):
+            return hit[1] if hit else None
+        info = None
+        try:
+            r = await self._http().get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+            if r.status_code == 429:
+                self._dex_blocked_until = now + 60
+                self.errors["dex_rate_limited"] += 1
+            elif r.status_code == 200:
+                pairs = [p for p in ((r.json() or {}).get("pairs") or []) if isinstance(p, dict) and p.get("chainId") == "solana"]
+                if pairs:
+                    p = max(pairs, key=lambda x: float(((x.get("liquidity") or {}).get("usd")) or 0))
+                    tx = p.get("txns") or {}
+                    prof = p.get("info") if isinstance(p.get("info"), dict) else {}
+                    info = {"buys_m5": (tx.get("m5") or {}).get("buys", 0), "sells_m5": (tx.get("m5") or {}).get("sells", 0),
+                            "buys_h1": (tx.get("h1") or {}).get("buys", 0), "sells_h1": (tx.get("h1") or {}).get("sells", 0),
+                            "boosts": ((p.get("boosts") or {}).get("active", 0) if isinstance(p.get("boosts"), dict) else 0), "profile": bool(prof),
+                            "links": extract_links(prof)}
+        except Exception as exc:
+            self.errors[f"dex_{type(exc).__name__}"] += 1
+        self._bound(self._dex)
+        self._dex[mint] = (now, info)
+        return info
+
+    async def _tg_members(self, handle: str | None) -> int | None:
+        if not handle or not self.tg_token or not self.cfg.buzz_telegram_members:
+            return None
+        now = self._clock()
+        hit = self._tg.get(handle.lower())
+        if hit and now - hit[0] < 1800:
+            return hit[1]
+        n = None
+        try:
+            r = await self._http().post(f"https://api.telegram.org/bot{self.tg_token}/getChatMemberCount", json={"chat_id": "@" + handle})
+            if r.status_code == 200 and (r.json() or {}).get("ok"):
+                n = int(r.json()["result"])
+        except Exception as exc:   # the URL holds the bot token: only the error type is kept
+            self.errors[f"tg_{type(exc).__name__}"] += 1
+        self._bound(self._tg)
+        self._tg[handle.lower()] = (now, n)
+        return n
+
+    async def _comments(self, mint: str) -> int | None:
+        if not self.cfg.buzz_pumpfun_comments or not BASE58_ADDRESS.match(mint):
+            return None
+        now = self._clock()
+        hit = self._cm.get(mint)
+        if hit and now - hit[0] < 120:
+            return hit[1]
+        n = None
+        try:
+            r = await self._http().get(self.cfg.buzz_comments_url.replace("{mint}", mint))
+            if r.status_code == 200:
+                data = r.json()
+                data = data.get("replies") if isinstance(data, dict) else data
+                n = len(data) if isinstance(data, list) else None
+        except Exception as exc:
+            self.errors[f"comments_{type(exc).__name__}"] += 1
+        self._bound(self._cm)
+        self._cm[mint] = (now, n)
+        return n
+
+    async def score(self, token: "TokenRecord") -> dict | None:
+        stats = self.tracker.snapshot(token.mint) if self.tracker is not None else None
+        async with self._sem:
+            links = await self._meta_links(token)
+            dex = await self._dex_info(token.mint)
+            if links is not None and dex and dex.get("links"):
+                for k, v in dex["links"].items():   # DEX Screener's profile fills gaps in the token's own metadata
+                    links = {**links, k: links.get(k) or v}
+            elif links is None and dex and dex.get("links"):
+                links = dex["links"]
+            members = await self._tg_members(telegram_handle((links or {}).get("telegram")))
+            comments = await self._comments(token.mint)
+        return combine_buzz([buzz_crowd(stats), buzz_community(links, members), buzz_market(dex), buzz_chatter(comments)], links)
+
+    async def refresh_once(self) -> int:
+        rows = await self.repo.list_recent_tokens(200, ["WATCH", "QUALIFIED"])
+        rows = sorted(rows, key=lambda t: (t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at), reverse=True)[: self.cfg.buzz_max_tokens]
+        done = 0
+        for t in rows:
+            try:
+                b = await self.score(t)
+            except Exception as exc:
+                self.errors[f"score_{type(exc).__name__}"] += 1
+                continue
+            if b:
+                self.cache[t.mint] = b
+                done += 1
+        keep = {t.mint for t in rows}
+        for mint in [m for m in self.cache if m not in keep and self._clock() - self._age(self.cache[m]) > 3600]:
+            self.cache.pop(mint, None)
+        self.rounds += 1
+        self.last_round = self._clock()
+        return done
+
+    @staticmethod
+    def _age(b: dict) -> float:
+        try:
+            return datetime.fromisoformat(b["updated_at"]).timestamp()
+        except Exception:
+            return 0.0
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.refresh_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.errors[f"round_{type(exc).__name__}"] += 1
+                log.warning("popularity round failed", extra={"error": type(exc).__name__})
+            await asyncio.sleep(max(15.0, self.cfg.buzz_interval_seconds))
+
+
 def build_api_router(auth) -> APIRouter:
     router = APIRouter(dependencies=[Depends(auth)])
 
-    @router.get("/tokens/recent", response_model=list[TokenRecord])
+    @router.get("/tokens/recent", response_model=list[HotToken])
     async def recent_tokens(request: Request, limit: int = Query(50, ge=1, le=200),
                             status: str | None = Query(None, description="Comma-separated statuses"),
-                            sort: str | None = Query(None, description="'score' = best evidence score first")):
+                            sort: str | None = Query(None, description="'score' = best evidence score first, 'hot' = evidence score plus popularity")):
         statuses = [x.strip().upper() for x in status.split(",") if x.strip()] if status else None
         if statuses and any(x not in VALID_STATUSES for x in statuses):
             raise HTTPException(status_code=422, detail="Unknown status")
         rows = await request.app.state.repo.list_recent_tokens(limit, statuses)
-        if sort == "score":
-            rows = sorted(rows, key=lambda t: (t.opportunity_score if t.opportunity_score is not None else -1.0, t.detected_at), reverse=True)
-        return rows
+        engine = getattr(request.app.state, "buzz", None)
+        weight = request.app.state.settings.buzz_rank_weight
+        out = []
+        for t in rows:
+            b = engine.get(t.mint) if engine is not None and t.status in ("WATCH", "QUALIFIED") else None
+            out.append(HotToken(**t.model_dump(), buzz=b, rank=rank_score(t.opportunity_score, b, weight) if b else t.opportunity_score))
+        if sort in ("score", "hot"):
+            key = (lambda x: x.rank) if sort == "hot" else (lambda x: x.opportunity_score)
+            out.sort(key=lambda x: (key(x) if key(x) is not None else -1.0, x.detected_at), reverse=True)
+        return out
+
+    @router.get("/tokens/{mint}/buzz")
+    async def token_buzz(request: Request, mint: str) -> dict:
+        """Popularity of one token that passed security. `buzz` is null when it has not been scored (yet) or the token is not a candidate."""
+        mint = _valid_mint(mint)
+        engine = getattr(request.app.state, "buzz", None)
+        return {"enabled": engine is not None, "buzz": engine.get(mint) if engine is not None else None}
 
     @router.get("/tokens/{mint}/image")
     async def token_image(request: Request, mint: str):
@@ -3606,6 +3981,9 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 log.warning("could not re-queue pending jobs", extra={"error": str(exc)})
         else:
             log.warning("analysis disabled by configuration")
+        if settings.buzz_enabled and settings.analysis_enabled:
+            app.state.buzz = BuzzEngine(repo, tracker, app.state.images, settings, tg_token=(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip())
+            analysis_tasks.append(asyncio.create_task(app.state.buzz.run(), name="popularity"))
         if settings.listener_enabled:
             listener = PumpPortalListener(
                 settings.pumpportal_ws_url, queue, health, metrics,
@@ -3630,6 +4008,8 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             if rpc is None:
                 await solana.aclose()
             await app.state.images.aclose()
+            if getattr(app.state, "buzz", None) is not None:
+                await app.state.buzz.aclose()
             await repo.aclose()
 
     app = FastAPI(title="Tosh Bot API", version="0.2.0", lifespan=lifespan)
