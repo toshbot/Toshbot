@@ -13,6 +13,7 @@ SOL values are ESTIMATES (may include ATA rent, close refunds, tips). Alert thre
 """
 import argparse
 import asyncio
+import hmac
 import html
 import json
 import os
@@ -724,6 +725,125 @@ class TrackerTests(unittest.TestCase):
         t.ingest([buy(5.0, 10, mint=M2)])
         page = render_live(t.snapshot(), rec)
         self.assertIn("Open positions", page); self.assertIn("5.000", page); self.assertNotIn("SECRET", page)
+
+
+class AlertTests(unittest.TestCase):
+    def make(self, on=True, owner="42"):
+        t = Tracker(W, "https://rpc.invalid/?api-key=SECRET", interval=5)
+        t.hub.token, t.hub.owner = ("123:ABC-SECRET", owner) if on else ("", "")
+        t.backfilled = True
+        return t
+
+    def fresh(self, t):   # make fixtures look like they happened just now
+        t["blockTime"] = int(time.time()) - 5
+        return t
+
+    def test_signed_fresh_buy_is_queued_but_backfill_noise_is_not(self):
+        t = self.make(); t.ingest([self.fresh(buy(2.0, 100))])
+        self.assertEqual(len(t.outbox), 1); self.assertIn("Buy", t.format_alert(t.outbox[0])); self.assertIn("NOT confirmed", t.format_alert(t.outbox[0]))
+        b = self.make(); b.backfilled = False; b.ingest([self.fresh(buy(2.0, 100))])
+        self.assertEqual(b.outbox, [])
+
+    def test_old_unsigned_and_off_do_not_alert(self):
+        t = self.make(); old = buy(2.0, 100); old["blockTime"] = int(time.time()) - 7200; t.ingest([old]); self.assertEqual(t.outbox, [])
+        t = self.make(); t.ingest(dust_in(3)); self.assertEqual(t.outbox, [])
+        t = self.make(on=False); t.ingest([self.fresh(buy(2.0, 100))]); self.assertEqual(t.outbox, [])
+
+    def test_min_size_filter(self):
+        t = self.make(); t.alert_min_sol = 1.0; t.ingest([self.fresh(buy(0.2, 100))]); self.assertEqual(t.outbox, [])
+
+    def test_alerts_reach_every_subscriber_in_order(self):
+        t = self.make(); sent = []
+        t.hub.subs = {"1001": {}, "1002": {}}
+        t.ingest([self.fresh(buy(2.0, 100)), self.fresh(sell(3.0, 100, 100))])
+
+        async def ok(chat, text):
+            sent.append((chat, text)); return "ok"
+        t.hub.send = ok
+        asyncio.run(t.flush_alerts())
+        self.assertEqual(sorted({c for c, _ in sent}), ["1001", "1002", "42"]); self.assertEqual(t.alerts_sent, 2); self.assertEqual(t.outbox, [])
+        self.assertIn("Buy", sent[0][1]); self.assertIn("/stop", [x for c, x in sent if c == "1001"][0]); self.assertNotIn("/stop", [x for c, x in sent if c == "42"][0])
+
+    def test_blocked_user_is_removed_and_total_failure_is_retried(self):
+        t = self.make(); t.hub.subs = {"1001": {}, "1002": {}}
+        t.ingest([self.fresh(buy(2.0, 100))])
+
+        async def mixed(chat, text):
+            return "gone" if chat == "1001" else "ok"
+        t.hub.send = mixed
+        asyncio.run(t.flush_alerts())
+        self.assertNotIn("1001", t.hub.subs); self.assertIn("1002", t.hub.subs); self.assertEqual(t.alerts_sent, 1)
+        t.ingest([self.fresh(buy(1.0, 5, mint=M2))])
+
+        async def down(chat, text):
+            t.hub.error = "Telegram unreachable"; return "error"
+        t.hub.send = down
+        asyncio.run(t.flush_alerts())
+        self.assertEqual(len(t.outbox), 1); self.assertNotIn("ABC-SECRET", json.dumps(t.snapshot()))
+
+
+class HubTests(unittest.TestCase):
+    def make(self, invite="", max_subs=100):
+        h = TelegramHub(); h.token, h.owner, h.invite, h.max_subs = "123:ABC-SECRET", "42", invite, max_subs
+        h.said = []
+
+        async def say(chat, text):
+            h.said.append((chat, text)); return "ok"
+        h.send = say
+        return h
+
+    def msg(self, chat, text, kind="private"):
+        return {"update_id": 1, "message": {"chat": {"id": chat, "type": kind}, "text": text}}
+
+    def go(self, h, chat, text, kind="private"):
+        asyncio.run(h.handle_update(self.msg(chat, text, kind)))
+
+    def test_start_stop_status(self):
+        h = self.make()
+        self.go(h, 777, "/start"); self.assertIn("777", h.subs); self.assertIn("Subscribed", h.said[-1][1])
+        self.go(h, 777, "/start"); self.assertIn("already", h.said[-1][1])
+        self.go(h, 777, "/status"); self.assertIn("Subscribed", h.said[-1][1])
+        self.go(h, 777, "/stop"); self.assertNotIn("777", h.subs)
+        self.go(h, 777, "/status"); self.assertIn("Not subscribed", h.said[-1][1])
+        self.go(h, 777, "hello"); self.assertIn("/start", h.said[-1][1])
+
+    def test_invite_code_and_cap_and_groups(self):
+        h = self.make(invite="s3cret")
+        self.go(h, 1, "/start"); self.assertEqual(h.subs, {}); self.assertIn("invite-only", h.said[-1][1])
+        self.go(h, 1, "/start wrong"); self.assertEqual(h.subs, {})
+        self.go(h, 1, "/start s3cret"); self.assertIn("1", h.subs)
+        self.go(h, 42, "/start"); self.assertNotIn("42", h.subs)   # owner is always on already, never listed twice
+        h2 = self.make(max_subs=1)
+        self.go(h2, 1, "/start"); self.go(h2, 2, "/start"); self.assertEqual(list(h2.subs), ["1"]); self.assertIn("full", h2.said[-1][1])
+        h3 = self.make(); self.go(h3, -100123, "/start", kind="group"); self.assertEqual(h3.subs, {}); self.assertEqual(h3.said, [])
+
+    def test_join_link_and_recipients(self):
+        h = self.make(invite="abc"); h.bot_username = "ToshAlertsBot"; h.subs = {"5": {}}
+        self.assertEqual(h.join_link(), "https://t.me/ToshAlertsBot?start=abc"); self.assertEqual(sorted(h.recipients()), ["42", "5"])
+
+    def test_subscribers_persist_through_store(self):
+        class Doc:
+            def __init__(self, store, i): self.store, self.i = store, i
+            async def set(self, data): self.store[self.i] = data
+            async def delete(self): self.store.pop(self.i, None)
+
+        class Row:
+            def __init__(self, i, d): self.id, self._d = i, d
+            def to_dict(self): return self._d
+
+        class Coll:
+            def __init__(self): self.data = {}
+            def document(self, i): return Doc(self.data, i)
+            async def stream(self):
+                for i, d in list(self.data.items()):
+                    yield Row(i, d)
+        h = self.make(); h._coll = Coll()
+        self.go(h, 9, "/start"); self.assertIn("9", h._coll.data)
+        h2 = self.make(); h2._coll = h._coll; asyncio.run(h2.load()); self.assertIn("9", h2.subs); self.assertTrue(h2.persistent)
+        self.go(h2, 9, "/stop"); self.assertEqual(h._coll.data, {})
+
+    def test_secret_never_in_scrubbed_errors(self):
+        h = self.make(); self.assertNotIn("ABC-SECRET", h._scrub("failed https://api.telegram.org/bot123:ABC-SECRET/sendMessage"))
 
 
 # ---- richer fixtures: header / signer flags / lookup tables / arbitrary key order -----------------
@@ -1480,6 +1600,184 @@ def verify(argv) -> int:
     return 0
 
 
+
+# ============================================================================
+# TELEGRAM HUB (one shared bot; anyone can subscribe by messaging it; alerts go to every subscriber)
+# ============================================================================
+class TelegramHub:
+    """Subscribers join with /start (optionally with an invite code) and leave with /stop. Only chat ids are stored.
+    Uses long polling (getUpdates), so run ONE copy of the app. The bot token never appears in logs, errors or pages."""
+
+    def __init__(self) -> None:
+        self.token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+        self.owner = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()          # optional: always receives alerts
+        self.invite = (os.getenv("CUPSEY_INVITE_CODE") or "").strip()       # optional: if set, /start needs it
+        self.max_subs = int(_f("CUPSEY_MAX_SUBSCRIBERS", 100))
+        self.subs: dict[str, dict] = {}
+        self.client = None
+        self.offset = 0
+        self.error = ""
+        self.persist_error = ""
+        self.bot_username = ""
+        self._coll = None
+        self.persistent = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token)
+
+    def recipients(self) -> list[str]:
+        ids = list(self.subs)
+        if self.owner and self.owner not in self.subs:
+            ids.append(self.owner)
+        return ids
+
+    def join_link(self) -> str:
+        if not self.bot_username:
+            return ""
+        return f"https://t.me/{self.bot_username}" + (f"?start={self.invite}" if self.invite else "")
+
+    def _scrub(self, text) -> str:
+        return redact_text(str(text), f"https://api.telegram.org/bot{self.token}/")[:150].replace(self.token, "<token>") if self.token else str(text)[:150]
+
+    # ---- storage (Firestore when available, else memory only)
+    def attach_store(self, client, prefix: str = "") -> None:
+        self._coll = client.collection(f"{prefix}cupsey_subscribers")
+
+    async def load(self) -> None:
+        if self._coll is None:
+            return
+        try:
+            async for d in self._coll.stream():
+                if d.id.lstrip("-").isdigit():
+                    self.subs[d.id] = d.to_dict() or {}
+            self.persistent = True
+        except Exception as exc:
+            self.persist_error = f"could not load subscribers: {type(exc).__name__}"
+
+    async def _save(self, chat: str, add: bool) -> None:
+        if self._coll is None:
+            return
+        try:
+            ref = self._coll.document(chat)
+            await (ref.set(self.subs[chat]) if add else ref.delete())
+            self.persistent, self.persist_error = True, ""
+        except Exception as exc:
+            self.persist_error = f"could not save subscriber list: {type(exc).__name__}"
+
+    # ---- Telegram API
+    async def _post(self, method: str, payload: dict):
+        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        try:
+            return await self.client.post(url, json=payload)
+        except Exception as exc:
+            raise RpcError("network", f"{type(exc).__name__} talking to Telegram") from None
+
+    async def send(self, chat: str, text: str) -> str:
+        """'ok' | 'gone' (user blocked the bot / chat missing: remove them) | 'error'."""
+        for attempt in range(2):
+            try:
+                r = await self._post("sendMessage", {"chat_id": chat, "text": text, "disable_web_page_preview": True})
+            except Exception as exc:
+                self.error = self._scrub(exc)
+                return "error"
+            if r.status_code == 200:
+                return "ok"
+            if r.status_code == 429 and attempt == 0:
+                await asyncio.sleep(1.5)
+                continue
+            if r.status_code == 403 or r.status_code == 400 and "chat not found" in str(getattr(r, "text", "")).lower():
+                return "gone"
+            self.error = f"Telegram answered HTTP {r.status_code}"
+            return "error"
+        return "error"
+
+    async def broadcast(self, text: str) -> tuple[int, int, int]:
+        """Returns (delivered, removed, failed). Paced to stay under Telegram's rate limit."""
+        ok = gone = failed = 0
+        for chat in self.recipients():
+            res = await self.send(chat, text + ("\n\nSend /stop to unsubscribe." if chat != self.owner else ""))
+            if res == "ok":
+                ok += 1
+            elif res == "gone" and chat != self.owner:
+                gone += 1
+                self.subs.pop(chat, None)
+                await self._save(chat, False)
+            else:
+                failed += 1
+            await asyncio.sleep(0.06)
+        return ok, gone, failed
+
+    # ---- commands from users
+    HELP = ("Tosh Bot Cupsey alerts.\n/start - subscribe to alerts\n/stop - unsubscribe\n/status - am I subscribed?\n\n"
+            "You get a message when the watched wallet makes a buy or sell. The wallet's identity is NOT confirmed (third-party label), "
+            "alerts arrive after the trade, and nothing here is financial advice.")
+
+    async def handle_update(self, u: dict) -> None:
+        m = (u or {}).get("message") or {}
+        chat = m.get("chat") or {}
+        text = (m.get("text") or "").strip()
+        if chat.get("type") != "private" or not text.startswith("/") and not text:
+            return
+        cid = str(chat.get("id", ""))
+        if not cid.lstrip("-").isdigit():
+            return
+        parts = text.split()
+        cmd, arg = (parts[0].split("@")[0].lower() if parts else ""), (parts[1] if len(parts) > 1 else "")
+        if cmd == "/start":
+            if cid in self.subs or cid == self.owner:
+                await self.send(cid, "You are already subscribed. Send /stop to unsubscribe.")
+            elif self.invite and not hmac.compare_digest(arg.encode(), self.invite.encode()):
+                await self.send(cid, "This alert bot is invite-only. Ask the owner for the invite link.")
+            elif len(self.subs) >= self.max_subs:
+                await self.send(cid, "Sorry, the alert list is full right now.")
+            else:
+                self.subs[cid] = {"joined": int(time.time())}
+                await self._save(cid, True)
+                await self.send(cid, "Subscribed. You will get a message when the watched wallet buys or sells. Send /stop any time.\n\n" + self.HELP.split("\n\n", 1)[1])
+        elif cmd == "/stop":
+            if cid in self.subs:
+                self.subs.pop(cid, None)
+                await self._save(cid, False)
+            await self.send(cid, "Unsubscribed. Send /start to join again.")
+        elif cmd == "/status":
+            await self.send(cid, "Subscribed to alerts." if cid in self.subs or cid == self.owner else "Not subscribed. Send /start.")
+        else:
+            await self.send(cid, self.HELP)
+
+    async def poll(self) -> None:
+        """Long-poll for /start, /stop and /status. Never lets one bad update stop the loop."""
+        try:
+            r = await self._post("getMe", {})
+            if r.status_code == 200:
+                self.bot_username = ((r.json() or {}).get("result") or {}).get("username", "")
+        except Exception:
+            pass
+        while True:
+            try:
+                r = await self._post("getUpdates", {"offset": self.offset, "timeout": 20, "allowed_updates": ["message"]})
+                if r.status_code == 409:   # a webhook is set, or another copy of the app is polling
+                    await self._post("deleteWebhook", {})
+                    self.error = "another process is reading this bot (run only one copy of the app)"
+                    await asyncio.sleep(15)
+                    continue
+                if r.status_code != 200:
+                    self.error = f"Telegram answered HTTP {r.status_code}"
+                    await asyncio.sleep(10)
+                    continue
+                for u in (r.json() or {}).get("result") or []:
+                    self.offset = max(self.offset, int(u.get("update_id", 0)) + 1)
+                    try:
+                        await self.handle_update(u)
+                    except Exception as exc:
+                        self.error = self._scrub(f"{type(exc).__name__}: {exc}")
+                self.error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.error = self._scrub(f"{type(exc).__name__}: {exc}")
+                await asyncio.sleep(10)
+
 # ============================================================================
 # LIVE TRACKER (background loop: polls the wallet, decodes new transactions, keeps a trade feed in memory)
 # ============================================================================
@@ -1509,6 +1807,13 @@ class Tracker:
         self.backfilled = False
         self.last_sig: str | None = None
         self.client = None
+        # Telegram alerts (optional): see TelegramHub. Alerts only fire for NEW trades the wallet signed itself.
+        self.hub = TelegramHub()
+        self.alert_min_sol = _f("CUPSEY_ALERT_MIN_SOL", 0.0)
+        self.alert_max_age = _f("CUPSEY_ALERT_MAX_AGE_SECONDS", 600.0)   # never alert about a trade older than this
+        self.outbox: list[dict] = []
+        self.alerts_sent = 0
+        self.alert_error = ""
 
     # ---- network
     async def _rpc(self, method: str, params: list):
@@ -1607,8 +1912,44 @@ class Tracker:
                                        "pnl": ev.realized_pnl_sol, "time": d.block_time, "sig": d.signature, "big": big, "why": why})
                 if d.kind in ("BUY", "SELL"):
                     self.last_trade = max(self.last_trade or 0, d.block_time or 0)
+                    fresh = bool(d.block_time) and time.time() - d.block_time <= self.alert_max_age
+                    if self.alerts_enabled and self.backfilled and fresh and role["is_signer"] is True and ev.sol_value >= self.alert_min_sol:
+                        self.outbox.append(self.events[0])
         del self.events[300:]
+        del self.outbox[:-20]
         return new
+
+    # ---- Telegram alerts
+    @property
+    def alerts_enabled(self) -> bool:
+        return self.hub.enabled
+
+    def format_alert(self, e: dict) -> str:
+        sell = "SELL" in e["cls"]
+        head = ("\U0001F534 " if sell else "\U0001F7E2 ") + e["cls"].title()
+        lines = [f"{head} by watched wallet", f"Token: {e['mint']}", f"Size: ~{e['sol']:.3f} SOL (estimate)"]
+        if e.get("pct") is not None and e["cls"] != "BUY":
+            lines.append(f"Position: {e['pct']:.0f}% of holding")
+        if e.get("pnl") is not None:
+            lines.append(f"Realized PnL: {e['pnl']:+.3f} SOL")
+        if e.get("time"):
+            lines.append(f"Seen on-chain {_ago(e['time'])}; you will be later than this")
+        lines += [f"Tx: https://solscan.io/tx/{e['sig']}", f"Token page: https://solscan.io/token/{e['mint']}",
+                  f"Chart: https://dexscreener.com/solana/{e['mint']}",
+                  "Wallet identity is NOT confirmed (third-party label). Not financial advice."]
+        return "\n".join(lines)
+
+    async def flush_alerts(self) -> None:
+        """Send queued alerts oldest first to every subscriber. If nobody received one (network down), it stays queued for the next cycle."""
+        while self.outbox:
+            ok, gone, failed = await self.hub.broadcast(self.format_alert(self.outbox[0]))
+            if ok == 0 and failed > 0:
+                self.alert_error = self.hub.error or "could not reach Telegram"
+                return
+            self.outbox.pop(0)
+            if ok:
+                self.alerts_sent += 1
+            self.alert_error = f"{failed} deliveries failed" if failed else ""
 
     async def cycle(self) -> None:
         if not self.backfilled:
@@ -1622,19 +1963,37 @@ class Tracker:
         import httpx
         async with httpx.AsyncClient(timeout=25) as c:
             self.client = c
-            while True:
+            self.hub.client = c
+            poller = None
+            if self.hub.enabled:
+                await self.hub.load()
+                poller = asyncio.create_task(self.hub.poll(), name="cupsey-telegram")
+            try:
+                await self._loop()
+            finally:
+                if poller:
+                    poller.cancel()
+                    await asyncio.gather(poller, return_exceptions=True)
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await self.cycle()
+                if not self.last_error.startswith("Helius method"):
+                    self.last_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:   # never let one bad poll stop tracking; never echo the RPC URL (holds the API key)
+                status = getattr(exc, "status", None) or getattr(getattr(exc, "response", None), "status_code", None)
+                self.last_error = redact_text(f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "") + f": {exc}", self.rpc_url)[:200]
+            if self.alerts_enabled:
                 try:
-                    await self.cycle()
-                    if not self.last_error.startswith("Helius method"):
-                        self.last_error = ""
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:   # never let one bad poll stop tracking; never echo the RPC URL (holds the API key)
-                    status = getattr(exc, "status", None) or getattr(getattr(exc, "response", None), "status_code", None)
-                    self.last_error = redact_text(f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "") + f": {exc}", self.rpc_url)[:200]
-                self.polls += 1
-                self.last_poll = time.time()
-                await asyncio.sleep(self.interval)
+                    await self.flush_alerts()
+                except Exception:
+                    pass
+            self.polls += 1
+            self.last_poll = time.time()
+            await asyncio.sleep(self.interval)
 
     def snapshot(self) -> dict:
         held = [asdict(p) for p in self.ledger.open.values() if p.qty > EPS]
@@ -1646,7 +2005,8 @@ class Tracker:
                 "foreign": self.foreign, "signed": self.signed, "signer_unknown": self.signer_unknown,
                 "reason_codes": self.reason_codes.most_common(8), "kinds": dict(self.kinds), "reasons": self.reasons.most_common(5), "newest": self.newest,
                 "oldest": self.oldest, "last_trade": self.last_trade, "events": self.events[:40], "open": opens[:20],
-                "transfer_only": transfer_only, "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
+                "transfer_only": transfer_only, "alerts_on": self.alerts_enabled, "alerts_sent": self.alerts_sent, "alert_error": self.alert_error or self.hub.error or self.hub.persist_error,
+                "subscribers": len(self.hub.recipients()), "join_link": self.hub.join_link(), "subs_persistent": self.hub.persistent, "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
 
 
 def _ago(ts) -> str:
@@ -1666,6 +2026,8 @@ def dashboard_payload(s: dict | None, rec: "WalletRecord", now: float | None = N
     k = s["kinds"]
     return {"running": True, "now": now, "wallet": wallet,
             "live": bool(s["last_ok"]) and now - s["last_ok"] < s["interval"] * 4 + 30,
+            "alerts": {"on": s.get("alerts_on", False), "sent": s.get("alerts_sent", 0), "error": s.get("alert_error", ""), "subscribers": s.get("subscribers", 0),
+                       "link": s.get("join_link", ""), "persistent": s.get("subs_persistent", False)},
             "poll": {"interval": s["interval"], "mode": s["mode"], "last_ok": s["last_ok"], "started": s["started"], "error": s["error"]},
             "stats": {"trades": k.get("BUY", 0) + k.get("SELL", 0), "transfers": k.get("TRANSFER", 0), "checked": s["checked"], "signed": s.get("signed", 0),
                       "foreign": s["foreign"], "signer_unknown": s.get("signer_unknown", 0), "last_trade": s["last_trade"], "newest": s["newest"],
@@ -1727,7 +2089,7 @@ table{{width:100%;border-collapse:collapse;margin-top:8px}}td,th{{text-align:lef
 .buy{{color:var(--ok);font-weight:600}}.sell{{color:var(--bad);font-weight:600}}a{{color:#5b9dff}}.badge{{background:#2b2d31;color:var(--warn);border-radius:999px;padding:3px 10px;font-size:12px;display:inline-block}}
 </style></head><body><h2>Cupsey monitor</h2>
 <div class="card"><div class="badge">{badge}</div><div class="sub">{e(rec.address)}</div>
-<div class="sub">Attribution comes from third parties and is not yet confirmed on-chain by us. Phone alerts are not switched on yet; this page is the live view.</div>
+<div class="sub">Attribution comes from third parties and is not yet confirmed on-chain by us. Telegram alerts: see the dashboard Cupsey tab for status.</div>
 <div class="sub"><a href="https://solscan.io/account/{e(rec.address)}" target="_blank">Open on Solscan</a> &middot; <a href="/cupsey/classic">Refresh</a> &middot; <a href="/cupsey/wallets">Wallets</a> &middot; <a href="/dashboard#/cupsey">Dashboard</a></div></div>
 {"".join(body)}</body></html>"""
 
@@ -1795,6 +2157,15 @@ def register_cupsey_routes(app, auth) -> None:
         @asynccontextmanager
         async def with_tracker(a):
             async with inner(a) as state:
+                try:   # keep subscribers in the same Firestore database as the rest of the app, if there is one
+                    repo = getattr(a.state, "repo", None)
+                    while repo is not None and hasattr(repo, "inner"):
+                        repo = repo.inner
+                    client = getattr(repo, "_client", None)
+                    if client is not None and hasattr(client, "collection"):
+                        tracker.hub.attach_store(client, getattr(a.state.settings, "firestore_collection_prefix", "") or "")
+                except Exception:
+                    pass
                 task = asyncio.create_task(tracker.run(), name="cupsey-tracker")
                 try:
                     yield state
@@ -1814,6 +2185,15 @@ def register_cupsey_routes(app, auth) -> None:
     @app.get("/cupsey/classic", include_in_schema=False, dependencies=[Depends(auth)])
     async def cupsey_classic_page():
         return HTMLResponse(render_live(tracker.snapshot() if tracker else None, registry.get(DEFAULT_ADDRESS)), headers={"Cache-Control": "no-store"})
+
+    @app.get("/cupsey/alerttest", include_in_schema=False, dependencies=[Depends(auth)])
+    async def cupsey_alert_test():
+        hub = tracker.hub if tracker else None
+        if not hub or not hub.enabled or hub.client is None or not hub.owner:
+            return JSONResponse({"ok": False, "error": "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (your own chat), then redeploy."}, status_code=400)
+        res = await hub.send(hub.owner, "Tosh Bot test alert: Telegram is connected.")
+        return JSONResponse({"ok": res == "ok", "subscribers": len(hub.recipients()), "join_link": hub.join_link(), "error": "" if res == "ok" else (hub.error or res)},
+                            status_code=200 if res == "ok" else 502)
 
     @app.get("/cupsey/wallets", include_in_schema=False, dependencies=[Depends(auth)])
     async def cupsey_wallets():
