@@ -846,6 +846,87 @@ class HubTests(unittest.TestCase):
         h = self.make(); self.assertNotIn("ABC-SECRET", h._scrub("failed https://api.telegram.org/bot123:ABC-SECRET/sendMessage"))
 
 
+class LookbackTests(unittest.TestCase):
+    def make(self, pages, cap=3000):
+        t = Tracker(W, "https://rpc.invalid/?api-key=SECRET", interval=5)
+        t.lookback_cap = cap
+        t.lookback["state"] = "waiting"
+        calls = []
+
+        async def fake(method, params):
+            calls.append(params[1].get("paginationToken"))
+            i = len(calls) - 1
+            return {"data": pages[i], "paginationToken": f"p{i + 1}" if i + 1 < len(pages) else None}
+        t._rpc = fake
+        return t, calls
+
+    def test_digs_past_spam_to_find_last_signed_trade(self):
+        old = buy(2.0, 100); old["blockTime"] = 1000
+        t, calls = self.make([dust_in(3), dust_in(3), [old]])
+        asyncio.run(t.lookup_last_trade())
+        self.assertEqual(t.lookback["state"], "done"); self.assertEqual(t.lookback["found"]["kind"], "BUY"); self.assertEqual(t.lookback["found"]["time"], 1000)
+        self.assertEqual(t.lookback["scanned"], 7); self.assertEqual(len(calls), 3)
+        self.assertEqual(t.events, []); self.assertEqual(t.last_trade, None)   # the live ledger is never touched
+
+    def test_none_found_and_cap_respected(self):
+        t, calls = self.make([dust_in(3)] * 5, cap=6)
+        asyncio.run(t.lookup_last_trade())
+        self.assertIsNone(t.lookback["found"]); self.assertEqual(t.lookback["state"], "done"); self.assertLessEqual(len(calls), 3)
+
+    def test_standard_mode_and_off(self):
+        t, _ = self.make([[]]); t.mode = "standard"; asyncio.run(t.lookup_last_trade()); self.assertEqual(t.lookback["state"], "unavailable")
+        t, _ = self.make([[]], cap=0); asyncio.run(t.lookup_last_trade()); self.assertEqual(t.lookback["state"], "off")
+
+    def test_payload_uses_newest_of_live_and_history(self):
+        t, _ = self.make([[]])
+        t.lookback.update(state="done", found={"kind": "SELL", "mint": M1, "sol": 1.0, "time": 5000, "sig": "S"}, scanned=100, oldest=100)
+        p = dashboard_payload(t.snapshot(), t.registry_rec() if hasattr(t, "registry_rec") else seed_registry().get(W))
+        self.assertEqual(p["stats"]["last_trade"], 5000); self.assertEqual(p["stats"]["last_trade_found"]["kind"], "SELL")
+        t.last_trade = 9000
+        p = dashboard_payload(t.snapshot(), seed_registry().get(W)); self.assertEqual(p["stats"]["last_trade"], 9000)
+
+
+class StoreTests(unittest.TestCase):
+    def test_json_file_store_survives_a_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sub", "subs.json")
+            h = TelegramHub(); h.token, h.owner = "1:T", "42"; h.attach_collection(JsonCollection(path), "file")
+            said = []
+
+            async def say(chat, text): said.append(chat); return "ok"
+            h.send = say
+            asyncio.run(h.handle_update({"update_id": 1, "message": {"chat": {"id": 7, "type": "private"}, "text": "/start"}}))
+            self.assertTrue(os.path.exists(path))
+            h2 = TelegramHub(); h2.token = "1:T"; h2.attach_collection(JsonCollection(path), "file"); asyncio.run(h2.load())
+            self.assertIn("7", h2.subs); self.assertTrue(h2.persistent); self.assertEqual(h2.store_kind, "file")
+            h2.send = say
+            asyncio.run(h2.handle_update({"update_id": 2, "message": {"chat": {"id": 7, "type": "private"}, "text": "/stop"}}))
+            h3 = TelegramHub(); h3.attach_collection(JsonCollection(path), "file"); asyncio.run(h3.load()); self.assertEqual(h3.subs, {})
+
+    def test_missing_or_corrupt_file_does_not_crash(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            h = TelegramHub(); h.attach_collection(JsonCollection(os.path.join(d, "none.json")), "file"); asyncio.run(h.load()); self.assertEqual(h.subs, {}); self.assertTrue(h.persistent)
+            bad = os.path.join(d, "bad.json"); open(bad, "w").write("{not json")
+            h = TelegramHub(); h.attach_collection(JsonCollection(bad), "file"); asyncio.run(h.load()); self.assertEqual(h.subs, {}); self.assertIn("could not load", h.persist_error)
+
+    def test_store_picker_prefers_main_firestore_then_own_firestore_then_file(self):
+        import types, tempfile
+        class Fake:
+            def collection(self, n): self.n = n; return object()
+        h = TelegramHub(); a = types.SimpleNamespace(state=types.SimpleNamespace(settings=types.SimpleNamespace(firestore_collection_prefix="x_", google_application_credentials="", firebase_project_id=""),
+                                                                              repo=types.SimpleNamespace(inner=types.SimpleNamespace(_client=Fake()))))
+        _attach_subscriber_store(a, h); self.assertEqual(h.store_kind, "firestore")
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["CUPSEY_SUBSCRIBERS_FILE"] = os.path.join(d, "s.json")
+            try:
+                h = TelegramHub(); a.state.repo = object(); _attach_subscriber_store(a, h); self.assertEqual(h.store_kind, "file")
+            finally:
+                del os.environ["CUPSEY_SUBSCRIBERS_FILE"]
+        h = TelegramHub(); _attach_subscriber_store(a, h); self.assertEqual(h.store_kind, "memory")
+
+
 # ---- richer fixtures: header / signer flags / lookup tables / arbitrary key order -----------------
 def rtx(keys, n_signers=1, pre=None, post=None, pre_tb=(), post_tb=(), fee=5000, err=None, header=True, flags=False, n_sigs=None, loaded=None, ro_unsigned=1):
     """getTransaction-shaped fixture with full control over account keys, signers and balances (lamports)."""
@@ -1604,6 +1685,48 @@ def verify(argv) -> int:
 # ============================================================================
 # TELEGRAM HUB (one shared bot; anyone can subscribe by messaging it; alerts go to every subscriber)
 # ============================================================================
+class _JsonRow:
+    def __init__(self, i, d): self.id, self._d = i, d
+    def to_dict(self): return self._d
+
+
+class _JsonDoc:
+    def __init__(self, coll, i): self.coll, self.i = coll, i
+    async def set(self, data): d = self.coll._read(); d[self.i] = data; self.coll._write(d)
+    async def delete(self): d = self.coll._read(); d.pop(self.i, None); self.coll._write(d)
+
+
+class JsonCollection:
+    """Tiny file-backed stand-in for a Firestore collection (the same three calls the hub uses). Survives restarts only if the file
+    lives on storage that survives them (a Render persistent disk, for example)."""
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def _read(self) -> dict:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            raise RuntimeError("subscriber file is unreadable")
+
+    def _write(self, data: dict) -> None:
+        folder = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(folder, exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, self.path)   # atomic: a crash mid-write never leaves a half-written list
+
+    def document(self, i: str): return _JsonDoc(self, i)
+
+    async def stream(self):
+        for k, v in self._read().items():
+            yield _JsonRow(k, v)
+
+
 class TelegramHub:
     """Subscribers join with /start (optionally with an invite code) and leave with /stop. Only chat ids are stored.
     Uses long polling (getUpdates), so run ONE copy of the app. The bot token never appears in logs, errors or pages."""
@@ -1621,6 +1744,7 @@ class TelegramHub:
         self.bot_username = ""
         self._coll = None
         self.persistent = False
+        self.store_kind = "memory"
 
     @property
     def enabled(self) -> bool:
@@ -1642,7 +1766,10 @@ class TelegramHub:
 
     # ---- storage (Firestore when available, else memory only)
     def attach_store(self, client, prefix: str = "") -> None:
-        self._coll = client.collection(f"{prefix}cupsey_subscribers")
+        self.attach_collection(client.collection(f"{prefix}cupsey_subscribers"), "firestore")
+
+    def attach_collection(self, coll, kind: str) -> None:
+        self._coll, self.store_kind = coll, kind
 
     async def load(self) -> None:
         if self._coll is None:
@@ -1814,6 +1941,9 @@ class Tracker:
         self.outbox: list[dict] = []
         self.alerts_sent = 0
         self.alert_error = ""
+        # "Last real trade": a one-off, capped dig back through history (Helius only) for the wallet's last self-signed buy/sell. Never touches the live ledger.
+        self.lookback_cap = int(_f("CUPSEY_LOOKBACK_TXS", 3000))
+        self.lookback: dict = {"state": "off" if self.lookback_cap <= 0 else "waiting", "found": None, "scanned": 0, "oldest": None, "checked_at": None, "error": ""}
 
     # ---- network
     async def _rpc(self, method: str, params: list):
@@ -1968,12 +2098,14 @@ class Tracker:
             if self.hub.enabled:
                 await self.hub.load()
                 poller = asyncio.create_task(self.hub.poll(), name="cupsey-telegram")
+            lookback = asyncio.create_task(self._lookback_loop(), name="cupsey-lookback")
             try:
                 await self._loop()
             finally:
-                if poller:
-                    poller.cancel()
-                    await asyncio.gather(poller, return_exceptions=True)
+                for task in (poller, lookback):
+                    if task:
+                        task.cancel()
+                await asyncio.gather(*(x for x in (poller, lookback) if x), return_exceptions=True)
 
     async def _loop(self) -> None:
         while True:
@@ -1995,6 +2127,48 @@ class Tracker:
             self.last_poll = time.time()
             await asyncio.sleep(self.interval)
 
+    # ---- last real trade lookup
+    async def lookup_last_trade(self) -> None:
+        if self.lookback_cap <= 0:
+            self.lookback["state"] = "off"
+            return
+        if self.mode != "helius":
+            self.lookback.update(state="unavailable", error="needs a Helius RPC")
+            return
+        self.lookback.update(state="searching", error="")
+        token, scanned, oldest, found = None, 0, None, None
+        while scanned < self.lookback_cap and not found:
+            page, token = _helius_page(await self._rpc("getTransactionsForAddress", [self.address, _helius_cfg(token)]))
+            for t in page:
+                try:
+                    d, role = decode_transaction(t, self.address), wallet_role(t, self.address)
+                except Exception:
+                    continue
+                if d.block_time:
+                    oldest = d.block_time if oldest is None else min(oldest, d.block_time)
+                if d.kind in ("BUY", "SELL") and role["is_signer"] is True and not found:
+                    found = {"kind": d.kind, "mint": d.mint, "sol": round(d.quote_sol, 4), "time": d.block_time, "sig": d.signature}
+            scanned += len(page)
+            if not token or not page:
+                break
+            await asyncio.sleep(0.25)
+        self.lookback.update(state="done", found=found, scanned=scanned, oldest=oldest, checked_at=time.time(), error="")
+
+    async def _lookback_loop(self) -> None:
+        while not self.backfilled:
+            await asyncio.sleep(3)
+        while self.lookback_cap > 0:
+            try:
+                await self.lookup_last_trade()
+                if self.lookback["found"] or self.last_trade:
+                    return   # found one (or the live feed has seen one): nothing more to dig for
+                await asyncio.sleep(3600)   # nothing in the window: look again in an hour
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.lookback.update(state="error", error=redact_text(f"{type(exc).__name__}: {exc}", self.rpc_url)[:150])
+                await asyncio.sleep(600)
+
     def snapshot(self) -> dict:
         held = [asdict(p) for p in self.ledger.open.values() if p.qty > EPS]
         opens = [p for p in held if p["buys"] or p["sells"]]   # real positions only: tokens that merely arrived by transfer (airdrops/spam) are not positions
@@ -2005,8 +2179,8 @@ class Tracker:
                 "foreign": self.foreign, "signed": self.signed, "signer_unknown": self.signer_unknown,
                 "reason_codes": self.reason_codes.most_common(8), "kinds": dict(self.kinds), "reasons": self.reasons.most_common(5), "newest": self.newest,
                 "oldest": self.oldest, "last_trade": self.last_trade, "events": self.events[:40], "open": opens[:20],
-                "transfer_only": transfer_only, "alerts_on": self.alerts_enabled, "alerts_sent": self.alerts_sent, "alert_error": self.alert_error or self.hub.error or self.hub.persist_error,
-                "subscribers": len(self.hub.recipients()), "join_link": self.hub.join_link(), "subs_persistent": self.hub.persistent, "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
+                "transfer_only": transfer_only, "lookback": dict(self.lookback), "alerts_on": self.alerts_enabled, "alerts_sent": self.alerts_sent, "alert_error": self.alert_error or self.hub.error or self.hub.persist_error,
+                "subscribers": len(self.hub.recipients()), "join_link": self.hub.join_link(), "subs_persistent": self.hub.persistent, "subs_store": self.hub.store_kind, "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
 
 
 def _ago(ts) -> str:
@@ -2024,13 +2198,17 @@ def dashboard_payload(s: dict | None, rec: "WalletRecord", now: float | None = N
     if not s:
         return {"running": False, "now": now, "wallet": wallet}
     k = s["kinds"]
+    lb = s.get("lookback") or {"state": "off"}
+    found = lb.get("found") or None
+    last_trade = max(s["last_trade"] or 0, (found or {}).get("time") or 0) or None   # live feed OR the history lookup, whichever is newer
     return {"running": True, "now": now, "wallet": wallet,
             "live": bool(s["last_ok"]) and now - s["last_ok"] < s["interval"] * 4 + 30,
             "alerts": {"on": s.get("alerts_on", False), "sent": s.get("alerts_sent", 0), "error": s.get("alert_error", ""), "subscribers": s.get("subscribers", 0),
-                       "link": s.get("join_link", ""), "persistent": s.get("subs_persistent", False)},
+                       "link": s.get("join_link", ""), "persistent": s.get("subs_persistent", False), "store": s.get("subs_store", "memory")},
             "poll": {"interval": s["interval"], "mode": s["mode"], "last_ok": s["last_ok"], "started": s["started"], "error": s["error"]},
             "stats": {"trades": k.get("BUY", 0) + k.get("SELL", 0), "transfers": k.get("TRANSFER", 0), "checked": s["checked"], "signed": s.get("signed", 0),
-                      "foreign": s["foreign"], "signer_unknown": s.get("signer_unknown", 0), "last_trade": s["last_trade"], "newest": s["newest"],
+                      "foreign": s["foreign"], "signer_unknown": s.get("signer_unknown", 0), "last_trade": last_trade, "last_trade_found": found,
+                      "lookback": {"state": lb.get("state"), "scanned": lb.get("scanned", 0), "oldest": lb.get("oldest"), "error": lb.get("error", "")}, "newest": s["newest"],
                       "transfer_only": s.get("transfer_only", 0), "closed": s["closed"], "closed_pnl": s["closed_pnl"], "reason_codes": s.get("reason_codes", [])},
             "open": s["open"], "events": [x for x in s["events"] if x["cls"] != "TRANSFER"][:30]}
 
@@ -2138,6 +2316,37 @@ table{{width:100%;border-collapse:collapse;margin-top:8px}}td,th{{text-align:lef
 {"".join(body)}</body></html>"""
 
 
+def _attach_subscriber_store(a, hub) -> None:
+    """Where the subscriber list lives, best first: (1) the app's own Firestore, (2) a Firestore of its own when the rest of the app runs on
+    memory but Firebase credentials are set, (3) a JSON file (CUPSEY_SUBSCRIBERS_FILE), (4) memory only."""
+    cfg = getattr(a.state, "settings", None)
+    prefix = getattr(cfg, "firestore_collection_prefix", "") or ""
+    repo = getattr(a.state, "repo", None)
+    while repo is not None and hasattr(repo, "inner"):
+        repo = repo.inner
+    client = getattr(repo, "_client", None)
+    if client is not None and hasattr(client, "collection"):
+        hub.attach_store(client, prefix)
+        return
+    creds = getattr(cfg, "google_application_credentials", "") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    project = getattr(cfg, "firebase_project_id", "") or os.getenv("FIREBASE_PROJECT_ID", "")
+    if creds or os.getenv("FIRESTORE_EMULATOR_HOST"):
+        try:
+            from google.cloud import firestore
+            if os.getenv("FIRESTORE_EMULATOR_HOST"):
+                from google.auth.credentials import AnonymousCredentials
+                client = firestore.AsyncClient(project=project or "tosh-bot-emulator", credentials=AnonymousCredentials())
+            else:
+                client = firestore.AsyncClient.from_service_account_json(creds, project=project or None)
+            hub.attach_store(client, prefix)
+            return
+        except Exception:
+            pass   # bad credentials or the library is missing: try the file, then memory
+    path = (os.getenv("CUPSEY_SUBSCRIBERS_FILE") or "").strip()
+    if path:
+        hub.attach_collection(JsonCollection(path), "file")
+
+
 def register_cupsey_routes(app, auth) -> None:
     """Adds /cupsey (live page), /cupsey/wallets and /cupsey/verify, and starts the background tracker with the app."""
     import asyncio
@@ -2157,15 +2366,10 @@ def register_cupsey_routes(app, auth) -> None:
         @asynccontextmanager
         async def with_tracker(a):
             async with inner(a) as state:
-                try:   # keep subscribers in the same Firestore database as the rest of the app, if there is one
-                    repo = getattr(a.state, "repo", None)
-                    while repo is not None and hasattr(repo, "inner"):
-                        repo = repo.inner
-                    client = getattr(repo, "_client", None)
-                    if client is not None and hasattr(client, "collection"):
-                        tracker.hub.attach_store(client, getattr(a.state.settings, "firestore_collection_prefix", "") or "")
+                try:
+                    _attach_subscriber_store(a, tracker.hub)
                 except Exception:
-                    pass
+                    pass   # never block startup: subscribers just stay in memory
                 task = asyncio.create_task(tracker.run(), name="cupsey-tracker")
                 try:
                     yield state
