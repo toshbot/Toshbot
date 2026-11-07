@@ -2577,7 +2577,8 @@ const ICONS = {
   search:'<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   expand:'<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
   shrink:'<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
-  logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"/><path d="m16 8 4 4-4 4M20 12H9"/>'
+  logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"/><path d="m16 8 4 4-4 4M20 12H9"/>',
+  wallet:'<path d="M4 7.5A2.5 2.5 0 0 1 6.5 5H18v3"/><path d="M4 7.5V17a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2H6.5A2.5 2.5 0 0 1 4 7.5z"/><path d="M16 13.5h.01"/>'
 };
 
 /* ---------- helpers: all text goes through textContent, so token names can never inject HTML ---------- */
@@ -2779,20 +2780,22 @@ function homeView() {
   const num = h("div", {class: "bignum"}, "0"), rate = h("div", {class: "mute"}), donutBox = h("div"), legend = h("div", {class: "legend"});
   const mkChip = (label, route, color, ic) => { const n = h("div", {class: "cn"}, "0"); const a = h("a", {class: "chip", href: "#/" + route, style: "--c:" + color}, h("span", {class: "ci"}, icon(ic, 18)), h("div", {class: "cl"}, label), n); a._n = n; return a; };
   const cPassed = mkChip("Top picks", "passed", "#3b82f6", "shield"), cReview = mkChip("In review", "review", "#f5a524", "eye"), cRej = mkChip("Rejected", "rejected", "#f6465d", "ban");
-  const chart = h("div"), latest = h("div"), sys = h("div"), picks = h("div");
-  latest.append(skeleton(5)); picks.append(skeleton(2));
+  const chart = h("div"), latest = h("div"), sys = h("div"), picks = h("div"), cup = h("div");
+  latest.append(skeleton(5)); picks.append(skeleton(2)); cup.append(skeleton(2));
   const root = h("div", {},
     h("section", {class: "hero"},
       h("div", {class: "hero-row"},
         h("div", {}, h("span", {class: "live"}, h("span", {class: "dot ok"}), "Live scan · Solana"), num, h("div", {style: "font-weight:600"}, "tokens detected"), rate),
         h("div", {class: "donutbox"}, donutBox, legend))),
     h("div", {class: "grid3", style: "margin-top:14px"}, cPassed, cReview, cRej),
+    sec("Cupsey wallet", "Open", "#/cupsey"), cup,
     sec("Top picks right now", "See all", "#/passed"), picks,
     h("div", {class: "grid2", style: "margin-top:2px"},
       h("div", {}, sec("Launches per minute"), h("div", {class: "card pad"}, chart)),
       h("div", {}, sec("System", "Details", "#/system"), h("div", {class: "card pad"}, sys))),
     sec("Latest launches", "See all", "#/scanner"), latest);
   async function refresh() {
+    api("/cupsey").then((d) => cup.replaceChildren(cupseyStrip(d))).catch((e) => { if (!e.noCache && !cup.querySelector(".tok")) cup.replaceChildren(empty("wallet", "Cupsey monitor unavailable", "Open the Cupsey tab for details.")); });   // never blocks the rest of Home
     const [s, recent, hl, pk] = await Promise.all([api("/stats"), api("/tokens/recent?limit=200"), api("/system/health"), api("/tokens/recent?limit=50&status=WATCH,QUALIFIED&sort=score")]);
     const fresh = pk.filter((t) => Date.now() - new Date(t.detected_at).getTime() < 2 * 3600 * 1000).slice(0, 3);
     picks.replaceChildren(fresh.length ? h("div", {class: "card list"}, fresh.map((t) => tokRow(t, false, "pick"))) : empty("shield", "No picks in the last 2 hours", "A pick is a token that passed every security check built so far. Best evidence score first. Not a buy signal."));
@@ -2998,8 +3001,101 @@ function tokenView(mint) {
   return {root, refresh, every: 8000};
 }
 
+/* ---------- Cupsey wallet monitor (read-only; data from /dashboard/api/cupsey) ---------- */
+const CS_STATUS = {UNVERIFIED: ["Unverified", "var(--gray)"], POSSIBLY_ASSOCIATED: ["Possibly associated", "var(--amber)"], STRONGLY_SUPPORTED: ["Strongly supported", "var(--blue)"], CONFIRMED: ["Confirmed", "var(--green)"], RETIRED: ["Retired", "var(--red)"]};
+const CS_REASON = {referenced_only: "only listed inside other people's transactions", sol_received_unsigned: "SOL received from others (dust)", token_in_unsigned: "tokens received without paying (airdrops)", token_out_unsigned: "tokens moved out by someone else", no_value_movement: "nothing moved", sol_received: "SOL received", sol_sent: "SOL sent, no trade", wsol_wrap_unwrap: "SOL wrapped or unwrapped", token_to_token_swap: "token-to-token swaps", unsigned_swap_shape: "swap-like moves the wallet did not sign", ambiguous_sol_movement: "unclear SOL movement", swap_sol_to_token: "buys", swap_token_to_sol: "sells", token_in: "tokens received", token_out: "tokens sent", failed_tx: "failed transactions", wallet_not_involved: "unrelated transactions"};
+function csAgo(ts, now) {
+  if (!ts) return "never";
+  const s = Math.max(0, Math.round(now - ts));
+  if (s < 90) return s + "s ago"; if (s < 5400) return Math.floor(s / 60) + "m ago";
+  if (s < 172800) return Math.floor(s / 3600) + "h ago"; return Math.floor(s / 86400) + "d ago";
+}
+const csSol = (v) => (Number(v) || 0).toFixed(3);
+const csLink = (kind, id) => "https://solscan.io/" + kind + "/" + encodeURIComponent(id || "");
+const csTile = (l, v, hint) => h("div", {class: "tile"}, h("div", {class: "l"}, l), h("div", {class: "v"}, v), hint ? h("div", {class: "h"}, hint) : null);
+function csTradeRow(x, now) {
+  const sell = String(x.cls).indexOf("SELL") >= 0;
+  const label = String(x.cls).toLowerCase().replace(/\b\w/g, (m) => m.toUpperCase());
+  const more = [];
+  if (sell && x.pct != null) more.push(Math.round(x.pct) + "% of position");
+  if (sell && x.pnl != null) more.push((x.pnl >= 0 ? "+" : "") + Number(x.pnl).toFixed(3) + " SOL result");
+  return h("a", {class: "tok", href: csLink("tx", x.sig), target: "_blank", rel: "noopener noreferrer"},
+    h("span", {class: "pill", style: "--c:" + (sell ? "var(--red)" : "var(--green)")}, h("i"), label),
+    h("div", {class: "tmain"},
+      h("div", {class: "tt"}, h("b", {}, short(x.mint, 4)), h("span", {}, csSol(x.sol) + " SOL" + (x.big ? " ★" : ""))),
+      h("div", {class: "ts"}, csAgo(x.time, now) + (more.length ? " · " + more.join(" · ") : ""))),
+    h("div", {class: "tr"}, icon("ext", 15)));
+}
+function csPosRow(p, now) {
+  const n = (c, w) => c + " " + w + (c === 1 ? "" : "s");
+  return h("a", {class: "tok", href: csLink("token", p.mint), target: "_blank", rel: "noopener noreferrer"},
+    h("div", {class: "tmain"},
+      h("div", {class: "tt"}, h("b", {}, short(p.mint, 4)), h("span", {}, "cost " + csSol(p.cost_sol) + " SOL")),
+      h("div", {class: "ts"}, "bought " + csSol(p.bought_sol) + " SOL · " + n(p.buys, "buy") + (p.sells ? " · " + n(p.sells, "sell") : "") + " · opened " + csAgo(p.opened_at, now))),
+    h("div", {class: "tr"}, icon("ext", 15)));
+}
+function cupseyView() {
+  const status = h("div"), tiles = h("div", {class: "grid3"}), posBox = h("div"), tradeBox = h("div"), evBox = h("div"), infoBox = h("div");
+  const tradeSec = h("div", {}, sec("Latest trades"), tradeBox), posSec = h("div", {}, sec("Open positions"), posBox), infoSec = h("div", {}, sec("How the tracker sees it"), infoBox);
+  status.append(skeleton(1)); posBox.append(skeleton(2)); tradeBox.append(skeleton(3));
+  const root = h("div", {},
+    h("h1", {class: "large"}, "Cupsey"),
+    h("p", {class: "sub"}, "A live, read-only view of one wallet. It only reads the blockchain; nothing here buys or sells."),
+    status, h("div", {style: "margin-top:12px"}, tiles),
+    tradeSec, posSec, sec("Wallet evidence"), evBox, infoSec);
+  async function refresh() {
+    const d = await api("/cupsey"), w = d.wallet, now = d.now;
+    const st = CS_STATUS[w.status] || [w.status, "var(--gray)"];
+    const head = h("div", {class: "card pad"},
+      d.running ? h("div", {style: "display:flex;align-items:center;gap:8px;font-weight:700"}, h("span", {class: "dot " + (d.live ? "ok" : "warn")}, ), d.live ? "Live" : "Not reading",
+        h("span", {class: "dim", style: "font-weight:500;font-size:13px"}, "reads every " + Math.round(d.poll.interval) + "s · last good read " + csAgo(d.poll.last_ok, now))) : h("b", {}, "Tracker is not running"),
+      h("div", {style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px"},
+        h("span", {class: "pill", style: "--c:" + st[1]}, h("i"), st[0]),
+        h("code", {style: "font-size:13px"}, short(w.address, 6)),
+        h("button", {class: "ibtn", "aria-label": "Copy wallet address", onclick: () => { copyText(w.address); toast("Address copied", 1600); }}, icon("copy", 16)),
+        h("a", {class: "btn", href: csLink("account", w.address), target: "_blank", rel: "noopener noreferrer"}, "Solscan", icon("ext", 15))),
+      h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, "Who owns this wallet is not confirmed. The name comes from third-party labels. Phone alerts are not switched on."),
+      d.running && d.poll.error ? h("p", {style: "color:var(--red);font-size:13px;margin:10px 0 0"}, "Problem reading the blockchain: " + d.poll.error) : null,
+      !d.running ? h("p", {class: "dim", style: "font-size:13px;margin:10px 0 0"}, "Check that CUPSEY_TRACKING is not set to false, then redeploy.") : null);
+    status.replaceChildren(head);
+    for (const x of [tradeSec, posSec, infoSec]) x.style.display = d.running ? "" : "none";
+    if (!d.running) tiles.replaceChildren();
+    else {
+      const s = d.stats;
+      tiles.replaceChildren(csTile("Buys / sells", String(s.trades), "seen since start"), csTile("Last trade", csAgo(s.last_trade, now), "any activity: " + csAgo(s.newest, now)), csTile("Open", String(d.open.length), s.transfer_only ? "+" + s.transfer_only + " airdropped, hidden" : "positions"));
+      tradeBox.replaceChildren(d.events.length ? h("div", {class: "card list"}, d.events.slice(0, 25).map((x) => csTradeRow(x, now))) : empty("wallet", "No buys or sells seen yet", "The tracker reads this wallet continuously and will show a trade here the moment tokens are swapped for SOL. Nothing is guessed."));
+      posBox.replaceChildren(d.open.length ? h("div", {class: "card list"}, d.open.map((p) => csPosRow(p, now))) : empty("wallet", "No open positions", "A position appears here after a buy and disappears after a full sell. Tokens that only arrive by transfer are not counted."));
+      const codes = (s.reason_codes || []).map(([c, n]) => n + " × " + (CS_REASON[c.split("/")[1]] || c)).join(" · ");
+      infoBox.replaceChildren(h("div", {class: "card pad"}, h("dl", {class: "kv"},
+        h("dt", {}, "Transactions read"), h("dd", {}, Number(s.checked).toLocaleString()),
+        h("dt", {}, "Signed by this wallet"), h("dd", {}, Number(s.signed).toLocaleString()),
+        h("dt", {}, "Started by someone else"), h("dd", {}, Number(s.foreign).toLocaleString()),
+        h("dt", {}, "Transfers without a trade"), h("dd", {}, Number(s.transfers).toLocaleString()),
+        h("dt", {}, "Closed positions"), h("dd", {}, s.closed + (s.closed ? " (" + (s.closed_pnl >= 0 ? "+" : "") + csSol(s.closed_pnl) + " SOL est.)" : "")),
+        h("dt", {}, "Read method"), h("dd", {}, d.poll.mode)),
+        codes ? h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, "Most common: " + codes) : null,
+        h("p", {class: "dim", style: "font-size:12px;margin:12px 0 0"}, "SOL sizes are estimates (they include fees and tips). A busy address is flooded with spam, so older trades can sit beyond what was read. ", h("a", {href: "/cupsey/verify?download=1", style: "color:var(--blue)"}, "Download full verification (JSON)"))));
+    }
+    evBox.replaceChildren(h("div", {class: "card pad"},
+      ...(w.evidence.length ? w.evidence.map((e) => h("div", {class: "prow", style: "align-items:flex-start"}, h("span", {class: "pill", style: "--c:var(--gray)"}, h("i"), String(e.kind).replace(/_/g, " ")),
+        h("div", {style: "flex:1;min-width:0"}, h("div", {style: "font-weight:650"}, e.source), h("div", {class: "dim", style: "font-size:12.5px"}, e.summary + (e.observed ? " (" + e.observed + ")" : ""))))) : [h("span", {class: "dim"}, "No evidence on file.")]),
+      w.notes ? h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, w.notes) : null));
+  }
+  return {root, refresh, every: 5000};
+}
+function cupseyStrip(d) {
+  if (!d.running) return empty("wallet", "Cupsey monitor is off", "Open the Cupsey tab for details.");
+  const now = d.now, last = d.events[0];
+  const top = h("a", {class: "tok", href: "#/cupsey"},
+    h("span", {class: "dot " + (d.live ? "ok" : "warn")}),
+    h("div", {class: "tmain"}, h("div", {class: "tt"}, h("b", {}, d.live ? "Live" : "Not reading"), h("span", {}, d.stats.trades + " trades seen · " + d.open.length + " open")),
+      h("div", {class: "ts"}, "last trade " + csAgo(d.stats.last_trade, now))),
+    h("div", {class: "tr"}, icon("chev", 16)));
+  return h("div", {class: "card list"}, top, last ? csTradeRow(last, now) : null);
+}
+
 /* ---------- router ---------- */
-const NAV = [["", "Home", "home"], ["scanner", "Scanner", "radar"], ["passed", "Picks", "shield"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
+const NAV = [["", "Home", "home"], ["cupsey", "Cupsey", "wallet"], ["scanner", "Scanner", "radar"], ["passed", "Picks", "shield"], ["review", "Review", "eye"], ["rejected", "Rejected", "ban"]];
 function buildNav() {
   const mk = (cls) => (r, l, ic) => h("a", {href: "#/" + r, "data-r": r}, icon(ic, cls === "rail" ? 20 : 22), cls === "rail" ? l : h("span", {}, l));
   document.getElementById("railnav").replaceChildren(...NAV.map(([r, l, ic]) => mk("rail")(r, l, ic)));
@@ -3029,6 +3125,7 @@ function build(name, arg) {
     case "passed": return listView({title: "Top picks", subtitle: "Tokens that passed every security check, best evidence score first. Only a pulsing BUY chip means live buy conditions are met right now. Never a guarantee.", url: "/tokens/recent?limit=200&status=QUALIFIED,WATCH&sort=score", windows: true, icon: "shield", emptyTitle: "No picks yet", emptyText: "A token appears here once it passes the security checks. BUY needs live momentum, real buyers and sell evidence on top."});
     case "review": case "investigating": return listView({title: "In review", subtitle: "Required evidence is missing, or something suspicious is unresolved.", url: "/tokens/recent?limit=200&status=INSUFFICIENT_DATA,HOLD", icon: "eye", emptyTitle: "Nothing in review", emptyText: "Tokens land here while data is being collected, or when something looks suspicious but is not proven."});
     case "rejected": return listView({title: "Rejected", subtitle: "A verified, serious security problem was found. Open a token to see the exact evidence.", url: "/tokens/recent?limit=200&status=REJECTED,REVOKED", icon: "ban", emptyTitle: "No rejected tokens", emptyText: "Rejections appear here with the on-chain evidence behind them."});
+    case "cupsey": return cupseyView();
     case "system": return systemView();
     case "token": return tokenView(arg || "");
     default: return homeView();
@@ -3556,14 +3653,14 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         cfg = request.app.state.settings
         token = request.cookies.get(SESSION_COOKIE, "")
         if not cfg.dashboard_password or (token and session_valid(cfg, token)):
-            return RedirectResponse("/cupsey", status_code=303)
+            return RedirectResponse("/dashboard", status_code=303)
         return HTMLResponse(render_login_page(), headers=LOGIN_HEADERS)
 
     @app.post("/login", include_in_schema=False)
     async def login_submit(request: Request):
         cfg = request.app.state.settings
         if not cfg.dashboard_password:
-            return RedirectResponse("/cupsey", status_code=303)
+            return RedirectResponse("/dashboard", status_code=303)
         ip = _client_ip(request)
         if _login_locked(ip):
             return HTMLResponse(render_login_page("Too many attempts. Wait a few minutes and try again."), status_code=429, headers=LOGIN_HEADERS)
@@ -3577,7 +3674,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             await asyncio.sleep(0.4)   # slows down guessing
             return HTMLResponse(render_login_page("Wrong username or password.", user), status_code=401, headers=LOGIN_HEADERS)
         _LOGIN_FAILS.pop(ip, None)
-        resp = RedirectResponse("/cupsey", status_code=303)
+        resp = RedirectResponse("/dashboard", status_code=303)
         resp.set_cookie(SESSION_COOKIE, make_session(cfg), max_age=SESSION_TTL, httponly=True,
                         secure=cfg.environment == "production", samesite="lax", path="/")
         return resp

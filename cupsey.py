@@ -109,6 +109,7 @@ def seed_registry() -> WalletRegistry:
                      "https://kolexplorer.com/kol/cupsey", "2026-11-06"),
             Evidence("third_party_label", "Solscan label", "Labelled 'cupseyyyyy' on Pump.fun; undated balance ~1,105 SOL",
                      "https://solscan.io/account/2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f", "2026-11-06"),
+            Evidence("third_party_label", "Solscan transaction view", "A swap signed by this address (2026-11-06 22:58 UTC) shows the signer as Pump.fun profile 'cupseyyyyy'; a profile name set by whoever controls the wallet, so it ties activity to the profile, not to a real identity", "", "2026-11-07"),
             Evidence("aggregator", "Kolscan", "Profile named Cupsey for this address; its 281.53 SOL balance matched our own chain read (same wallet data, not proof of identity)", "", "2026-11-06"),
         ],
         notes="No self-confirmation found. Sources may copy each other. On-chain read 2026-11-06: the newest ~500 transactions (about 90 minutes) were only references in others' Pump.fun trades; Kolscan shows real trades about once a day or less, so a short window shows none. Not confirmed.",
@@ -846,6 +847,33 @@ class DecoderReasonTests(unittest.TestCase):
 class TrackerSignerTests(unittest.TestCase):
     def make(self):
         return Tracker(W, "https://rpc.invalid/?api-key=SECRET", interval=5)
+
+    def test_airdropped_tokens_are_not_listed_as_open_positions(self):
+        t = self.make(); airdrop = rtx([S, W], 1, pre=[SOL10, 10**9], post=[SOL10, 10**9], fee=0, post_tb=[tb(M2, 10**6, idx=1)])
+        t.ingest([buy(2.0, 100), airdrop]); t.last_ok = time.time()
+        s = t.snapshot()
+        self.assertEqual([p["mint"] for p in s["open"]], [M1]); self.assertEqual(s["transfer_only"], 1)
+        self.assertIn("arrived or left by transfer", render_live(s, seed_registry().get(SEED_ADDRESS)))
+
+    def test_dashboard_payload_for_main_dashboard(self):
+        t = self.make(); t.ingest([buy(1.0, 10), rtx([S, W], 1, pre=[SOL10, 10**9], post=[SOL10, 10**9], fee=0, post_tb=[tb(M2, 10**6, idx=1)])]); t.last_ok = time.time()
+        rec = seed_registry().get(SEED_ADDRESS)
+        p = dashboard_payload(t.snapshot(), rec)
+        self.assertTrue(p["running"]); self.assertTrue(p["live"]); self.assertEqual(p["wallet"]["address"], SEED_ADDRESS); self.assertEqual(p["wallet"]["status"], rec.status)
+        self.assertEqual(p["stats"]["trades"], 1); self.assertEqual(p["stats"]["transfers"], 1); self.assertEqual(p["stats"]["transfer_only"], 1)
+        self.assertTrue(all(e["cls"] != "TRANSFER" for e in p["events"])); self.assertEqual(len(p["open"]), 1)
+        self.assertTrue(len(p["wallet"]["evidence"]) >= 3)
+        blob = json.dumps(p)
+        self.assertNotIn("SECRET", blob); self.assertNotIn("rpc.invalid", blob)   # never carries the RPC URL
+
+    def test_dashboard_payload_when_tracker_is_off_or_stale(self):
+        rec = seed_registry().get(SEED_ADDRESS)
+        off = dashboard_payload(None, rec, now=100.0)
+        self.assertEqual((off["running"], off["now"]), (False, 100.0)); self.assertNotIn("stats", off)
+        t = self.make(); t.last_ok = 1000.0
+        window = t.interval * 4 + 30   # same rule as the old page: live while the last good read is newer than 4 polls + 30s
+        self.assertFalse(dashboard_payload(t.snapshot(), rec, now=1000.0 + window + 1)["live"])
+        self.assertTrue(dashboard_payload(t.snapshot(), rec, now=1000.0 + window - 1)["live"])
 
     def test_cosigned_transaction_is_not_foreign(self):
         t = self.make(); t.ingest([rtx([R, W], 2, flags=True, pre=[SOL10, SOL10], post=[SOL10, SOL10])])
@@ -1609,14 +1637,16 @@ class Tracker:
                 await asyncio.sleep(self.interval)
 
     def snapshot(self) -> dict:
-        opens = [asdict(p) for p in self.ledger.open.values() if p.qty > EPS]
+        held = [asdict(p) for p in self.ledger.open.values() if p.qty > EPS]
+        opens = [p for p in held if p["buys"] or p["sells"]]   # real positions only: tokens that merely arrived by transfer (airdrops/spam) are not positions
+        transfer_only = len(held) - len(opens)
         opens.sort(key=lambda p: p.get("opened_at") or 0, reverse=True)
         return {"address": self.address, "started": self.started, "last_poll": self.last_poll, "last_ok": self.last_ok, "error": self.last_error,
                 "interval": self.interval, "mode": self.mode, "polls": self.polls, "backfilled": self.backfilled, "checked": self.checked,
                 "foreign": self.foreign, "signed": self.signed, "signer_unknown": self.signer_unknown,
                 "reason_codes": self.reason_codes.most_common(8), "kinds": dict(self.kinds), "reasons": self.reasons.most_common(5), "newest": self.newest,
                 "oldest": self.oldest, "last_trade": self.last_trade, "events": self.events[:40], "open": opens[:20],
-                "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
+                "transfer_only": transfer_only, "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
 
 
 def _ago(ts) -> str:
@@ -1624,6 +1654,23 @@ def _ago(ts) -> str:
         return "never"
     sec = max(0, int(time.time() - ts))
     return f"{sec}s ago" if sec < 90 else f"{sec // 60}m ago" if sec < 5400 else f"{sec // 3600}h ago" if sec < 172800 else f"{sec // 86400}d ago"
+
+
+def dashboard_payload(s: dict | None, rec: "WalletRecord", now: float | None = None) -> dict:
+    """JSON for the Cupsey tab inside the main dashboard (/dashboard/api/cupsey). Memory only: no network calls, no secrets."""
+    now = time.time() if now is None else now
+    wallet = {"address": rec.address, "label": rec.label, "status": rec.status, "notes": rec.notes,
+              "evidence": [{"kind": e.kind, "source": e.source, "summary": e.summary, "observed": e.observed} for e in rec.evidence]}
+    if not s:
+        return {"running": False, "now": now, "wallet": wallet}
+    k = s["kinds"]
+    return {"running": True, "now": now, "wallet": wallet,
+            "live": bool(s["last_ok"]) and now - s["last_ok"] < s["interval"] * 4 + 30,
+            "poll": {"interval": s["interval"], "mode": s["mode"], "last_ok": s["last_ok"], "started": s["started"], "error": s["error"]},
+            "stats": {"trades": k.get("BUY", 0) + k.get("SELL", 0), "transfers": k.get("TRANSFER", 0), "checked": s["checked"], "signed": s.get("signed", 0),
+                      "foreign": s["foreign"], "signer_unknown": s.get("signer_unknown", 0), "last_trade": s["last_trade"], "newest": s["newest"],
+                      "transfer_only": s.get("transfer_only", 0), "closed": s["closed"], "closed_pnl": s["closed_pnl"], "reason_codes": s.get("reason_codes", [])},
+            "open": s["open"], "events": [x for x in s["events"] if x["cls"] != "TRANSFER"][:30]}
 
 
 def render_live(s: dict | None, rec: "WalletRecord") -> str:
@@ -1647,6 +1694,8 @@ def render_live(s: dict | None, rec: "WalletRecord") -> str:
             rows = "".join('<tr><td><a href="https://solscan.io/token/%s" target="_blank">%s</a></td><td>%.2f SOL</td><td>%.2f SOL</td><td>%s</td></tr>'
                            % (e(p["mint"]), short(p["mint"]), p["cost_sol"], p["bought_sol"], e(_ago(p["opened_at"]))) for p in s["open"])
             body.append(f'<div class="card"><b>Open positions ({len(s["open"])})</b><table><tr><th>Token</th><th>Holding cost</th><th>Bought</th><th>Opened</th></tr>{rows}</table></div>')
+        if s.get("transfer_only"):
+            body.append('<div class="card"><div class="sub">%d other tokens in the wallet arrived or left by transfer without a trade (airdrops or transfers). They are not shown as positions.</div></div>' % s["transfer_only"])
         if trades:
             rows = "".join('<tr><td class="%s">%s%s</td><td><a href="https://solscan.io/tx/%s" target="_blank">%s</a></td><td>%.3f</td><td>%s</td></tr>'
                            % ("sell" if "SELL" in x["cls"] else "buy", e(x["cls"].title()), " &#9733;" if x["big"] else "", e(x["sig"]), short(x["mint"]), x["sol"], e(_ago(x["time"])))
@@ -1679,7 +1728,7 @@ table{{width:100%;border-collapse:collapse;margin-top:8px}}td,th{{text-align:lef
 </style></head><body><h2>Cupsey monitor</h2>
 <div class="card"><div class="badge">{badge}</div><div class="sub">{e(rec.address)}</div>
 <div class="sub">Attribution comes from third parties and is not yet confirmed on-chain by us. Phone alerts are not switched on yet; this page is the live view.</div>
-<div class="sub"><a href="https://solscan.io/account/{e(rec.address)}" target="_blank">Open on Solscan</a> &middot; <a href="/cupsey">Refresh</a> &middot; <a href="/cupsey/wallets">Wallets</a> &middot; <a href="/dashboard">Old Tosh scanner</a></div></div>
+<div class="sub"><a href="https://solscan.io/account/{e(rec.address)}" target="_blank">Open on Solscan</a> &middot; <a href="/cupsey/classic">Refresh</a> &middot; <a href="/cupsey/wallets">Wallets</a> &middot; <a href="/dashboard#/cupsey">Dashboard</a></div></div>
 {"".join(body)}</body></html>"""
 
 
@@ -1732,7 +1781,7 @@ def register_cupsey_routes(app, auth) -> None:
     import asyncio
     from contextlib import asynccontextmanager
     from fastapi import Depends, Query, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
     registry = seed_registry()
     if not registry.get(DEFAULT_ADDRESS):   # wallet chosen through CUPSEY_WALLET
@@ -1754,8 +1803,16 @@ def register_cupsey_routes(app, auth) -> None:
                     await asyncio.gather(task, return_exceptions=True)
         app.router.lifespan_context = with_tracker
 
+    @app.get("/dashboard/api/cupsey", include_in_schema=False, dependencies=[Depends(auth)])
+    async def cupsey_dashboard_data():
+        return JSONResponse(dashboard_payload(tracker.snapshot() if tracker else None, registry.get(DEFAULT_ADDRESS)), headers={"Cache-Control": "no-store"})
+
     @app.get("/cupsey", include_in_schema=False, dependencies=[Depends(auth)])
-    async def cupsey_page():
+    async def cupsey_page():   # bookmarks keep working: the monitor now lives inside the main dashboard
+        return RedirectResponse("/dashboard#/cupsey", status_code=303)
+
+    @app.get("/cupsey/classic", include_in_schema=False, dependencies=[Depends(auth)])
+    async def cupsey_classic_page():
         return HTMLResponse(render_live(tracker.snapshot() if tracker else None, registry.get(DEFAULT_ADDRESS)), headers={"Cache-Control": "no-store"})
 
     @app.get("/cupsey/wallets", include_in_schema=False, dependencies=[Depends(auth)])
