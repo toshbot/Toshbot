@@ -2506,6 +2506,21 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 details.raw summary{cursor:pointer;color:var(--dim);font-size:12px;margin-top:8px;list-style:none}
 pre{background:rgba(0,0,0,.28);border:1px solid var(--line);border-radius:16px;padding:12px;overflow:auto;max-height:240px;font-size:11.5px;color:var(--mute);font-family:var(--mono)}
 [data-theme="light"] pre{background:rgba(255,255,255,.6)}
+.fold{margin-top:12px;overflow:hidden}
+.fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:16px 18px;font-weight:700;font-size:15px}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary::after{content:"";flex:none;width:8px;height:8px;border-right:2px solid var(--dim);border-bottom:2px solid var(--dim);transform:rotate(45deg);transition:transform .25s}
+.fold[open]>summary::after{transform:rotate(-135deg)}
+.fold .fbadge{margin-left:auto;font-weight:500;font-size:13px}
+.fold>.fb{padding:0 18px 18px}
+.stat3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.stat3>div{padding:10px 6px;border-radius:16px;background:rgba(128,128,128,.10);text-align:center;min-width:0}
+.stat3 .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:700}
+.stat3 .v{font-size:16px;font-weight:800;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bigbtn{display:flex;justify-content:center;width:100%;padding:15px 18px;font-size:16px;border-radius:18px;margin-top:14px;font-weight:800;color:#fff}
+.cdn{font-size:22px;font-weight:800;font-variant-numeric:tabular-nums}
+.minirow{display:flex;gap:8px;margin-top:10px}.minirow .btn{flex:1;justify-content:center;padding:11px 8px}
+.csmore{display:block;width:100%;margin-top:10px;padding:12px;text-align:center;color:var(--blue);font-weight:650;font-size:14px}
 .kv{position:relative;display:grid;grid-template-columns:1fr auto;gap:8px 14px;font-size:14px}
 .kv dt{color:var(--mute)}.kv dd{margin:0;text-align:right;font-weight:650}
 .tile{padding:16px;border-radius:28px}
@@ -3064,62 +3079,64 @@ function csDur(sec) { sec = Math.max(0, Math.round(sec)); return sec < 60 ? sec 
 function csPlanTable(rows, withPrices) {
   return h("dl", {class: "kv"}, rows.flatMap((r) => [h("dt", {}, r.step), h("dd", {}, r.rule + (withPrices && r.price ? "  (around " + csPrice(r.price) + " SOL per token)" : ""))]));
 }
-function csExitCard(x, now) {
-  const profit = x.kind === "TAKING PROFIT", loss = x.kind === "CUTTING A LOSS";
-  const col = profit ? "var(--green)" : "var(--red)";
-  return h("div", {class: "card pad", style: "border-left:4px solid " + col},
-    h("div", {style: "display:flex;align-items:center;gap:10px;flex-wrap:wrap"}, h("span", {style: "font-weight:800;font-size:19px"}, csCoin(x)), x.name ? h("span", {class: "mute"}, x.name) : null,
-      h("span", {class: "pill", style: "--c:" + col}, h("i"), "EXIT SIGNAL"), h("b", {style: "color:" + col}, x.kind)),
-    h("div", {style: "margin-top:10px;font-weight:800;font-size:16px"}, x.action),
-    h("div", {class: "dim", style: "font-size:13px;margin-top:6px"}, "He sold " + csSol(x.sol) + " SOL " + csAgo(x.time, now)
-      + (x.gain_pct != null ? " at " + (x.gain_pct >= 0 ? "+" : "") + x.gain_pct + "% vs his average cost" : "") + (x.pnl != null ? " (" + (x.pnl >= 0 ? "+" : "") + Number(x.pnl).toFixed(3) + " SOL for him)" : "")
-      + ". Do it fast: his selling pushes the price down."),
-    h("div", {style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"},
-      h("a", {class: "btn", style: "background:" + col + ";color:#fff", href: "https://pump.fun/coin/" + x.mint, target: "_blank", rel: "noopener noreferrer"}, "Sell on Pump.fun", icon("ext", 15)),
-      h("a", {class: "btn", href: "https://dexscreener.com/solana/" + x.mint, target: "_blank", rel: "noopener noreferrer"}, "Chart", icon("ext", 15)),
-      h("button", {class: "btn", onclick: () => { copyText(x.mint); toast("Coin address copied", 1600); }}, "Copy address", icon("copy", 15))));
+const csOpen = {}, csShow = {trades: false};
+const csStat = (k, v, color) => h("div", {}, h("div", {class: "k"}, k), h("div", {class: "v", style: color ? "color:" + color : null}, v));
+function csFold(key, title, badge, body, openDefault) {
+  const open = key in csOpen ? csOpen[key] : !!openDefault;
+  return h("details", {class: "card fold", open: open, ontoggle: (e) => { csOpen[key] = e.target.open; }},
+    h("summary", {}, h("span", {}, title), badge ? h("span", {class: "dim fbadge"}, badge) : null), h("div", {class: "fb"}, body));
 }
-function csNowCard(d, skew) {
-  const nc = d.now_card;
-  if (!nc) {
-    const last = d.stats.last_trade;
-    return h("div", {class: "card pad", style: "border-left:4px solid var(--gray)"},
-      h("div", {style: "font-weight:800;font-size:17px"}, "No entry window open"),
-      h("p", {class: "mute", style: "margin:6px 0 0"}, last ? "His last trade was " + csAgo(last, d.now) + ". Do not chase old trades. Wait for the next Telegram alert." : "Waiting for his next trade. Nothing to do right now."));
-  }
-  const cd = h("b", {style: "font-variant-numeric:tabular-nums"}, "");
-  const closes = nc.entry.closes_at;
-  const tick = () => { const left = closes - (Date.now() + skew) / 1000; cd.textContent = left > 0 ? csDur(left) + " left" : "CLOSED"; cd.style.color = left > 0 ? "var(--green)" : "var(--red)"; return left; };
+const csExt = (cls, href, label, style) => h("a", {class: cls, style: style || null, href, target: "_blank", rel: "noopener noreferrer"}, label, icon("ext", 15));
+function csExitCard(x, now) {
+  const good = x.kind === "TAKING PROFIT", col = good ? "var(--green)" : "var(--red)";
+  return h("div", {class: "card pad", style: "border-left:4px solid " + col},
+    h("div", {style: "display:flex;align-items:center;justify-content:space-between;gap:10px"},
+      h("div", {style: "min-width:0"}, h("div", {style: "font-weight:800;font-size:20px"}, csCoin(x)), x.name ? h("div", {class: "mute", style: "font-size:13px"}, x.name) : null),
+      h("span", {class: "pill", style: "--c:" + col}, h("i"), x.kind)),
+    h("div", {style: "margin-top:12px;font-weight:800;font-size:17px;line-height:1.3"}, x.action),
+    h("div", {class: "stat3"}, csStat("He sold", csSol(x.sol) + " SOL"), csStat("His gain", x.gain_pct != null ? (x.gain_pct >= 0 ? "+" : "") + x.gain_pct + "%" : "n/a", col), csStat("When", csAgo(x.time, now))),
+    csExt("btn bigbtn", "https://pump.fun/coin/" + x.mint, "Sell on Pump.fun", "background:" + col),
+    h("div", {class: "minirow"}, csExt("btn", "https://dexscreener.com/solana/" + x.mint, "Chart"), h("button", {class: "btn", onclick: () => { copyText(x.mint); toast("Coin address copied", 1600); }}, "Copy address", icon("copy", 15))),
+    h("p", {class: "dim", style: "font-size:12px;margin:10px 0 0;text-align:center"}, "Do it fast. His selling pushes the price down."));
+}
+function csEntryCard(d, skew) {
+  const nc = d.now_card, e = nc.entry, closes = e.closes_at;
+  const cd = h("span", {class: "cdn"}, "");
+  const tick = () => { const left = closes - (Date.now() + skew) / 1000; cd.textContent = left > 0 ? csDur(left) : "CLOSED"; cd.style.color = left > 0 ? "var(--green)" : "var(--red)"; return left; };
   tick();
   const card = h("div", {class: "card pad", style: "border-left:4px solid var(--green)"},
-    h("div", {style: "display:flex;align-items:center;gap:10px;flex-wrap:wrap"}, h("span", {style: "font-weight:800;font-size:19px"}, csCoin(nc)), nc.name ? h("span", {class: "mute"}, nc.name) : null,
-      h("span", {class: "pill", style: "--c:var(--green)"}, h("i"), "ENTRY OPEN"), cd),
-    h("div", {class: "dim", style: "font-size:13px;margin-top:6px"}, "He " + (nc.cls === "BUY" ? "bought" : "added") + " " + csSol(nc.sol) + " SOL at " + csClock(nc.time) + ". Enter between " + csClock(nc.time) + " and " + csClock(closes) + " only."
-      + (nc.entry.price_known ? " Price now is " + (nc.entry.move_pct >= 0 ? "+" : "") + nc.entry.move_pct + "% vs his entry." : " Live price unavailable, go by the clock.")),
-    h("div", {style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"},
-      h("a", {class: "btn", style: "background:var(--green);color:#fff", href: "https://pump.fun/coin/" + nc.mint, target: "_blank", rel: "noopener noreferrer"}, "Open on Pump.fun", icon("ext", 15)),
-      h("a", {class: "btn", href: "https://dexscreener.com/solana/" + nc.mint, target: "_blank", rel: "noopener noreferrer"}, "Chart", icon("ext", 15)),
-      h("a", {class: "btn", href: axiomUrl({mint: nc.mint}), target: "_blank", rel: "noopener noreferrer"}, "Axiom", icon("ext", 15)),
-      h("button", {class: "btn", onclick: () => { copyText(nc.mint); toast("Coin address copied", 1600); }}, "Copy address", icon("copy", 15))),
-    h("div", {style: "margin-top:14px;font-weight:700"}, nc.size ? "Your buy size: " + nc.size + " SOL" : "Your buy size: see the table below (set CUPSEY_BANKROLL_SOL for an exact number)"),
-    h("div", {style: "margin-top:8px"}, csPlanTable(nc.plan, true)),
-    h("p", {class: "dim", style: "font-size:12px;margin:10px 0 0"}, "Rules, not predictions. You enter after him, so the price can already have moved. Skip it if the window is closed."));
+    h("div", {style: "display:flex;align-items:center;justify-content:space-between;gap:10px"},
+      h("div", {style: "min-width:0"}, h("div", {style: "font-weight:800;font-size:20px"}, csCoin(nc)), nc.name ? h("div", {class: "mute", style: "font-size:13px"}, nc.name) : null),
+      h("div", {style: "text-align:right"}, h("span", {class: "pill", style: "--c:var(--green)"}, h("i"), "ENTRY OPEN"), h("div", {style: "margin-top:4px"}, cd))),
+    h("div", {class: "stat3"}, csStat("He bought", csSol(nc.sol) + " SOL"), csStat("Price vs his", e.price_known ? (e.move_pct >= 0 ? "+" : "") + e.move_pct + "%" : "n/a"), csStat("Your size", nc.size ? nc.size + " SOL" : "see plan")),
+    csExt("btn bigbtn", "https://pump.fun/coin/" + nc.mint, "Open on Pump.fun", "background:var(--green)"),
+    h("div", {class: "minirow"}, csExt("btn", "https://dexscreener.com/solana/" + nc.mint, "Chart"), csExt("btn", axiomUrl({mint: nc.mint}), "Axiom"),
+      h("button", {class: "btn", onclick: () => { copyText(nc.mint); toast("Coin address copied", 1600); }}, "Copy", icon("copy", 15))),
+    h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, "Enter between " + csClock(nc.time) + " and " + csClock(closes) + " only" + (e.price_known ? "." : ". Live price unavailable, go by the clock.")),
+    csFold("plan", "Plan: stop, take profit, exits", "", csPlanTable(nc.plan, true), false));
   const iv = setInterval(() => { if (!card.isConnected) { clearInterval(iv); return; } if (tick() <= 0) clearInterval(iv); }, 1000);
   return card;
 }
+function csIdleCard(d) {
+  const last = d.stats.last_trade;
+  return h("div", {class: "card pad", style: "display:flex;align-items:center;gap:12px"}, h("span", {class: "dot"}),
+    h("div", {}, h("div", {style: "font-weight:750"}, "No entry window open"),
+      h("div", {class: "dim", style: "font-size:13px;margin-top:2px"}, last ? "His last trade was " + csAgo(last, d.now) + ". Don't chase old trades. Wait for the next alert." : "Waiting for his next trade.")));
+}
 function csRightNow(d, skew) {
   const cards = (d.exit_cards || []).map((x) => csExitCard(x, d.now));
-  if (d.now_card || !cards.length) cards.push(csNowCard(d, skew));
+  if (d.now_card) cards.push(csEntryCard(d, skew));
+  if (!cards.length) cards.push(csIdleCard(d));
   return h("div", {style: "display:grid;gap:12px"}, cards);
 }
 function csPlaybook(pb) {
   const c = pb.cfg;
-  return h("div", {class: "card pad"},
+  return h("div", {},
     csPlanTable(pb.plan, false),
-    h("div", {style: "margin:14px 0 6px;font-weight:700"}, "Exact buy size by bankroll (risk " + c.risk_pct + "% per trade, stop " + c.stop_pct + "%, max " + c.max_position_sol + " SOL)"),
-    h("dl", {class: "kv"}, pb.sizes.flatMap((r) => [h("dt", {}, r.bankroll + " SOL bankroll"), h("dd", {}, "buy " + r.buy + " SOL · most you lose " + r.max_loss + " SOL")])),
-    h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, pb.hold && pb.hold.median_s ? "His typical hold so far: " + csDur(pb.hold.median_s) + " (from " + pb.hold.n + " closed trades)." : "No closed trades of his seen yet, so there is no real hold time to show. The time stop above is a default."),
-    h("p", {class: "dim", style: "font-size:12px;margin:8px 0 0"}, "These are default rules you can change in Render (CUPSEY_ENTRY_WINDOW_SECONDS, CUPSEY_MAX_CHASE_PCT, CUPSEY_STOP_PCT, CUPSEY_TP1_PCT, CUPSEY_TP2_PCT, CUPSEY_TIME_STOP_MINUTES, CUPSEY_BANKROLL_SOL, CUPSEY_RISK_PCT, CUPSEY_MAX_POSITION_SOL). Start with paper or tiny size. Not financial advice."));
+    h("div", {style: "margin:16px 0 8px;font-weight:700"}, "Buy size by bankroll"),
+    h("dl", {class: "kv"}, pb.sizes.flatMap((r) => [h("dt", {}, r.bankroll + " SOL"), h("dd", {}, "buy " + r.buy + " · max loss " + r.max_loss)])),
+    h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, "Risk " + c.risk_pct + "% per trade, stop " + c.stop_pct + "%, max " + c.max_position_sol + " SOL. " + (pb.hold && pb.hold.median_s ? "His typical hold so far: " + csDur(pb.hold.median_s) + " (" + pb.hold.n + " closed trades)." : "No closed trades of his yet, so the 30 minute time stop is a default.")),
+    h("p", {class: "dim", style: "font-size:12px;margin:8px 0 0"}, "Change these in Render: CUPSEY_ENTRY_WINDOW_SECONDS, CUPSEY_MAX_CHASE_PCT, CUPSEY_STOP_PCT, CUPSEY_TP1_PCT, CUPSEY_TP2_PCT, CUPSEY_TIME_STOP_MINUTES, CUPSEY_BANKROLL_SOL, CUPSEY_RISK_PCT, CUPSEY_MAX_POSITION_SOL. Start tiny. Not financial advice."));
 }
 function csTradeRow(x, now) {
   const sell = String(x.cls).indexOf("SELL") >= 0;
@@ -3146,56 +3163,48 @@ function csPosRow(p, now) {
     h("div", {class: "tr"}, icon("ext", 15)));
 }
 function cupseyView() {
-  const status = h("div"), nowBox = h("div", {style: "margin-top:12px"}), tiles = h("div", {class: "grid3"}), posBox = h("div"), tradeBox = h("div"), evBox = h("div"), infoBox = h("div"), pbBox = h("div");
-  const tradeSec = h("div", {}, sec("Latest trades"), tradeBox), posSec = h("div", {}, sec("He is holding (entry closed unless marked open)"), posBox), pbSec = h("div", {}, sec("Your playbook: what to do and when"), pbBox), infoSec = h("div", {}, sec("How the tracker sees it"), infoBox);
-  status.append(skeleton(1)); posBox.append(skeleton(2)); tradeBox.append(skeleton(3));
-  const root = h("div", {},
-    h("h1", {class: "large"}, "Cupsey"),
-    h("p", {class: "sub"}, "A live, read-only view of one wallet. It only reads the blockchain; nothing here buys or sells."),
-    status, nowBox, h("div", {style: "margin-top:12px"}, tiles),
-    tradeSec, posSec, pbSec, sec("Wallet evidence"), evBox, infoSec);
+  const headRow = h("div", {style: "display:flex;align-items:center;justify-content:space-between;gap:12px"}), walletRow = h("div", {style: "margin-top:6px"});
+  const hero = h("div", {style: "margin-top:16px"}), tiles = h("div", {class: "grid3", style: "margin-top:14px"}), tradeBox = h("div"), posBox = h("div"), foldBox = h("div");
+  const tradeSec = h("div", {}, sec("Latest trades"), tradeBox), posSec = h("div", {}, sec("He is holding"), posBox);
+  hero.append(skeleton(1)); tradeBox.append(skeleton(3));
+  const root = h("div", {}, headRow, walletRow, hero, tiles, tradeSec, posSec, foldBox);
   async function refresh() {
     const d = await api("/cupsey"), w = d.wallet, now = d.now;
-    const st = CS_STATUS[w.status] || [w.status, "var(--gray)"];
-    const head = h("div", {class: "card pad"},
-      d.running ? h("div", {style: "display:flex;align-items:center;gap:8px;font-weight:700"}, h("span", {class: "dot " + (d.live ? "ok" : "warn")}, ), d.live ? "Live" : "Not reading",
-        h("span", {class: "dim", style: "font-weight:500;font-size:13px"}, "reads every " + Math.round(d.poll.interval) + "s · last good read " + csAgo(d.poll.last_ok, now))) : h("b", {}, "Tracker is not running"),
-      h("div", {style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px"},
-        h("span", {class: "pill", style: "--c:var(--blue)"}, h("i"), "Tracked wallet"),
-        h("code", {style: "font-size:13px"}, short(w.address, 6)),
-        h("button", {class: "ibtn", "aria-label": "Copy wallet address", onclick: () => { copyText(w.address); toast("Address copied", 1600); }}, icon("copy", 16)),
-        h("a", {class: "btn", href: csLink("account", w.address), target: "_blank", rel: "noopener noreferrer"}, "Solscan", icon("ext", 15))),
-      h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, (d.alerts && d.alerts.on ? "Telegram alerts are on: " + d.alerts.subscribers + " subscriber(s), " + d.alerts.sent + " sent." + (d.alerts.persistent ? " Subscriber list is saved (" + d.alerts.store + ")." : " Subscriber list is NOT saved across restarts.") + (d.alerts.error ? " Problem: " + d.alerts.error : "") : "Telegram alerts are off.")),
-      d.alerts && d.alerts.link ? h("div", {style: "margin-top:12px"}, h("button", {class: "btn", onclick: () => { copyText(d.alerts.link); toast("Alert bot link copied", 1600); }}, "Copy alert bot link")) : null,
-      d.running && d.poll.error ? h("p", {style: "color:var(--red);font-size:13px;margin:10px 0 0"}, "Problem reading the blockchain: " + d.poll.error) : null,
-      !d.running ? h("p", {class: "dim", style: "font-size:13px;margin:10px 0 0"}, "Check that CUPSEY_TRACKING is not set to false, then redeploy.") : null);
-    status.replaceChildren(head);
-    for (const x of [tradeSec, posSec, infoSec, pbSec]) x.style.display = d.running ? "" : "none";
-    if (!d.running) { tiles.replaceChildren(); nowBox.replaceChildren(); }
-    else {
-      const s = d.stats;
-      nowBox.replaceChildren(csRightNow(d, d.now * 1000 - Date.now()));
-      pbBox.replaceChildren(csPlaybook(d.playbook));
-      tiles.replaceChildren(csTile("Buys / sells", String(s.trades), "seen since start"), csTile("Last trade", s.last_trade ? csAgo(s.last_trade, now) : (s.lookback && s.lookback.state === "searching" ? "searching…" : "none found"), s.last_trade ? "any activity: " + csAgo(s.newest, now) : (s.lookback && s.lookback.state === "done" ? "none in last " + s.lookback.scanned + " txs" : "any activity: " + csAgo(s.newest, now))), csTile("Open", String(d.open.length), s.transfer_only ? "+" + s.transfer_only + " airdropped, hidden" : "positions"));
-      const lf = s.last_trade_found;
-      tradeBox.replaceChildren(d.events.length ? h("div", {class: "card list"}, d.events.slice(0, 25).map((x) => csTradeRow(x, now))) : empty("wallet", "No buys or sells seen yet", "The tracker reads this wallet continuously and will show a trade here the moment tokens are swapped for SOL. Nothing is guessed."),
-        !d.events.length && lf ? h("p", {class: "dim", style: "font-size:13px;margin:10px 4px 0"}, "Last real trade found in history: " + lf.kind.toLowerCase() + " ~" + csSol(lf.sol) + " SOL, " + csAgo(lf.time, now) + ". ", h("a", {href: csLink("tx", lf.sig), target: "_blank", rel: "noopener noreferrer"}, "View on Solscan")) : null);
-      posBox.replaceChildren(d.open.length ? h("div", {class: "card list"}, d.open.map((p) => csPosRow(p, now))) : empty("wallet", "No open positions", "A position appears here after a buy and disappears after a full sell. Tokens that only arrive by transfer are not counted."));
-      const codes = (s.reason_codes || []).map(([c, n]) => n + " × " + (CS_REASON[c.split("/")[1]] || c)).join(" · ");
-      infoBox.replaceChildren(h("div", {class: "card pad"}, h("dl", {class: "kv"},
-        h("dt", {}, "Transactions read"), h("dd", {}, Number(s.checked).toLocaleString()),
-        h("dt", {}, "Signed by this wallet"), h("dd", {}, Number(s.signed).toLocaleString()),
-        h("dt", {}, "Started by someone else"), h("dd", {}, Number(s.foreign).toLocaleString()),
-        h("dt", {}, "Transfers without a trade"), h("dd", {}, Number(s.transfers).toLocaleString()),
-        h("dt", {}, "Closed positions"), h("dd", {}, s.closed + (s.closed ? " (" + (s.closed_pnl >= 0 ? "+" : "") + csSol(s.closed_pnl) + " SOL est.)" : "")),
-        h("dt", {}, "Read method"), h("dd", {}, d.poll.mode)),
-        codes ? h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, "Most common: " + codes) : null,
-        h("p", {class: "dim", style: "font-size:12px;margin:12px 0 0"}, "SOL sizes are estimates (they include fees and tips). A busy address is flooded with spam, so older trades can sit beyond what was read. ", h("a", {href: "/cupsey/verify?download=1", style: "color:var(--blue)"}, "Download full verification (JSON)"))));
-    }
-    evBox.replaceChildren(h("div", {class: "card pad"},
-      ...(w.evidence.length ? w.evidence.map((e) => h("div", {class: "prow", style: "align-items:flex-start"}, h("span", {class: "pill", style: "--c:var(--gray)"}, h("i"), String(e.kind).replace(/_/g, " ")),
-        h("div", {style: "flex:1;min-width:0"}, h("div", {style: "font-weight:650"}, e.source), h("div", {class: "dim", style: "font-size:12.5px"}, e.summary + (e.observed ? " (" + e.observed + ")" : ""))))) : [h("span", {class: "dim"}, "No evidence on file.")]),
-      w.notes ? h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, w.notes) : null));
+    headRow.replaceChildren(h("h1", {class: "large", style: "margin:0"}, "Cupsey"),
+      h("span", {class: "pill", style: "--c:" + (d.running && d.live ? "var(--green)" : "var(--amber)")}, h("i"), d.running ? (d.live ? "Live · " + csAgo(d.poll.last_ok, now).replace(" ago", "") : "Not reading") : "Off"));
+    walletRow.replaceChildren(h("div", {style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;color:var(--mute)"}, "Tracked wallet", h("code", {}, short(w.address, 6)),
+      h("button", {class: "ibtn", "aria-label": "Copy wallet address", onclick: () => { copyText(w.address); toast("Address copied", 1600); }}, icon("copy", 16)),
+      h("a", {href: csLink("account", w.address), target: "_blank", rel: "noopener noreferrer", style: "color:var(--blue);font-weight:650"}, "Solscan")),
+      d.running && d.poll.error ? h("p", {style: "color:var(--red);font-size:13px;margin:8px 0 0"}, "Problem reading the blockchain: " + d.poll.error) : null,
+      !d.running ? h("p", {class: "dim", style: "font-size:13px;margin:8px 0 0"}, "Tracker is not running. Check that CUPSEY_TRACKING is not set to false, then redeploy.") : null);
+    for (const x of [tiles, tradeSec, posSec, foldBox]) x.style.display = d.running ? "" : "none";
+    hero.replaceChildren();
+    if (!d.running) return;
+    const s = d.stats;
+    hero.replaceChildren(csRightNow(d, d.now * 1000 - Date.now()));
+    tiles.replaceChildren(csTile("Buys / sells", String(s.trades), "since start"), csTile("Last trade", s.last_trade ? csAgo(s.last_trade, now) : (s.lookback && s.lookback.state === "searching" ? "searching…" : "none found"), s.last_trade ? "activity " + csAgo(s.newest, now) : (s.lookback && s.lookback.state === "done" ? "none in last " + s.lookback.scanned + " txs" : "activity " + csAgo(s.newest, now))),
+      csTile("Holding", String(d.open.length), s.airdropped ? "+" + s.airdropped + " airdrops hidden" : "open positions"));
+    const lf = s.last_trade_found, many = d.events.length > 5, rows = csShow.trades ? d.events.slice(0, 25) : d.events.slice(0, 5);
+    tradeBox.replaceChildren(d.events.length ? h("div", {}, h("div", {class: "card list"}, rows.map((x) => csTradeRow(x, now))), many ? h("button", {class: "csmore", onclick: () => { csShow.trades = !csShow.trades; refresh(); }}, csShow.trades ? "Show fewer" : "Show all " + Math.min(d.events.length, 25) + " trades") : null)
+      : h("div", {}, empty("wallet", "No buys or sells seen yet", "A trade shows here the moment tokens are swapped for SOL."),
+        lf ? h("p", {class: "dim", style: "font-size:13px;margin:10px 4px 0"}, "Last real trade in history: " + lf.kind.toLowerCase() + " ~" + csSol(lf.sol) + " SOL, " + csAgo(lf.time, now) + ". ", h("a", {href: csLink("tx", lf.sig), target: "_blank", rel: "noopener noreferrer", style: "color:var(--blue)"}, "View")) : null));
+    posSec.style.display = d.open.length ? "" : "none";
+    posBox.replaceChildren(d.open.length ? h("div", {class: "card list"}, d.open.map((p) => csPosRow(p, now))) : "");
+    const al = d.alerts || {}, codes = (s.reason_codes || []).map(([c, n]) => n + " × " + (CS_REASON[c.split("/")[1]] || c)).join(" · ");
+    const alertsBody = h("div", {}, h("p", {class: "dim", style: "font-size:13.5px;margin:0"}, al.on ? al.subscribers + " subscriber(s), " + al.sent + " alerts sent. " + (al.persistent ? "List saved (" + al.store + ")." : "List is NOT saved across restarts.") + (al.error ? " Problem: " + al.error : "") : "Telegram alerts are off. Add TELEGRAM_BOT_TOKEN in Render to switch them on."),
+      al.link ? h("div", {style: "margin-top:12px"}, h("button", {class: "btn", onclick: () => { copyText(al.link); toast("Alert bot link copied", 1600); }}, "Copy alert bot link", icon("copy", 15))) : null);
+    const infoBody = h("div", {}, h("dl", {class: "kv"},
+      h("dt", {}, "Transactions read"), h("dd", {}, Number(s.checked).toLocaleString()), h("dt", {}, "Signed by this wallet"), h("dd", {}, Number(s.signed).toLocaleString()),
+      h("dt", {}, "Started by someone else"), h("dd", {}, Number(s.foreign).toLocaleString()), h("dt", {}, "Transfers without a trade"), h("dd", {}, Number(s.transfers).toLocaleString()),
+      h("dt", {}, "Closed positions"), h("dd", {}, s.closed + (s.closed ? " (" + (s.closed_pnl >= 0 ? "+" : "") + csSol(s.closed_pnl) + " SOL est.)" : "")), h("dt", {}, "Read method"), h("dd", {}, d.poll.mode)),
+      codes ? h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, "Most common: " + codes) : null,
+      h("p", {class: "dim", style: "font-size:12px;margin:12px 0 0"}, "SOL sizes are estimates (fees and tips included). ", h("a", {href: "/cupsey/verify?download=1", style: "color:var(--blue)"}, "Download full verification (JSON)")));
+    const evBody = h("div", {}, ...(w.evidence.length ? w.evidence.map((e) => h("div", {class: "prow", style: "align-items:flex-start"}, h("span", {class: "pill", style: "--c:var(--gray)"}, h("i"), String(e.kind).replace(/_/g, " ")),
+      h("div", {style: "flex:1;min-width:0"}, h("div", {style: "font-weight:650"}, e.source), h("div", {class: "dim", style: "font-size:12.5px"}, e.summary + (e.observed ? " (" + e.observed + ")" : ""))))) : [h("span", {class: "dim"}, "No evidence on file.")]),
+      w.notes ? h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, w.notes) : null);
+    foldBox.replaceChildren(csFold("playbook", "Your playbook and buy sizes", "stop -" + d.playbook.cfg.stop_pct + "%", csPlaybook(d.playbook), false),
+      csFold("alerts", "Telegram alerts", al.on ? al.subscribers + " subscribers" : "off", alertsBody, false),
+      csFold("evidence", "Wallet evidence", "", evBody, false), csFold("info", "How the tracker sees it", "", infoBody, false));
   }
   return {root, refresh, every: 5000};
 }
