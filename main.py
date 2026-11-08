@@ -3161,11 +3161,11 @@ function cupseyView() {
       d.running ? h("div", {style: "display:flex;align-items:center;gap:8px;font-weight:700"}, h("span", {class: "dot " + (d.live ? "ok" : "warn")}, ), d.live ? "Live" : "Not reading",
         h("span", {class: "dim", style: "font-weight:500;font-size:13px"}, "reads every " + Math.round(d.poll.interval) + "s · last good read " + csAgo(d.poll.last_ok, now))) : h("b", {}, "Tracker is not running"),
       h("div", {style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px"},
-        h("span", {class: "pill", style: "--c:" + st[1]}, h("i"), st[0]),
+        h("span", {class: "pill", style: "--c:var(--blue)"}, h("i"), "Tracked wallet"),
         h("code", {style: "font-size:13px"}, short(w.address, 6)),
         h("button", {class: "ibtn", "aria-label": "Copy wallet address", onclick: () => { copyText(w.address); toast("Address copied", 1600); }}, icon("copy", 16)),
         h("a", {class: "btn", href: csLink("account", w.address), target: "_blank", rel: "noopener noreferrer"}, "Solscan", icon("ext", 15))),
-      h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, "Who owns this wallet is not confirmed. The name comes from third-party labels. " + (d.alerts && d.alerts.on ? "Telegram alerts are on: " + d.alerts.subscribers + " subscriber(s), " + d.alerts.sent + " sent." + (d.alerts.persistent ? " Subscriber list is saved (" + d.alerts.store + ")." : " Subscriber list is NOT saved across restarts.") + (d.alerts.error ? " Problem: " + d.alerts.error : "") : "Telegram alerts are off.")),
+      h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, (d.alerts && d.alerts.on ? "Telegram alerts are on: " + d.alerts.subscribers + " subscriber(s), " + d.alerts.sent + " sent." + (d.alerts.persistent ? " Subscriber list is saved (" + d.alerts.store + ")." : " Subscriber list is NOT saved across restarts.") + (d.alerts.error ? " Problem: " + d.alerts.error : "") : "Telegram alerts are off.")),
       d.alerts && d.alerts.link ? h("div", {style: "margin-top:12px"}, h("button", {class: "btn", onclick: () => { copyText(d.alerts.link); toast("Alert bot link copied", 1600); }}, "Copy alert bot link")) : null,
       d.running && d.poll.error ? h("p", {style: "color:var(--red);font-size:13px;margin:10px 0 0"}, "Problem reading the blockchain: " + d.poll.error) : null,
       !d.running ? h("p", {class: "dim", style: "font-size:13px;margin:10px 0 0"}, "Check that CUPSEY_TRACKING is not set to false, then redeploy.") : null);

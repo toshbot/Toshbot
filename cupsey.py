@@ -840,7 +840,7 @@ class AlertTests(unittest.TestCase):
 
     def test_signed_fresh_buy_is_queued_but_backfill_noise_is_not(self):
         t = self.make(); t.ingest([self.fresh(buy(2.0, 100))])
-        self.assertEqual(len(t.outbox), 1); self.assertIn("Buy", t.format_alert(t.outbox[0])); self.assertIn("NOT confirmed", t.format_alert(t.outbox[0]))
+        self.assertEqual(len(t.outbox), 1); self.assertIn("Buy", t.format_alert(t.outbox[0])); self.assertIn("Not financial advice", t.format_alert(t.outbox[0]))
         b = self.make(); b.backfilled = False; b.ingest([self.fresh(buy(2.0, 100))])
         self.assertEqual(b.outbox, [])
 
@@ -1063,7 +1063,7 @@ class PlaybookTests(unittest.TestCase):
         t = self.make(); tx = buy(1.0, 1000, mint=M1); tx["blockTime"] = int(time.time()) - 40; t.ingest([tx])
         t.market[M1] = {"price": 0.00105, "symbol": "PEPE", "name": "Pepe Coin", "t": time.time()}
         a = t.format_alert(t.events[0])
-        for need in ("$PEPE (Pepe Coin)", "ENTRY WINDOW OPEN", "pump.fun/coin/" + M1, "+5.0%", "stop -20%", "NOT confirmed"):
+        for need in ("$PEPE (Pepe Coin)", "ENTRY WINDOW OPEN", "pump.fun/coin/" + M1, "+5.0%", "stop -20%", "Not financial advice"):
             self.assertIn(need, a)
         old = t.format_alert(t.events[0], now=time.time() + 600); self.assertIn("ENTRY CLOSED", old); self.assertNotIn("Your buy size", old)
         sx = sell(1.4, 1000, 1000); sx["blockTime"] = int(time.time()) - 5; t.ingest([sx])
@@ -2040,8 +2040,8 @@ class TelegramHub:
 
     # ---- commands from users
     HELP = ("Tosh Bot Cupsey alerts.\n/start - subscribe to alerts\n/stop - unsubscribe\n/status - am I subscribed?\n\n"
-            "You get a message when the watched wallet makes a buy or sell. The wallet's identity is NOT confirmed (third-party label), "
-            "alerts arrive after the trade, and nothing here is financial advice.")
+            "You get a message when the watched wallet makes a buy or sell. "
+            "Alerts arrive after the trade, and nothing here is financial advice.")
 
     async def handle_update(self, u: dict) -> None:
         m = (u or {}).get("message") or {}
@@ -2311,7 +2311,7 @@ class Tracker:
         coin = (f"${m['symbol']}" + (f" ({m['name']})" if m.get("name") and m["name"] != m["symbol"] else "")) if m.get("symbol") else "unknown coin"
         sell = "SELL" in e["cls"]
         links = [f"Pump.fun (chart + buy): https://pump.fun/coin/{mint}", f"Chart: https://dexscreener.com/solana/{mint}", f"Tx: https://solscan.io/tx/{e['sig']}"]
-        tail = "Wallet identity is NOT confirmed (third-party label). Not financial advice."
+        tail = "Not financial advice."
         if sell:
             sv = sell_view(e)
             lines = [f"\U0001F534 EXIT SIGNAL: {sv['kind']} ({e['cls'].title()})", f"Coin: {coin}", f"Mint: {mint}",
