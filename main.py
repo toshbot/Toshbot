@@ -2384,7 +2384,9 @@ h1.large{font-size:34px;line-height:1.08;font-weight:800;letter-spacing:-.04em;m
 .hero{overflow:hidden;padding:24px;border-radius:36px;
   background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.04))}
 [data-theme="light"] .hero{background:radial-gradient(120% 150% at 0% 0%,rgba(10,116,255,.18),transparent 58%),radial-gradient(90% 120% at 100% 0%,rgba(250,200,60,.22),transparent 52%),var(--g-bg)}
-.hero-row{position:relative;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.hero-row{position:relative;display:flex;flex-wrap:nowrap;align-items:center;justify-content:space-between;gap:12px}
+.hero-row>div:first-child{min-width:0}
+@media (max-width:480px){.donut{width:104px;height:104px}.donutbox{gap:12px}.legend{font-size:12.5px;gap:5px}.legend b{padding-left:10px}.bignum{font-size:54px}}
 .live{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--mute)}
 .bignum{font-size:60px;line-height:1;font-weight:800;letter-spacing:-.05em;margin:12px 0 2px}
 .donutbox{display:flex;align-items:center;gap:18px}
@@ -2849,7 +2851,7 @@ function homeView() {
     setNum(cPassed._n, c.WATCH + c.QUALIFIED); setNum(cReview._n, c.INSUFFICIENT_DATA + c.HOLD); setNum(cRej._n, c.REJECTED + c.REVOKED);
     rate.textContent = recent.length ? "Last launch " + ago(recent[0].detected_at) : "Waiting for the first launch…";
     donutBox.replaceChildren(donut(c, s.total));
-    legend.replaceChildren(...ORDER.filter((k) => c[k] > 0).map((k) => h("div", {}, h("i", {style: "background:" + COLOR[k]}), LABEL[k], h("b", {}, c[k].toLocaleString()))));
+    legend.replaceChildren(...ORDER.filter((k) => c[k] > 0).map((k) => h("div", {}, h("i", {style: "background:" + COLOR[k]}), (k === "INSUFFICIENT_DATA" ? "Low data" : LABEL[k]), h("b", {}, c[k].toLocaleString()))));
     chart.replaceChildren(recent.length ? areaChart(recent) : h("div", {class: "dim", style: "padding:40px 0;text-align:center"}, "No launches yet"));
     latest.replaceChildren(recent.length ? h("div", {class: "card list"}, recent.slice(0, 8).map((t) => tokRow(t, false))) : empty("radar", "Nothing detected yet", "New launches appear here within seconds once the feed is connected."));
     const rows = Object.values(hl.providers).map((p) => h("div", {class: "prow"}, h("span", {class: "dot " + dotState(p.effective_status)}), h("div", {style: "flex:1;font-weight:600"}, p.name), h("span", {class: "dim", style: "font-size:12.5px"}, p.effective_status + " · " + ago(p.last_success_at))));
