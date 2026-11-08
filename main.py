@@ -3057,6 +3057,70 @@ function csAgo(ts, now) {
 const csSol = (v) => (Number(v) || 0).toFixed(3);
 const csLink = (kind, id) => "https://solscan.io/" + kind + "/" + encodeURIComponent(id || "");
 const csTile = (l, v, hint) => h("div", {class: "tile"}, h("div", {class: "l"}, l), h("div", {class: "v"}, v), hint ? h("div", {class: "h"}, hint) : null);
+const csPrice = (v) => (v == null || !isFinite(v)) ? "n/a" : Number(v).toPrecision(3);
+const csCoin = (x) => x.symbol ? "$" + x.symbol : short(x.mint, 4);
+const csClock = (ts) => new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+function csDur(sec) { sec = Math.max(0, Math.round(sec)); return sec < 60 ? sec + "s" : sec < 3600 ? Math.floor(sec / 60) + "m " + String(sec % 60).padStart(2, "0") + "s" : Math.floor(sec / 3600) + "h " + String(Math.floor(sec % 3600 / 60)).padStart(2, "0") + "m"; }
+function csPlanTable(rows, withPrices) {
+  return h("dl", {class: "kv"}, rows.flatMap((r) => [h("dt", {}, r.step), h("dd", {}, r.rule + (withPrices && r.price ? "  (around " + csPrice(r.price) + " SOL per token)" : ""))]));
+}
+function csExitCard(x, now) {
+  const profit = x.kind === "TAKING PROFIT", loss = x.kind === "CUTTING A LOSS";
+  const col = profit ? "var(--green)" : "var(--red)";
+  return h("div", {class: "card pad", style: "border-left:4px solid " + col},
+    h("div", {style: "display:flex;align-items:center;gap:10px;flex-wrap:wrap"}, h("span", {style: "font-weight:800;font-size:19px"}, csCoin(x)), x.name ? h("span", {class: "mute"}, x.name) : null,
+      h("span", {class: "pill", style: "--c:" + col}, h("i"), "EXIT SIGNAL"), h("b", {style: "color:" + col}, x.kind)),
+    h("div", {style: "margin-top:10px;font-weight:800;font-size:16px"}, x.action),
+    h("div", {class: "dim", style: "font-size:13px;margin-top:6px"}, "He sold " + csSol(x.sol) + " SOL " + csAgo(x.time, now)
+      + (x.gain_pct != null ? " at " + (x.gain_pct >= 0 ? "+" : "") + x.gain_pct + "% vs his average cost" : "") + (x.pnl != null ? " (" + (x.pnl >= 0 ? "+" : "") + Number(x.pnl).toFixed(3) + " SOL for him)" : "")
+      + ". Do it fast: his selling pushes the price down."),
+    h("div", {style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"},
+      h("a", {class: "btn", style: "background:" + col + ";color:#fff", href: "https://pump.fun/coin/" + x.mint, target: "_blank", rel: "noopener noreferrer"}, "Sell on Pump.fun", icon("ext", 15)),
+      h("a", {class: "btn", href: "https://dexscreener.com/solana/" + x.mint, target: "_blank", rel: "noopener noreferrer"}, "Chart", icon("ext", 15)),
+      h("button", {class: "btn", onclick: () => { copyText(x.mint); toast("Coin address copied", 1600); }}, "Copy address", icon("copy", 15))));
+}
+function csNowCard(d, skew) {
+  const nc = d.now_card;
+  if (!nc) {
+    const last = d.stats.last_trade;
+    return h("div", {class: "card pad", style: "border-left:4px solid var(--gray)"},
+      h("div", {style: "font-weight:800;font-size:17px"}, "No entry window open"),
+      h("p", {class: "mute", style: "margin:6px 0 0"}, last ? "His last trade was " + csAgo(last, d.now) + ". Do not chase old trades. Wait for the next Telegram alert." : "Waiting for his next trade. Nothing to do right now."));
+  }
+  const cd = h("b", {style: "font-variant-numeric:tabular-nums"}, "");
+  const closes = nc.entry.closes_at;
+  const tick = () => { const left = closes - (Date.now() + skew) / 1000; cd.textContent = left > 0 ? csDur(left) + " left" : "CLOSED"; cd.style.color = left > 0 ? "var(--green)" : "var(--red)"; return left; };
+  tick();
+  const card = h("div", {class: "card pad", style: "border-left:4px solid var(--green)"},
+    h("div", {style: "display:flex;align-items:center;gap:10px;flex-wrap:wrap"}, h("span", {style: "font-weight:800;font-size:19px"}, csCoin(nc)), nc.name ? h("span", {class: "mute"}, nc.name) : null,
+      h("span", {class: "pill", style: "--c:var(--green)"}, h("i"), "ENTRY OPEN"), cd),
+    h("div", {class: "dim", style: "font-size:13px;margin-top:6px"}, "He " + (nc.cls === "BUY" ? "bought" : "added") + " " + csSol(nc.sol) + " SOL at " + csClock(nc.time) + ". Enter between " + csClock(nc.time) + " and " + csClock(closes) + " only."
+      + (nc.entry.price_known ? " Price now is " + (nc.entry.move_pct >= 0 ? "+" : "") + nc.entry.move_pct + "% vs his entry." : " Live price unavailable, go by the clock.")),
+    h("div", {style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"},
+      h("a", {class: "btn", style: "background:var(--green);color:#fff", href: "https://pump.fun/coin/" + nc.mint, target: "_blank", rel: "noopener noreferrer"}, "Open on Pump.fun", icon("ext", 15)),
+      h("a", {class: "btn", href: "https://dexscreener.com/solana/" + nc.mint, target: "_blank", rel: "noopener noreferrer"}, "Chart", icon("ext", 15)),
+      h("a", {class: "btn", href: axiomUrl({mint: nc.mint}), target: "_blank", rel: "noopener noreferrer"}, "Axiom", icon("ext", 15)),
+      h("button", {class: "btn", onclick: () => { copyText(nc.mint); toast("Coin address copied", 1600); }}, "Copy address", icon("copy", 15))),
+    h("div", {style: "margin-top:14px;font-weight:700"}, nc.size ? "Your buy size: " + nc.size + " SOL" : "Your buy size: see the table below (set CUPSEY_BANKROLL_SOL for an exact number)"),
+    h("div", {style: "margin-top:8px"}, csPlanTable(nc.plan, true)),
+    h("p", {class: "dim", style: "font-size:12px;margin:10px 0 0"}, "Rules, not predictions. You enter after him, so the price can already have moved. Skip it if the window is closed."));
+  const iv = setInterval(() => { if (!card.isConnected) { clearInterval(iv); return; } if (tick() <= 0) clearInterval(iv); }, 1000);
+  return card;
+}
+function csRightNow(d, skew) {
+  const cards = (d.exit_cards || []).map((x) => csExitCard(x, d.now));
+  if (d.now_card || !cards.length) cards.push(csNowCard(d, skew));
+  return h("div", {style: "display:grid;gap:12px"}, cards);
+}
+function csPlaybook(pb) {
+  const c = pb.cfg;
+  return h("div", {class: "card pad"},
+    csPlanTable(pb.plan, false),
+    h("div", {style: "margin:14px 0 6px;font-weight:700"}, "Exact buy size by bankroll (risk " + c.risk_pct + "% per trade, stop " + c.stop_pct + "%, max " + c.max_position_sol + " SOL)"),
+    h("dl", {class: "kv"}, pb.sizes.flatMap((r) => [h("dt", {}, r.bankroll + " SOL bankroll"), h("dd", {}, "buy " + r.buy + " SOL · most you lose " + r.max_loss + " SOL")])),
+    h("p", {class: "dim", style: "font-size:12.5px;margin:12px 0 0"}, pb.hold && pb.hold.median_s ? "His typical hold so far: " + csDur(pb.hold.median_s) + " (from " + pb.hold.n + " closed trades)." : "No closed trades of his seen yet, so there is no real hold time to show. The time stop above is a default."),
+    h("p", {class: "dim", style: "font-size:12px;margin:8px 0 0"}, "These are default rules you can change in Render (CUPSEY_ENTRY_WINDOW_SECONDS, CUPSEY_MAX_CHASE_PCT, CUPSEY_STOP_PCT, CUPSEY_TP1_PCT, CUPSEY_TP2_PCT, CUPSEY_TIME_STOP_MINUTES, CUPSEY_BANKROLL_SOL, CUPSEY_RISK_PCT, CUPSEY_MAX_POSITION_SOL). Start with paper or tiny size. Not financial advice."));
+}
 function csTradeRow(x, now) {
   const sell = String(x.cls).indexOf("SELL") >= 0;
   const label = String(x.cls).toLowerCase().replace(/\b\w/g, (m) => m.toUpperCase());
@@ -3066,27 +3130,30 @@ function csTradeRow(x, now) {
   return h("a", {class: "tok", href: csLink("tx", x.sig), target: "_blank", rel: "noopener noreferrer"},
     h("span", {class: "pill", style: "--c:" + (sell ? "var(--red)" : "var(--green)")}, h("i"), label),
     h("div", {class: "tmain"},
-      h("div", {class: "tt"}, h("b", {}, short(x.mint, 4)), h("span", {}, csSol(x.sol) + " SOL" + (x.big ? " ★" : ""))),
-      h("div", {class: "ts"}, csAgo(x.time, now) + (more.length ? " · " + more.join(" · ") : ""))),
+      h("div", {class: "tt"}, h("b", {}, csCoin(x)), h("span", {}, csSol(x.sol) + " SOL" + (x.big ? " ★" : ""))),
+      h("div", {class: "ts"}, csAgo(x.time, now) + (more.length ? " · " + more.join(" · ") : "")),
+      x.entry ? h("div", {class: "ts", style: "color:" + (x.entry.state === "OPEN" ? "var(--green)" : "var(--gray)")}, x.entry.state === "OPEN" ? "Entry window open (" + csDur(x.entry.closes_at - now) + " left)" : "Entry closed: " + x.entry.reason) : (sell && x.exit ? h("div", {class: "ts", style: "color:" + (x.exit.kind === "TAKING PROFIT" ? "var(--green)" : "var(--red)")}, x.exit.kind + (x.exit.gain_pct != null ? " (" + (x.exit.gain_pct >= 0 ? "+" : "") + x.exit.gain_pct + "% vs his cost)" : "") + ". " + x.exit.action) : null)),
     h("div", {class: "tr"}, icon("ext", 15)));
 }
 function csPosRow(p, now) {
   const n = (c, w) => c + " " + w + (c === 1 ? "" : "s");
   return h("a", {class: "tok", href: csLink("token", p.mint), target: "_blank", rel: "noopener noreferrer"},
     h("div", {class: "tmain"},
-      h("div", {class: "tt"}, h("b", {}, short(p.mint, 4)), h("span", {}, "cost " + csSol(p.cost_sol) + " SOL")),
-      h("div", {class: "ts"}, "bought " + csSol(p.bought_sol) + " SOL · " + n(p.buys, "buy") + (p.sells ? " · " + n(p.sells, "sell") : "") + " · opened " + csAgo(p.opened_at, now))),
+      h("div", {class: "tt"}, h("b", {}, csCoin(p)), h("span", {}, "cost " + csSol(p.cost_sol) + " SOL")),
+      h("div", {class: "ts"}, "bought " + csSol(p.bought_sol) + " SOL · " + n(p.buys, "buy") + (p.sells ? " · " + n(p.sells, "sell") : "") + " · opened " + csAgo(p.opened_at, now)),
+      h("div", {class: "ts", style: "color:" + (p.entry_open ? "var(--green)" : "var(--gray)")}, (p.entry_open ? "Entry window open" : "He is holding. Entry closed. Exit when he sells.")
+        + (p.price_now && p.avg_price ? " · price vs his avg " + (p.price_now / p.avg_price >= 1 ? "+" : "") + ((p.price_now / p.avg_price - 1) * 100).toFixed(0) + "%" : ""))),
     h("div", {class: "tr"}, icon("ext", 15)));
 }
 function cupseyView() {
-  const status = h("div"), tiles = h("div", {class: "grid3"}), posBox = h("div"), tradeBox = h("div"), evBox = h("div"), infoBox = h("div");
-  const tradeSec = h("div", {}, sec("Latest trades"), tradeBox), posSec = h("div", {}, sec("Open positions"), posBox), infoSec = h("div", {}, sec("How the tracker sees it"), infoBox);
+  const status = h("div"), nowBox = h("div", {style: "margin-top:12px"}), tiles = h("div", {class: "grid3"}), posBox = h("div"), tradeBox = h("div"), evBox = h("div"), infoBox = h("div"), pbBox = h("div");
+  const tradeSec = h("div", {}, sec("Latest trades"), tradeBox), posSec = h("div", {}, sec("He is holding (entry closed unless marked open)"), posBox), pbSec = h("div", {}, sec("Your playbook: what to do and when"), pbBox), infoSec = h("div", {}, sec("How the tracker sees it"), infoBox);
   status.append(skeleton(1)); posBox.append(skeleton(2)); tradeBox.append(skeleton(3));
   const root = h("div", {},
     h("h1", {class: "large"}, "Cupsey"),
     h("p", {class: "sub"}, "A live, read-only view of one wallet. It only reads the blockchain; nothing here buys or sells."),
-    status, h("div", {style: "margin-top:12px"}, tiles),
-    tradeSec, posSec, sec("Wallet evidence"), evBox, infoSec);
+    status, nowBox, h("div", {style: "margin-top:12px"}, tiles),
+    tradeSec, posSec, pbSec, sec("Wallet evidence"), evBox, infoSec);
   async function refresh() {
     const d = await api("/cupsey"), w = d.wallet, now = d.now;
     const st = CS_STATUS[w.status] || [w.status, "var(--gray)"];
@@ -3103,10 +3170,12 @@ function cupseyView() {
       d.running && d.poll.error ? h("p", {style: "color:var(--red);font-size:13px;margin:10px 0 0"}, "Problem reading the blockchain: " + d.poll.error) : null,
       !d.running ? h("p", {class: "dim", style: "font-size:13px;margin:10px 0 0"}, "Check that CUPSEY_TRACKING is not set to false, then redeploy.") : null);
     status.replaceChildren(head);
-    for (const x of [tradeSec, posSec, infoSec]) x.style.display = d.running ? "" : "none";
-    if (!d.running) tiles.replaceChildren();
+    for (const x of [tradeSec, posSec, infoSec, pbSec]) x.style.display = d.running ? "" : "none";
+    if (!d.running) { tiles.replaceChildren(); nowBox.replaceChildren(); }
     else {
       const s = d.stats;
+      nowBox.replaceChildren(csRightNow(d, d.now * 1000 - Date.now()));
+      pbBox.replaceChildren(csPlaybook(d.playbook));
       tiles.replaceChildren(csTile("Buys / sells", String(s.trades), "seen since start"), csTile("Last trade", s.last_trade ? csAgo(s.last_trade, now) : (s.lookback && s.lookback.state === "searching" ? "searching…" : "none found"), s.last_trade ? "any activity: " + csAgo(s.newest, now) : (s.lookback && s.lookback.state === "done" ? "none in last " + s.lookback.scanned + " txs" : "any activity: " + csAgo(s.newest, now))), csTile("Open", String(d.open.length), s.transfer_only ? "+" + s.transfer_only + " airdropped, hidden" : "positions"));
       const lf = s.last_trade_found;
       tradeBox.replaceChildren(d.events.length ? h("div", {class: "card list"}, d.events.slice(0, 25).map((x) => csTradeRow(x, now))) : empty("wallet", "No buys or sells seen yet", "The tracker reads this wallet continuously and will show a trade here the moment tokens are swapped for SOL. Nothing is guessed."),

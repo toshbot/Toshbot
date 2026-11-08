@@ -368,6 +368,7 @@ class TradeEvent:
     realized_pnl_sol: float | None = None
     position: dict | None = None
     note: str = ""
+    cost_price_sol: float | None = None   # sells: his average cost per token for the part sold
 
 
 class Ledger:
@@ -436,6 +437,7 @@ class Ledger:
             pos.realized_pnl_sol += pnl
         full = (d.post_token_amount <= EPS) if d.post_token_amount is not None else pos.qty <= EPS
         ev.sol_value, ev.price_sol, ev.token_amount, ev.realized_pnl_sol = proceeds, d.price_sol, sold, pnl
+        ev.cost_price_sol = (basis / known) if (known > EPS and basis > 0) else None
         ev.pct_of_position = 100.0 * known / qty_before if qty_before > EPS else None
         if full:
             pos.qty, pos.cost_sol, pos.status, pos.closed_at = 0.0, 0.0, "CLOSED", d.block_time
@@ -465,8 +467,106 @@ class Ledger:
 # ============================================================================
 # SIGNIFICANCE (configurable alert filter; defaults are UNAPPROVED placeholders)
 # ============================================================================
+BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
 def _f(name: str, default: float) -> float:
     return float(os.getenv(name, default))
+
+
+# ============================================================================
+# PLAYBOOK: entry window, position size and exit rules for anyone copying this wallet. Rules, not predictions.
+# ============================================================================
+@dataclass
+class PlaybookConfig:
+    entry_window_s: int = 180        # how long after his buy an entry is still allowed
+    max_chase_pct: float = 15.0      # skip if the price is already this much above HIS price
+    stop_pct: float = 20.0           # sell everything if price is this far below YOUR entry
+    tp1_pct: float = 50.0            # sell half here
+    tp2_pct: float = 100.0           # sell the rest here
+    time_stop_min: int = 30          # if it has not worked by now, get out
+    bankroll_sol: float = 0.0        # your trading bankroll (0 = not set: the dashboard shows a table instead)
+    risk_pct: float = 1.0            # share of the bankroll you accept losing if the stop is hit
+    max_position_sol: float = 1.0    # never put in more than this per trade
+
+    @classmethod
+    def from_env(cls) -> "PlaybookConfig":
+        return cls(entry_window_s=int(_f("CUPSEY_ENTRY_WINDOW_SECONDS", 180)), max_chase_pct=_f("CUPSEY_MAX_CHASE_PCT", 15), stop_pct=_f("CUPSEY_STOP_PCT", 20),
+                   tp1_pct=_f("CUPSEY_TP1_PCT", 50), tp2_pct=_f("CUPSEY_TP2_PCT", 100), time_stop_min=int(_f("CUPSEY_TIME_STOP_MINUTES", 30)),
+                   bankroll_sol=_f("CUPSEY_BANKROLL_SOL", 0), risk_pct=_f("CUPSEY_RISK_PCT", 1), max_position_sol=_f("CUPSEY_MAX_POSITION_SOL", 1))
+
+
+def _dur(sec: float) -> str:
+    sec = max(0, int(sec))
+    return f"{sec}s" if sec < 60 else f"{sec // 60}m {sec % 60:02d}s" if sec < 3600 else f"{sec // 3600}h {sec % 3600 // 60:02d}m"
+
+
+def position_size(cfg: PlaybookConfig, bankroll: float) -> float:
+    """SOL to buy so that hitting the stop loses exactly `risk_pct` of the bankroll (capped). Example: 1% risk with a 20% stop = 5% of the bankroll."""
+    if bankroll <= 0 or cfg.stop_pct <= 0 or cfg.risk_pct <= 0:
+        return 0.0
+    return round(min(bankroll * cfg.risk_pct / cfg.stop_pct, cfg.max_position_sol), 3)
+
+
+def size_table(cfg: PlaybookConfig) -> list[dict]:
+    rows = []
+    for b in (1, 2, 5, 10, 25, 50):
+        size = position_size(cfg, b)
+        rows.append({"bankroll": b, "buy": size, "max_loss": round(size * cfg.stop_pct / 100, 3)})
+    return rows
+
+
+def entry_window(ev: dict, now: float, price_now: float | None, cfg: PlaybookConfig, still_holding: bool) -> dict:
+    """Is it still sensible to copy this BUY? CLOSED for any one reason: he already sold, too much time passed, the price ran, or it failed."""
+    t = ev.get("time") or 0
+    age = max(0.0, now - t)
+    his = ev.get("price")
+    move = ((price_now / his - 1) * 100) if (price_now and his and his > 0) else None
+    out = {"state": "CLOSED", "reason": "", "age_s": round(age), "closes_at": t + cfg.entry_window_s, "seconds_left": 0, "move_pct": None if move is None else round(move, 1),
+           "his_price": his, "price_now": price_now, "price_known": move is not None}
+    if not still_holding:
+        out["reason"] = "He already sold this one. Do not enter."
+    elif age > cfg.entry_window_s:
+        out["reason"] = f"Too late: his buy was {_dur(age)} ago and the entry window is {_dur(cfg.entry_window_s)}."
+    elif move is not None and move > cfg.max_chase_pct:
+        out["reason"] = f"Price is already {move:+.0f}% above his entry (limit +{cfg.max_chase_pct:g}%). Do not chase."
+    elif move is not None and move < -cfg.stop_pct:
+        out["reason"] = f"Price is {move:.0f}% below his entry. The setup has failed."
+    else:
+        out.update(state="OPEN", seconds_left=round(cfg.entry_window_s - age), reason="Entry window open." + ("" if move is not None else " Price check unavailable: go by the time only."))
+    return out
+
+
+def plan_rows(cfg: PlaybookConfig, his_price: float | None = None) -> list[dict]:
+    rows = [{"step": "Enter", "rule": f"Only within {_dur(cfg.entry_window_s)} of his buy, and only if price is no more than +{cfg.max_chase_pct:g}% above his price."},
+            {"step": "Size", "rule": f"Risk {cfg.risk_pct:g}% of your bankroll: buy bankroll x {cfg.risk_pct / cfg.stop_pct:.1%}, never more than {cfg.max_position_sol:g} SOL."},
+            {"step": "Stop loss", "rule": f"Sell everything if price falls {cfg.stop_pct:g}% below YOUR entry."},
+            {"step": "Take profit 1", "rule": f"Sell half at +{cfg.tp1_pct:g}%."},
+            {"step": "Take profit 2", "rule": f"Sell the rest at +{cfg.tp2_pct:g}%."},
+            {"step": "Follow him", "rule": "Sell everything the moment he sells (you get a Telegram alert)."},
+            {"step": "Time stop", "rule": f"Not working after {cfg.time_stop_min} minutes? Sell."}]
+    if his_price:
+        rows[0]["price"] = his_price * (1 + cfg.max_chase_pct / 100)
+        rows[2]["price"] = his_price * (1 - cfg.stop_pct / 100)
+        rows[3]["price"] = his_price * (1 + cfg.tp1_pct / 100)
+        rows[4]["price"] = his_price * (1 + cfg.tp2_pct / 100)
+    return rows
+
+
+def sell_view(e: dict) -> dict:
+    """What his sale means for someone who copied him: take profit, cut a loss, or just exit. Mirror rule: he sold X% of his position, you sell X% of yours."""
+    full = "FULL" in e["cls"]
+    price, cost = e.get("price"), e.get("cost_price")
+    gain = round((price / cost - 1) * 100, 1) if (price and cost and cost > 0) else None
+    mirror = 100.0 if full else (round(e["pct"]) if e.get("pct") is not None else None)
+    kind = "EXIT" if gain is None else "TAKING PROFIT" if gain >= 5 else "CUTTING A LOSS" if gain <= -5 else "SELLING"
+    if full:
+        action = "Sell ALL of yours now."
+    elif mirror is not None:
+        action = f"Sell about {mirror:.0f}% of yours now (he sold {mirror:.0f}% of his)."
+    else:
+        action = "Sell at least half of yours now."
+    return {"kind": kind, "gain_pct": gain, "mirror_pct": mirror, "full": full, "action": action}
 
 
 @dataclass
@@ -925,6 +1025,109 @@ class StoreTests(unittest.TestCase):
             finally:
                 del os.environ["CUPSEY_SUBSCRIBERS_FILE"]
         h = TelegramHub(); _attach_subscriber_store(a, h); self.assertEqual(h.store_kind, "memory")
+
+
+class PlaybookTests(unittest.TestCase):
+    cfg = PlaybookConfig()
+
+    def ev(self, age=30, price=0.001, now=10_000.0):
+        return {"cls": "BUY", "mint": M1, "sol": 1.0, "time": now - age, "price": price, "sig": "S", "pct": None, "pnl": None}, now
+
+    def test_entry_window_states(self):
+        e, now = self.ev(30)
+        self.assertEqual(entry_window(e, now, 0.00105, self.cfg, True)["state"], "OPEN")
+        self.assertEqual(entry_window(e, now, 0.00105, self.cfg, True)["seconds_left"], 150)
+        late, now = self.ev(400); r = entry_window(late, now, 0.001, self.cfg, True)
+        self.assertEqual(r["state"], "CLOSED"); self.assertIn("Too late", r["reason"])
+        r = entry_window(e, now, 0.00130, self.cfg, True); self.assertEqual(r["state"], "CLOSED"); self.assertIn("chase", r["reason"])
+        r = entry_window(e, now, 0.00070, self.cfg, True); self.assertEqual(r["state"], "CLOSED"); self.assertIn("failed", r["reason"])
+        r = entry_window(e, now, 0.001, self.cfg, False); self.assertEqual(r["state"], "CLOSED"); self.assertIn("already sold", r["reason"])
+        r = entry_window(e, now, None, self.cfg, True); self.assertEqual(r["state"], "OPEN"); self.assertFalse(r["price_known"]); self.assertIn("Price check unavailable", r["reason"])
+
+    def test_position_size_math_and_caps(self):
+        self.assertEqual(position_size(self.cfg, 5), 0.25)       # 1% risk / 20% stop = 5% of bankroll
+        self.assertEqual(position_size(self.cfg, 100), 1.0)      # capped at max_position_sol
+        self.assertEqual(position_size(self.cfg, 0), 0.0)
+        self.assertEqual(position_size(PlaybookConfig(stop_pct=0), 5), 0.0)
+        row = size_table(self.cfg)[2]; self.assertEqual((row["bankroll"], row["buy"], row["max_loss"]), (5, 0.25, 0.05))
+
+    def test_plan_has_prices_from_his_entry(self):
+        rows = plan_rows(self.cfg, 0.001); self.assertAlmostEqual(rows[0]["price"], 0.00115); self.assertAlmostEqual(rows[2]["price"], 0.0008)
+        self.assertNotIn("price", plan_rows(self.cfg)[0])
+
+    def make(self):
+        t = Tracker(W, "https://rpc.invalid/?api-key=SECRET", interval=5); t.hub.token, t.hub.owner = "1:T", "42"; t.backfilled = True
+        return t
+
+    def test_alert_text_open_closed_and_exit(self):
+        t = self.make(); tx = buy(1.0, 1000, mint=M1); tx["blockTime"] = int(time.time()) - 40; t.ingest([tx])
+        t.market[M1] = {"price": 0.00105, "symbol": "PEPE", "name": "Pepe Coin", "t": time.time()}
+        a = t.format_alert(t.events[0])
+        for need in ("$PEPE (Pepe Coin)", "ENTRY WINDOW OPEN", "pump.fun/coin/" + M1, "+5.0%", "stop -20%", "NOT confirmed"):
+            self.assertIn(need, a)
+        old = t.format_alert(t.events[0], now=time.time() + 600); self.assertIn("ENTRY CLOSED", old); self.assertNotIn("Your buy size", old)
+        sx = sell(1.4, 1000, 1000); sx["blockTime"] = int(time.time()) - 5; t.ingest([sx])
+        ex = t.format_alert(t.events[0]); self.assertIn("EXIT SIGNAL", ex); self.assertIn("Sell ALL of yours now", ex); self.assertIn("pump.fun/coin/" + M1, ex)
+        self.assertIn("ENTRY CLOSED", t.format_alert(t.events[1]))   # he already sold: the earlier buy can no longer be entered
+
+    def test_market_lookup_parses_filters_and_backs_off(self):
+        class R:
+            def __init__(s, code, data): s.status_code, s._d = code, data
+            def json(s): return s._d
+
+        class C:
+            def __init__(s, resp): s.resp, s.calls = resp, 0
+            async def get(s, url, timeout=None): s.calls += 1; return s.resp
+        pair = {"chainId": "solana", "quoteToken": {"symbol": "SOL"}, "priceNative": "0.0012", "liquidity": {"usd": 5000}, "baseToken": {"symbol": "PE\x00PE", "name": "Pepe"}}
+        t = self.make(); t.client = C(R(200, {"pairs": [pair, {**pair, "quoteToken": {"symbol": "USDC"}, "priceNative": "9"}]}))
+        asyncio.run(t.refresh_market([M1, "not-a-mint"])); self.assertEqual(t.market[M1]["price"], 0.0012); self.assertEqual(t.market[M1]["symbol"], "PEPE"); self.assertEqual(t.client.calls, 1)
+        asyncio.run(t.refresh_market([M1])); self.assertEqual(t.client.calls, 1)   # cached 15s
+        t2 = self.make(); t2.client = C(R(429, None)); asyncio.run(t2.refresh_market([M1, M2])); asyncio.run(t2.refresh_market([M1])); self.assertEqual(t2.client.calls, 1)
+        t3 = self.make(); t3.client = C(R(200, {"pairs": [{**pair, "quoteToken": {"symbol": "USDC"}}]})); asyncio.run(t3.refresh_market([M1])); self.assertNotIn(M1, t3.market)
+        t4 = self.make(); t4.price_lookup = False; t4.client = C(R(200, {})); asyncio.run(t4.refresh_market([M1])); self.assertEqual(t4.client.calls, 0)
+
+    def test_dashboard_now_card_only_while_a_window_is_open(self):
+        t = self.make(); tx = buy(1.0, 1000, mint=M1); tx["blockTime"] = int(time.time()) - 40; t.ingest([tx])
+        p = dashboard_payload(t.snapshot(), seed_registry().get(W))
+        self.assertEqual(p["now_card"]["mint"], M1); self.assertTrue(p["open"][0]["entry_open"]); self.assertEqual(p["playbook"]["sizes"][2]["buy"], 0.25)
+        stale = dashboard_payload(t.snapshot(), seed_registry().get(W), now=time.time() + 900)
+        self.assertIsNone(stale["now_card"]); self.assertFalse(stale["open"][0]["entry_open"]); self.assertEqual(stale["events"][0]["entry"]["state"], "CLOSED")
+
+    def test_hold_time_median_from_closed_positions(self):
+        t = self.make(); self.assertEqual(t._hold_stats(), {"n": 0, "median_s": None})
+        b1, s1 = buy(1.0, 100, mint=M1), sell(1.5, 100, 100, mint=M1); b1["blockTime"], s1["blockTime"] = 1000, 1600
+        t.ingest([b1, s1]); self.assertEqual(t._hold_stats(), {"n": 1, "median_s": 600})
+
+
+class ExitSignalTests(unittest.TestCase):
+    def ev(self, cls="PARTIAL SELL", price=0.0018, cost=0.001, pct=50.0):
+        return {"cls": cls, "mint": M1, "sol": 0.9, "time": 1000, "price": price, "cost_price": cost, "pct": pct, "pnl": 0.4, "sig": "S"}
+
+    def test_sell_view_take_profit_loss_and_mirror(self):
+        v = sell_view(self.ev()); self.assertEqual((v["kind"], v["gain_pct"], v["mirror_pct"], v["full"]), ("TAKING PROFIT", 80.0, 50, False)); self.assertIn("50%", v["action"])
+        f = sell_view(self.ev("FULL SELL", pct=100.0)); self.assertTrue(f["full"]); self.assertIn("ALL", f["action"])
+        self.assertEqual(sell_view(self.ev(price=0.0007))["kind"], "CUTTING A LOSS")
+        self.assertEqual(sell_view(self.ev(price=0.00101))["kind"], "SELLING")
+        self.assertEqual(sell_view({**self.ev(), "cost_price": None})["kind"], "EXIT")
+        self.assertIn("at least half", sell_view({**self.ev(), "pct": None})["action"])
+
+    def make(self):
+        t = Tracker(W, "https://rpc.invalid/?api-key=SECRET", interval=5); t.hub.token, t.hub.owner = "1:T", "42"; t.backfilled = True
+        return t
+
+    def test_ledger_records_his_cost_so_the_gain_is_known(self):
+        t = self.make(); b = buy(2.0, 100); b["blockTime"] = int(time.time()) - 60; s1 = sell(1.5, 50, 100); s1["blockTime"] = int(time.time()) - 10
+        t.ingest([b, s1]); e = t.events[0]
+        self.assertEqual(e["cls"], "PARTIAL SELL"); self.assertAlmostEqual(e["cost_price"], 0.02); self.assertAlmostEqual(sell_view(e)["gain_pct"], 50.0, places=1)
+
+    def test_alert_and_dashboard_tell_you_to_mirror_the_sale(self):
+        t = self.make(); b = buy(2.0, 100); b["blockTime"] = int(time.time()) - 60; s1 = sell(1.5, 50, 100); s1["blockTime"] = int(time.time()) - 10; t.ingest([b, s1])
+        a = t.format_alert(t.events[0])
+        for need in ("EXIT SIGNAL: TAKING PROFIT", "+50.0%", "Sell about 50% of yours", "pump.fun/coin/"):
+            self.assertIn(need, a)
+        p = dashboard_payload(t.snapshot(), seed_registry().get(W))
+        self.assertEqual(len(p["exit_cards"]), 1); self.assertEqual(p["exit_cards"][0]["mirror_pct"], 50); self.assertEqual(p["events"][0]["exit"]["kind"], "TAKING PROFIT")
+        old = dashboard_payload(t.snapshot(), seed_registry().get(W), now=time.time() + 3600); self.assertEqual(old["exit_cards"], [])   # signal expires
 
 
 # ---- richer fixtures: header / signer flags / lookup tables / arbitrary key order -----------------
@@ -1942,6 +2145,10 @@ class Tracker:
         self.alerts_sent = 0
         self.alert_error = ""
         # "Last real trade": a one-off, capped dig back through history (Helius only) for the wallet's last self-signed buy/sell. Never touches the live ledger.
+        self.playbook = PlaybookConfig.from_env()
+        self.price_lookup = (os.getenv("CUPSEY_PRICE_LOOKUP") or "true").strip().lower() != "false"
+        self.market: dict[str, dict] = {}
+        self._market_blocked_until = 0.0
         self.lookback_cap = int(_f("CUPSEY_LOOKBACK_TXS", 3000))
         self.lookback: dict = {"state": "off" if self.lookback_cap <= 0 else "waiting", "found": None, "scanned": 0, "oldest": None, "checked_at": None, "error": ""}
 
@@ -2039,7 +2246,8 @@ class Tracker:
             if d.kind in ("BUY", "SELL", "TRANSFER") and d.mint:
                 big, why = is_significant(ev, self.thresholds)
                 self.events.insert(0, {"cls": ev.classification, "mint": d.mint, "sol": ev.sol_value, "pct": ev.pct_of_position,
-                                       "pnl": ev.realized_pnl_sol, "time": d.block_time, "sig": d.signature, "big": big, "why": why})
+                                       "pnl": ev.realized_pnl_sol, "time": d.block_time, "sig": d.signature, "big": big, "why": why,
+                                       "price": ev.price_sol, "qty": ev.token_amount, "cost_price": ev.cost_price_sol})
                 if d.kind in ("BUY", "SELL"):
                     self.last_trade = max(self.last_trade or 0, d.block_time or 0)
                     fresh = bool(d.block_time) and time.time() - d.block_time <= self.alert_max_age
@@ -2054,25 +2262,92 @@ class Tracker:
     def alerts_enabled(self) -> bool:
         return self.hub.enabled
 
-    def format_alert(self, e: dict) -> str:
+    # ---- price and coin name (DEX Screener, free). Fails quietly: without a price the playbook just goes by time.
+    async def refresh_market(self, mints) -> None:
+        if not self.price_lookup or self.client is None:
+            return
+        now = time.time()
+        if now < self._market_blocked_until:
+            return
+        for mint in list(dict.fromkeys(mints))[:6]:
+            have = self.market.get(mint)
+            if (have and now - have["t"] < 15) or not BASE58.match(mint or ""):
+                continue
+            try:
+                r = await self.client.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
+                if r.status_code == 429:
+                    self._market_blocked_until = now + 60
+                    return
+                if r.status_code != 200:
+                    continue
+                pairs = [p for p in ((r.json() or {}).get("pairs") or []) if isinstance(p, dict) and p.get("chainId") == "solana"
+                         and str((p.get("quoteToken") or {}).get("symbol") or "").upper() in ("SOL", "WSOL")]
+                if not pairs:
+                    continue
+                p = max(pairs, key=lambda x: float(((x.get("liquidity") or {}).get("usd")) or 0))
+                price = float(p.get("priceNative"))
+                if not (price > 0):
+                    continue
+                bt = p.get("baseToken") or {}
+                clean = lambda v, n: "".join(c for c in str(v or "") if c.isprintable())[:n]
+                self.market[mint] = {"price": price, "symbol": clean(bt.get("symbol"), 20), "name": clean(bt.get("name"), 40), "t": now}
+            except Exception:
+                continue
+        if len(self.market) > 200:
+            for k in list(self.market)[:100]:
+                self.market.pop(k, None)
+
+    def _price_now(self, mint: str, now: float) -> float | None:
+        m = self.market.get(mint)
+        return m["price"] if m and now - m["t"] < 120 else None
+
+    def _holding(self, mint: str) -> bool:
+        return any(p.mint == mint and p.qty > EPS for p in self.ledger.open.values())
+
+    def format_alert(self, e: dict, now: float | None = None) -> str:
+        now = time.time() if now is None else now
+        cfg, mint = self.playbook, e["mint"]
+        m = self.market.get(mint) or {}
+        coin = (f"${m['symbol']}" + (f" ({m['name']})" if m.get("name") and m["name"] != m["symbol"] else "")) if m.get("symbol") else "unknown coin"
         sell = "SELL" in e["cls"]
-        head = ("\U0001F534 " if sell else "\U0001F7E2 ") + e["cls"].title()
-        lines = [f"{head} by watched wallet", f"Token: {e['mint']}", f"Size: ~{e['sol']:.3f} SOL (estimate)"]
-        if e.get("pct") is not None and e["cls"] != "BUY":
-            lines.append(f"Position: {e['pct']:.0f}% of holding")
-        if e.get("pnl") is not None:
-            lines.append(f"Realized PnL: {e['pnl']:+.3f} SOL")
-        if e.get("time"):
-            lines.append(f"Seen on-chain {_ago(e['time'])}; you will be later than this")
-        lines += [f"Tx: https://solscan.io/tx/{e['sig']}", f"Token page: https://solscan.io/token/{e['mint']}",
-                  f"Chart: https://dexscreener.com/solana/{e['mint']}",
-                  "Wallet identity is NOT confirmed (third-party label). Not financial advice."]
+        links = [f"Pump.fun (chart + buy): https://pump.fun/coin/{mint}", f"Chart: https://dexscreener.com/solana/{mint}", f"Tx: https://solscan.io/tx/{e['sig']}"]
+        tail = "Wallet identity is NOT confirmed (third-party label). Not financial advice."
+        if sell:
+            sv = sell_view(e)
+            lines = [f"\U0001F534 EXIT SIGNAL: {sv['kind']} ({e['cls'].title()})", f"Coin: {coin}", f"Mint: {mint}",
+                     f"He sold ~{e['sol']:.3f} SOL" + (f" ({e['pct']:.0f}% of his position)" if e.get("pct") is not None else "")]
+            if sv["gain_pct"] is not None:
+                lines.append(f"His sale price vs his average cost: {sv['gain_pct']:+.1f}%")
+            if e.get("pnl") is not None:
+                lines.append(f"His result on this sale: {e['pnl']:+.3f} SOL")
+            lines += [f"\u26A1 {sv['action']} Do it fast: his selling pushes the price down.", *links, tail]
+            return "\n".join(lines)
+        ew = entry_window(e, now, self._price_now(mint, now), cfg, self._holding(mint))
+        size = position_size(cfg, cfg.bankroll_sol)
+        lines = [f"\U0001F7E2 {e['cls'].title()} by watched wallet", f"Coin: {coin}", f"Mint: {mint}",
+                 f"He paid ~{e['sol']:.3f} SOL" + (f" ({e['pct']:.0f}% of his position now)" if e.get("pct") is not None and e["cls"] != "BUY" else "")]
+        if ew["state"] == "OPEN":
+            until = datetime.fromtimestamp(ew["closes_at"], timezone.utc).strftime("%H:%M:%S")
+            lines.append(f"\u23F1 ENTRY WINDOW OPEN: {_dur(ew['seconds_left'])} left (closes {until} UTC)")
+        else:
+            lines.append(f"\u26D4 ENTRY CLOSED: {ew['reason']}")
+        if ew["price_known"]:
+            lines.append(f"Price vs his entry: {ew['move_pct']:+.1f}% (skip above +{cfg.max_chase_pct:g}%)")
+        if ew["state"] == "OPEN":
+            lines.append(f"Your buy size: ~{size:g} SOL" if size else f"Your buy size: bankroll x {cfg.risk_pct / cfg.stop_pct:.1%} (max {cfg.max_position_sol:g} SOL)")
+            lines.append(f"Exit: stop -{cfg.stop_pct:g}% | sell half +{cfg.tp1_pct:g}% | rest +{cfg.tp2_pct:g}% | sell when he sells | out after {cfg.time_stop_min}m")
+        lines += [*links, tail]
         return "\n".join(lines)
 
     async def flush_alerts(self) -> None:
         """Send queued alerts oldest first to every subscriber. If nobody received one (network down), it stays queued for the next cycle."""
         while self.outbox:
-            ok, gone, failed = await self.hub.broadcast(self.format_alert(self.outbox[0]))
+            e = self.outbox[0]
+            try:
+                await asyncio.wait_for(self.refresh_market([e["mint"]]), timeout=8)   # fresh price and coin name for the message
+            except Exception:
+                pass
+            ok, gone, failed = await self.hub.broadcast(self.format_alert(e))
             if ok == 0 and failed > 0:
                 self.alert_error = self.hub.error or "could not reach Telegram"
                 return
@@ -2118,6 +2393,13 @@ class Tracker:
             except Exception as exc:   # never let one bad poll stop tracking; never echo the RPC URL (holds the API key)
                 status = getattr(exc, "status", None) or getattr(getattr(exc, "response", None), "status_code", None)
                 self.last_error = redact_text(f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "") + f": {exc}", self.rpc_url)[:200]
+            try:   # price + coin name for recent buys and open positions (the entry window and the dashboard use it)
+                now = time.time()
+                recent = [e["mint"] for e in self.events if e["cls"] in ("BUY", "ADDITIONAL BUY") and now - (e["time"] or 0) < 7200][:3]
+                held = [p.mint for p in self.ledger.open.values() if p.qty > EPS and (p.buys or p.sells)][:3]
+                await self.refresh_market(recent + held)
+            except Exception:
+                pass
             if self.alerts_enabled:
                 try:
                     await self.flush_alerts()
@@ -2169,6 +2451,10 @@ class Tracker:
                 self.lookback.update(state="error", error=redact_text(f"{type(exc).__name__}: {exc}", self.rpc_url)[:150])
                 await asyncio.sleep(600)
 
+    def _hold_stats(self) -> dict:
+        secs = sorted(p.closed_at - p.opened_at for p in self.ledger.closed if p.opened_at and p.closed_at and p.closed_at >= p.opened_at)
+        return {"n": len(secs), "median_s": secs[len(secs) // 2] if secs else None}
+
     def snapshot(self) -> dict:
         held = [asdict(p) for p in self.ledger.open.values() if p.qty > EPS]
         opens = [p for p in held if p["buys"] or p["sells"]]   # real positions only: tokens that merely arrived by transfer (airdrops/spam) are not positions
@@ -2179,7 +2465,7 @@ class Tracker:
                 "foreign": self.foreign, "signed": self.signed, "signer_unknown": self.signer_unknown,
                 "reason_codes": self.reason_codes.most_common(8), "kinds": dict(self.kinds), "reasons": self.reasons.most_common(5), "newest": self.newest,
                 "oldest": self.oldest, "last_trade": self.last_trade, "events": self.events[:40], "open": opens[:20],
-                "transfer_only": transfer_only, "lookback": dict(self.lookback), "alerts_on": self.alerts_enabled, "alerts_sent": self.alerts_sent, "alert_error": self.alert_error or self.hub.error or self.hub.persist_error,
+                "transfer_only": transfer_only, "lookback": dict(self.lookback), "market": {k: dict(v) for k, v in self.market.items()}, "playbook": asdict(self.playbook), "hold": self._hold_stats(), "alerts_on": self.alerts_enabled, "alerts_sent": self.alerts_sent, "alert_error": self.alert_error or self.hub.error or self.hub.persist_error,
                 "subscribers": len(self.hub.recipients()), "join_link": self.hub.join_link(), "subs_persistent": self.hub.persistent, "subs_store": self.hub.store_kind, "closed": len(self.ledger.closed), "closed_pnl": sum(p.realized_pnl_sol for p in self.ledger.closed if p.complete)}
 
 
@@ -2201,6 +2487,37 @@ def dashboard_payload(s: dict | None, rec: "WalletRecord", now: float | None = N
     lb = s.get("lookback") or {"state": "off"}
     found = lb.get("found") or None
     last_trade = max(s["last_trade"] or 0, (found or {}).get("time") or 0) or None   # live feed OR the history lookup, whichever is newer
+    cfg = PlaybookConfig(**s["playbook"]) if s.get("playbook") else PlaybookConfig()
+    market = s.get("market") or {}
+    held = {p["mint"] for p in s["open"]}
+
+    def price_of(mint):
+        m = market.get(mint)
+        return m["price"] if m and now - m["t"] < 120 else None
+    events, now_card, open_entry, exit_cards = [], None, set(), []
+    for x in [x for x in s["events"] if x["cls"] != "TRANSFER"][:30]:
+        y, m = dict(x), market.get(x["mint"]) or {}
+        y["symbol"], y["name"] = m.get("symbol", ""), m.get("name", "")
+        if "SELL" in x["cls"]:
+            y["exit"] = sv = sell_view(x)
+            if now - (x["time"] or 0) <= 60 * _f("CUPSEY_EXIT_SIGNAL_MINUTES", 15):
+                exit_cards.append({"mint": x["mint"], "symbol": y["symbol"], "name": y["name"], "cls": x["cls"], "sol": x["sol"], "time": x["time"], "pnl": x.get("pnl"), **sv})
+        if x["cls"] in ("BUY", "ADDITIONAL BUY"):
+            y["entry"] = ew = entry_window(x, now, price_of(x["mint"]), cfg, x["mint"] in held)
+            if ew["state"] == "OPEN":
+                open_entry.add(x["mint"])
+                if now_card is None:   # newest open window first
+                    now_card = {"mint": x["mint"], "symbol": y["symbol"], "name": y["name"], "cls": x["cls"], "sol": x["sol"], "time": x["time"], "entry": ew,
+                                "plan": plan_rows(cfg, x.get("price")), "size": position_size(cfg, cfg.bankroll_sol)}
+        events.append(y)
+    opens = []
+    for p in s["open"]:
+        q, m = dict(p), market.get(p["mint"]) or {}
+        q["symbol"], q["name"] = m.get("symbol", ""), m.get("name", "")
+        q["avg_price"] = (p["cost_sol"] / p["qty"]) if p.get("qty") and p["qty"] > 0 and p.get("cost_sol") else None
+        q["price_now"] = price_of(p["mint"])
+        q["entry_open"] = p["mint"] in open_entry
+        opens.append(q)
     return {"running": True, "now": now, "wallet": wallet,
             "live": bool(s["last_ok"]) and now - s["last_ok"] < s["interval"] * 4 + 30,
             "alerts": {"on": s.get("alerts_on", False), "sent": s.get("alerts_sent", 0), "error": s.get("alert_error", ""), "subscribers": s.get("subscribers", 0),
@@ -2210,7 +2527,8 @@ def dashboard_payload(s: dict | None, rec: "WalletRecord", now: float | None = N
                       "foreign": s["foreign"], "signer_unknown": s.get("signer_unknown", 0), "last_trade": last_trade, "last_trade_found": found,
                       "lookback": {"state": lb.get("state"), "scanned": lb.get("scanned", 0), "oldest": lb.get("oldest"), "error": lb.get("error", "")}, "newest": s["newest"],
                       "transfer_only": s.get("transfer_only", 0), "closed": s["closed"], "closed_pnl": s["closed_pnl"], "reason_codes": s.get("reason_codes", [])},
-            "open": s["open"], "events": [x for x in s["events"] if x["cls"] != "TRANSFER"][:30]}
+            "open": opens, "events": events, "now_card": now_card, "exit_cards": exit_cards[:3],
+            "playbook": {"cfg": asdict(cfg), "plan": plan_rows(cfg), "sizes": size_table(cfg), "size": position_size(cfg, cfg.bankroll_sol), "hold": s.get("hold") or {}}}
 
 
 def render_live(s: dict | None, rec: "WalletRecord") -> str:
