@@ -2089,7 +2089,7 @@ async def require_dashboard_auth(request: Request) -> None:
             pass
     accept = request.headers.get("accept", "")
     is_browser = "text/html" in accept or "sec-fetch-dest" in request.headers
-    if is_browser and "text/html" in accept and request.url.path.rstrip("/") in ("/dashboard", "/cupsey"):
+    if is_browser and "text/html" in accept and request.url.path.rstrip("/") in ("/dashboard", "/cupsey", "/forex"):
         raise HTTPException(status_code=303, detail="Sign in required", headers={"Location": "/login"})
     if is_browser:   # a background fetch from the page: plain 401 so the browser never shows its own ugly popup
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -2353,6 +2353,7 @@ svg{display:block}
 .dot.warn{background:var(--amber)}.dot.bad{background:var(--red)}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.6)}70%{box-shadow:0 0 0 8px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
 .page{max-width:1080px;margin:0 auto;padding:6px 16px calc(130px + env(safe-area-inset-bottom))}
+.modesw{display:flex;gap:4px;max-width:1048px;margin:0 16px 8px;padding:4px;border-radius:999px;background:rgba(128,128,128,.16)}@media(min-width:1112px){.modesw{margin-left:auto;margin-right:auto}}.modesw a{flex:1;text-align:center;padding:9px;border-radius:999px;color:var(--mute);font-weight:700}.modesw a.on{background:var(--text);color:var(--bg)}
 #banner{display:none;max-width:1048px;margin:4px 16px 0;padding:11px 16px;border-radius:20px;background:rgba(255,93,115,.16);border:1px solid rgba(255,93,115,.45);color:var(--red);font-size:13px;-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px)}
 @media(min-width:1112px){#banner{margin-left:auto;margin-right:auto}}
 
@@ -2566,6 +2567,7 @@ footer{max-width:1080px;margin:0 auto;padding:0 20px 24px;color:var(--dim);font-
         <a class="ibtn" href="/logout" aria-label="Sign out" id="outbtn"></a>
       </div>
     </div></header>
+    <div class="modesw"><a class="on" href="/dashboard">Memecoin</a><a href="/forex">Forex</a></div>
     <div id="banner"></div>
     <main class="page" id="app"></main>
     <footer>Detection and analysis only. Nothing here is financial advice or a guarantee that a token is safe. Missing data is never counted as a pass.</footer>
@@ -4164,6 +4166,17 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         log.info("cupsey.py not found; Cupsey routes disabled")
     except Exception as exc:
         log.error("cupsey routes failed to load", extra={"error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+
+    # Forex signals add-on (forex.py). Optional: if the file is missing or fails, the rest of the app is unaffected.
+    try:
+        from forex import register_forex_routes
+        register_forex_routes(app, require_dashboard_auth)
+    except ModuleNotFoundError as exc:
+        if exc.name != "forex":
+            raise
+        log.info("forex.py not found; forex routes disabled")
+    except Exception as exc:
+        log.error("forex routes failed to load", extra={"error": f"{type(exc).__name__}: {str(exc)[:200]}"})
 
     return app
 
