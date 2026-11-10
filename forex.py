@@ -22,6 +22,7 @@ import asyncio
 import html
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -134,7 +135,7 @@ def trigger(cs: list[Candle], ind: Indicators, i: int) -> str | None:
 # SIZING
 # ============================================================================
 def contract_size(pair: str) -> float:
-    return 100.0 if pair.startswith("XAU/") else 100000.0
+    return 100.0 if pair.startswith("XAU/") else 5000.0 if pair.startswith("XAG/") else 100000.0
 
 
 def lots_for_risk(pair: str, price: float, stop_distance: float, risk_usd: float) -> float | None:
@@ -151,7 +152,7 @@ def lots_for_risk(pair: str, price: float, stop_distance: float, risk_usd: float
 
 
 def decimals(pair: str) -> int:
-    return 2 if pair.startswith("XAU/") else 3 if pair.endswith("/JPY") else 5
+    return 2 if pair.startswith("XAU/") else 3 if pair.startswith("XAG/") or pair.endswith("/JPY") else 5
 
 
 # ============================================================================
@@ -190,6 +191,23 @@ def closed_only(cs: list[Candle], now: datetime) -> list[Candle]:
     return cs
 
 
+def watch_reason(ind: Indicators, i: int) -> str:
+    """Plain-words status for a pair with no entry: what the bot is waiting for."""
+    e50, e200, e200p, r = ind.e50[i], ind.e200[i], ind.e200[i - 10] if i >= 10 else None, ind.rsi[i]
+    if None in (e50, e200, e200p, r):
+        return "no setup right now: still collecting enough candles."
+    recent = [x for x in ind.rsi[max(0, i - 6):i] if x is not None] + [r]
+    if e50 > e200 and e200 > e200p:
+        if min(recent) <= 40:
+            return f"Uptrend. Price pulled back (RSI {min(recent):.0f}). Waiting for a green candle back above the 20 average, then it says ENTER BUY."
+        return f"Uptrend. Waiting for a pullback (RSI {r:.0f}; it needs to dip to 40 or lower first)."
+    if e50 < e200 and e200 < e200p:
+        if max(recent) >= 60:
+            return f"Downtrend. Price bounced up (RSI {max(recent):.0f}). Waiting for a red candle back below the 20 average, then it says ENTER SELL."
+        return f"Downtrend. Waiting for a bounce up (RSI {r:.0f}; it needs to rise to 60 or more first)."
+    return "No clear trend right now, so nothing to trade."
+
+
 def evaluate(pair: str, cs: list[Candle], now: datetime, account_usd: float = 100.0, risk_pct: float = 1.0) -> tuple[Signal, list[tuple]]:
     """Returns (current Signal, list of setups that formed in the last few candles as (side, formed_time, entry, stop, target)).
     The second list feeds the paper record so a setup is recorded even if you never open the page."""
@@ -210,7 +228,7 @@ def evaluate(pair: str, cs: list[Candle], now: datetime, account_usd: float = 10
             e = cs[i].c
             stop, tgt = (e - d, e + TARGET_R * d) if side == "BUY" else (e + d, e - TARGET_R * d)
             found.append((side, cs[i].t + timedelta(minutes=INTERVAL_MIN), e, stop, tgt, i, a))
-    base = Signal(pair, "WAIT", "no setup right now: waiting for a trend, a pullback, then the trend to resume.", price=price, atr=a_now)
+    base = Signal(pair, "WAIT", watch_reason(ind, n - 1), price=price, atr=a_now)
     live = [f for f in found if f[5] >= n - MAX_SIGNAL_AGE]
     records = [(f[0], f[1], f[2], f[3], f[4]) for f in found]
     if not live:
@@ -309,10 +327,41 @@ def parse_twelvedata(payload: dict) -> list[Candle]:
     return out
 
 
+PAIR_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}$")
+STREAM_FRESH = 45.0        # seconds: no price for this long and the stream counts as down
+MAX_PAIRS_DEFAULT = 6
+
+
+def clean_pairs(items, limit: int) -> list[str]:
+    out: list[str] = []
+    for x in items or []:
+        p = str(x).strip().upper()
+        if PAIR_RE.match(p) and p not in out:
+            out.append(p)
+    return out[:limit]
+
+
+def floor_candle(now: datetime) -> datetime:
+    return now.replace(minute=now.minute - now.minute % INTERVAL_MIN, second=0, microsecond=0)
+
+
+def is_stale(cs: list[Candle], now: datetime) -> bool:
+    """True when the newest CLOSED candle is the one before the one we expect, i.e. the provider has not published the just-closed candle yet."""
+    closed = closed_only(cs, now)
+    if not closed:
+        return False
+    expected = floor_candle(now) - timedelta(minutes=INTERVAL_MIN)
+    return expected - timedelta(minutes=2 * INTERVAL_MIN) <= closed[-1].t < expected     # older than that = market break, not a late candle
+
+
 class ForexTracker:
-    def __init__(self, pairs: list[str], api_key: str, account_usd: float = 100.0, risk_pct: float = 1.0) -> None:
-        self.pairs, self.api_key = pairs, api_key
+    def __init__(self, pairs: list[str], api_key: str, account_usd: float = 100.0, risk_pct: float = 1.0,
+                 max_pairs: int = MAX_PAIRS_DEFAULT, poll_seconds: float = 60.0) -> None:
+        self.api_key = api_key
+        self.max_pairs = max(1, max_pairs)
+        self.pairs = clean_pairs(pairs, self.max_pairs)
         self.account_usd, self.risk_pct = account_usd, risk_pct
+        self.poll_seconds = max(15.0, poll_seconds)
         self.signals: dict[str, Signal] = {}
         self.book = PaperBook()
         self.candles: dict[str, list[Candle]] = {}
@@ -320,7 +369,19 @@ class ForexTracker:
         self.last_cycle: float | None = None
         self.started = time.time()
         self.client = None
+        self.rev = 0                                   # goes up whenever anything the page shows changes
+        self._keys: dict[str, tuple] = {}
+        self.wake = asyncio.Event()                    # set when new pairs need their first download
+        self.ticks: dict[str, tuple[float, float]] = {}   # pair -> (price, time received)
+        self.forming: dict[str, list] = {}             # pair -> [candle open epoch, o, h, l, c] built from live prices
+        self.last_stream_tick = 0.0
+        self.last_poll_tick = 0.0
+        self.stream_error = ""
+        self.outbox: list[dict] = []                   # messages to send on the live connection (subscribe / unsubscribe)
+        self.viewer_ts = 0.0                           # last time the page asked for live data
+        self.viewer_pair = ""
 
+    # ---- candles + signals
     def process(self, pair: str, cs: list[Candle], now: datetime) -> Signal:
         sig, records = evaluate(pair, cs, now, self.account_usd, self.risk_pct)
         self.candles[pair] = closed_only(cs, now)
@@ -328,6 +389,11 @@ class ForexTracker:
             self.book.add(pair, rec)
         self.book.update(pair, cs, now)
         self.signals[pair] = sig
+        c = self.candles[pair]
+        key = (sig.state, sig.formed, len(c), c[-1].t if c else None)
+        if self._keys.get(pair) != key:
+            self._keys[pair] = key
+            self.rev += 1
         return sig
 
     async def fetch(self, pair: str) -> list[Candle]:
@@ -336,17 +402,27 @@ class ForexTracker:
         r.raise_for_status()
         return parse_twelvedata(r.json())
 
-    async def cycle(self) -> None:
+    async def cycle(self, targets: list[str] | None = None) -> list[str]:
+        """Download candles for the pairs and re-check them. Returns the pairs whose newest candle was not published yet (retry soon)."""
         now = datetime.now(UTC)
         if market_closed(now):
+            changed = False
             for p in self.pairs:
+                if not self.signals.get(p) or self.signals[p].state != "CLOSED":
+                    changed = True
                 self.signals[p] = Signal(p, "CLOSED", "the forex market is closed for the weekend. It reopens Sunday 22:00 UTC.")
+            if changed:
+                self.rev += 1
             self.last_cycle = time.time()
-            return
-        for p in self.pairs:
+            return []
+        stale: list[str] = []
+        for p in (self.pairs if targets is None else [t for t in targets if t in self.pairs]):
             try:
-                self.process(p, await self.fetch(p), datetime.now(UTC))
+                cs = await self.fetch(p)
+                self.process(p, cs, datetime.now(UTC))
                 self.errors.pop(p, None)
+                if is_stale(cs, datetime.now(UTC)):
+                    stale.append(p)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -354,27 +430,200 @@ class ForexTracker:
                 self.errors[p] = (f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "") + f": {exc}")[:200].replace(self.api_key, "<key>")
             await asyncio.sleep(1.5)   # stay under the provider's per-minute limit
         self.last_cycle = time.time()
+        return stale
 
     @staticmethod
     def seconds_to_next_candle(now: datetime | None = None) -> float:
         now = now or datetime.now(UTC)
         mins = INTERVAL_MIN - (now.minute % INTERVAL_MIN)
-        nxt = (now.replace(second=0, microsecond=0) + timedelta(minutes=mins)) + timedelta(seconds=20)
+        nxt = (now.replace(second=0, microsecond=0) + timedelta(minutes=mins)) + timedelta(seconds=6)
         return max(5.0, (nxt - now).total_seconds())
+
+    # ---- the watch list (changed from the drawer on the page)
+    def set_pairs(self, items) -> list[str]:
+        new = clean_pairs(items, self.max_pairs)
+        if not new:
+            return list(self.pairs)
+        added = [p for p in new if p not in self.pairs]
+        removed = [p for p in self.pairs if p not in new]
+        self.pairs = new
+        for p in removed:
+            for d in (self.signals, self.candles, self.errors, self.ticks, self.forming, self._keys):
+                d.pop(p, None)
+        if removed:
+            self.outbox.append({"action": "unsubscribe", "params": {"symbols": ",".join(removed)}})
+        if added:
+            self.outbox.append({"action": "subscribe", "params": {"symbols": ",".join(added)}})
+            self.wake.set()
+        if added or removed:
+            self.rev += 1
+        return list(self.pairs)
+
+    # ---- live prices
+    def on_tick(self, pair: str, price: float, ts: float | None = None, source: str = "stream") -> None:
+        now = time.time()
+        ts = ts if ts and abs(ts - now) < 3600 else now
+        if pair not in self.pairs or not price or price <= 0:
+            return
+        self.ticks[pair] = (price, now)
+        if source == "stream":
+            self.last_stream_tick = now
+        else:
+            self.last_poll_tick = now
+        bucket = int(ts // (INTERVAL_MIN * 60) * (INTERVAL_MIN * 60))
+        fc = self.forming.get(pair)
+        if fc is None or fc[0] != bucket:
+            prev = fc[4] if fc else None
+            if prev is None:
+                last = self.candles.get(pair)
+                prev = last[-1].c if last and int(last[-1].t.timestamp()) == bucket - INTERVAL_MIN * 60 else price
+            self.forming[pair] = [bucket, prev, max(prev, price), min(prev, price), price]
+        else:
+            fc[2] = max(fc[2], price)
+            fc[3] = min(fc[3], price)
+            fc[4] = price
+
+    def on_message(self, raw) -> None:
+        try:
+            m = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(m, dict):
+            return
+        ev = m.get("event")
+        if ev == "price":
+            try:
+                self.on_tick(str(m.get("symbol", "")).upper(), float(m.get("price")), float(m.get("timestamp") or 0) or None)
+            except (TypeError, ValueError):
+                pass
+        elif ev == "subscribe-status":
+            fails = m.get("fails") or []
+            if fails:
+                names = ", ".join(str(f.get("symbol", f) if isinstance(f, dict) else f) for f in fails)[:120]
+                self.stream_error = f"live prices not available for: {names}"
+            elif m.get("success"):
+                self.stream_error = ""
+        elif ev == "error" or m.get("status") == "error":
+            self.stream_error = str(m.get("message") or "live stream error")[:150].replace(self.api_key, "<key>")
+
+    def stream_alive(self) -> bool:
+        return time.time() - self.last_stream_tick < STREAM_FRESH
+
+    def live_mode(self) -> str:
+        if market_closed(datetime.now(UTC)):
+            return "closed"
+        if self.stream_alive():
+            return "stream"
+        if time.time() - self.last_poll_tick < self.poll_seconds * 3:
+            return "poll"
+        return "delayed"
+
+    async def run_stream(self) -> None:
+        """Live prices over a websocket. Reconnects by itself. If streaming is not allowed on your plan, run_poll covers the page you are looking at."""
+        streak = 0
+        while True:
+            try:
+                if market_closed(datetime.now(UTC)):
+                    await asyncio.sleep(300)
+                    continue
+                import websockets
+                url = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={self.api_key}"
+                async with websockets.connect(url, open_timeout=15, max_size=2 ** 20) as ws:
+                    await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": ",".join(self.pairs)}}))
+                    self.outbox.clear()
+
+                    async def pump() -> None:
+                        n = 0
+                        while True:
+                            await asyncio.sleep(1)
+                            n += 1
+                            while self.outbox:
+                                await ws.send(json.dumps(self.outbox.pop(0)))
+                            if n % 10 == 0:
+                                await ws.send('{"action":"heartbeat"}')
+                    task = asyncio.create_task(pump())
+                    try:
+                        async for raw in ws:
+                            self.on_message(raw)
+                            streak = 0
+                    finally:
+                        task.cancel()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.stream_error = (f"{type(exc).__name__}: {exc}")[:150].replace(self.api_key, "<key>")
+            streak += 1
+            await asyncio.sleep(min(60.0, 4.0 * streak))
+
+    async def run_poll(self) -> None:
+        """Fallback when the stream is down: ask for the price of the pair you are looking at, about once a minute, only while the page is open."""
+        while True:
+            await asyncio.sleep(self.poll_seconds)
+            try:
+                if (self.client is None or market_closed(datetime.now(UTC)) or self.stream_alive()
+                        or time.time() - self.viewer_ts > 90 or self.viewer_pair not in self.pairs):
+                    continue
+                r = await self.client.get("https://api.twelvedata.com/price", params={"symbol": self.viewer_pair, "apikey": self.api_key})
+                data = r.json()
+                if isinstance(data, dict) and "price" in data:
+                    self.on_tick(self.viewer_pair, float(data["price"]), source="poll")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
     async def run(self) -> None:
         import httpx
         async with httpx.AsyncClient(timeout=25) as c:
             self.client = c
-            while True:
-                try:
-                    await self.cycle()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-                await asyncio.sleep(self.seconds_to_next_candle())
+            side = [asyncio.create_task(self.run_stream()), asyncio.create_task(self.run_poll())]
+            try:
+                targets: list[str] | None = None
+                retries = 0
+                while True:
+                    try:
+                        stale = await self.cycle(targets)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        stale = []
+                    if stale and retries < 6:      # the just-closed candle is not published yet: ask again in 10 seconds
+                        retries += 1
+                        targets, wait = stale, 10.0
+                    else:
+                        retries, targets, wait = 0, None, self.seconds_to_next_candle()
+                    try:
+                        await asyncio.wait_for(self.wake.wait(), timeout=wait)
+                        self.wake.clear()
+                        targets = [p for p in self.pairs if p not in self.candles]    # only the newly added pairs
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                for t in side:
+                    t.cancel()
+                await asyncio.gather(*side, return_exceptions=True)
 
+    def live_payload(self, pair: str | None = None) -> dict:
+        now = time.time()
+        if pair and pair in self.pairs:
+            self.viewer_ts, self.viewer_pair = now, pair
+        quotes = {}
+        for p in self.pairs:
+            cs = self.candles.get(p) or []
+            t = self.ticks.get(p)
+            price = t[0] if t and now - t[1] < 300 else (cs[-1].c if cs else None)
+            ref = cs[-97].c if len(cs) >= 97 else (cs[0].c if cs else None)      # about 24 hours ago
+            sig = self.signals.get(p)
+            quotes[p] = {"p": price, "chg": ((price / ref - 1) * 100) if price and ref else None,
+                         "state": sig.state if sig else "starting", "live": bool(t and now - t[1] < 60), "err": self.errors.get(p)}
+        candle = None
+        fc = self.forming.get(pair) if pair else None
+        if fc:
+            cs = self.candles.get(pair) or []
+            last_open = int(cs[-1].t.timestamp()) if cs else 0
+            if fc[0] > last_open and fc[0] >= int(now // (INTERVAL_MIN * 60) * (INTERVAL_MIN * 60)) - INTERVAL_MIN * 60:
+                candle = list(fc)
+        return {"now": int(now), "rev": self.rev, "mode": self.live_mode(), "quotes": quotes, "candle": candle, "stream_error": self.stream_error}
 
     def chart_payload(self, pair: str) -> dict:
         """Everything the chart needs for one pair, as plain JSON (times are epoch seconds, UTC)."""
@@ -385,13 +634,35 @@ class ForexTracker:
             live = {"side": sig.side, "entry": sig.entry, "stop": sig.stop, "target": sig.target, "formed": int(sig.formed.timestamp())}
         trades = [{"side": t.side, "t": int(t.opened.timestamp()), "entry": t.entry, "stop": t.stop, "target": t.target, "status": t.status}
                   for t in self.book.trades if t.pair == pair][-40:]
-        return {"pair": pair, "dp": decimals(pair), "state": sig.state if sig else "starting", "version": int(self.last_cycle or 0),
+        return {"pair": pair, "dp": decimals(pair), "state": sig.state if sig else "starting", "version": self.rev,
                 "candles": [[int(c.t.timestamp()), c.o, c.h, c.l, c.c] for c in cs], "signal": live, "trades": trades}
+
+
+    def health(self) -> dict:
+        """Status for the dashboard's System health screen."""
+        iso = lambda ts: datetime.fromtimestamp(ts, UTC).isoformat() if ts else None
+        return {"mode": self.live_mode(), "pairs": list(self.pairs), "last_check_at": iso(self.last_cycle), "started_at": iso(self.started),
+                "last_price_at": iso(max(self.last_stream_tick, self.last_poll_tick)), "stream_error": self.stream_error,
+                "errors": dict(self.errors), "entries_now": [p for p in self.pairs if self.signals.get(p) and self.signals[p].state.startswith("ENTER")],
+                "paper": self.book.stats(), "candles": {p: len(self.candles.get(p, [])) for p in self.pairs}}
 
     def snapshot(self) -> dict:
         return {"pairs": [{"pair": p, "signal": self.signals.get(p), "error": self.errors.get(p)} for p in self.pairs],
-                "stats": self.book.stats(), "trades": list(reversed(self.book.trades[-15:])), "last_cycle": self.last_cycle,
-                "started": self.started, "account": self.account_usd, "risk_pct": self.risk_pct}
+                "stats": self.book.stats(), "trades": list(reversed(self.book.trades[-15:])), "last_cycle": self.last_cycle, "rev": self.rev,
+                "started": self.started, "account": self.account_usd, "risk_pct": self.risk_pct, "max": self.max_pairs}
+
+
+class ForexHealth:
+    """Small object kept on app.state.forex so the System health screen can report on the forex add-on."""
+
+    def __init__(self, tracker: "ForexTracker | None", key_set: bool) -> None:
+        self.tracker, self.key_set = tracker, key_set
+
+    def health(self) -> dict:
+        out = {"enabled": True, "key_set": self.key_set}
+        if self.tracker:
+            out.update(self.tracker.health())
+        return out
 
 
 # ============================================================================
@@ -437,16 +708,23 @@ var TFNAME = {15: "M15", 60: "H1", 240: "H4"};
 
 function createChart(canvas, theme) {
   var ctx = canvas.getContext("2d");
-  var S = {data: null, tf: 15, n: 80, off: -6, ema: true, cross: null, W: 320, H: 420, dpr: 1};
+  var S = {data: null, live: null, pair: "", tf: 15, n: 80, off: -6, ema: true, cross: null, W: 320, H: 420, dpr: 1};
   var cs = [], e20 = [], e50 = [], e200 = [], idx = {};
   var PAD = {l: 6, r: 66, t: 46, b: 24}, DEFOFF = -6;   // a few empty candles on the right, like MT5
 
+  function baseCandles() {
+    var base = S.data ? S.data.candles : [], lv = S.live;
+    if (lv && base.length && lv[0] > base[base.length - 1][0]) return base.concat([lv]);   // the still-forming candle, built from live prices
+    return base;
+  }
   function rebuild() {
-    cs = S.data ? aggregate(S.data.candles, S.tf) : [];
+    var before = cs.length;
+    cs = S.data ? aggregate(baseCandles(), S.tf) : [];
     var cl = cs.map(function (c) { return c[4]; });
     e20 = ema(cl, 20); e50 = ema(cl, 50); e200 = ema(cl, 200);
     idx = {};
     cs.forEach(function (c, i) { idx[c[0]] = i; });
+    if (before > 0 && cs.length > before && S.off > 0) S.off += cs.length - before;   // scrolled back in time: do not let new candles push the view
     clamp();
   }
   function clamp() {
@@ -660,7 +938,11 @@ function createChart(canvas, theme) {
   else if (typeof window !== "undefined") window.addEventListener("resize", resize);
 
   return {
-    setData: function (d) { S.data = d; rebuild(); draw(); },
+    setData: function (d) {
+      if (d.pair !== S.pair) { S.pair = d.pair; S.live = null; S.off = DEFOFF; cs = []; }
+      S.data = d; rebuild(); draw();
+    },
+    setLive: function (c) { S.live = c; rebuild(); draw(); },
     setTf: function (m) { S.tf = m; S.off = DEFOFF; S.n = m === 15 ? 80 : m === 60 ? 70 : 40; S.cross = null; rebuild(); draw(); },
     setEma: function (on) { S.ema = on; draw(); },
     reset: function () { S.n = S.tf === 15 ? 80 : S.tf === 60 ? 70 : 40; S.off = DEFOFF; S.cross = null; clamp(); draw(); },
@@ -674,69 +956,236 @@ if (typeof window !== "undefined") window.FxChart = api;
 if (typeof module !== "undefined") module.exports = api;
 
 // ---- page glue (only runs on the real page)
+var CAT = [["EUR/USD", "Euro vs US Dollar"], ["GBP/USD", "British Pound vs US Dollar"], ["USD/JPY", "US Dollar vs Japanese Yen"], ["USD/CHF", "US Dollar vs Swiss Franc"],
+  ["AUD/USD", "Australian Dollar vs US Dollar"], ["USD/CAD", "US Dollar vs Canadian Dollar"], ["NZD/USD", "New Zealand Dollar vs US Dollar"], ["EUR/GBP", "Euro vs British Pound"],
+  ["EUR/JPY", "Euro vs Japanese Yen"], ["GBP/JPY", "British Pound vs Japanese Yen"], ["AUD/JPY", "Australian Dollar vs Japanese Yen"], ["EUR/AUD", "Euro vs Australian Dollar"],
+  ["EUR/CHF", "Euro vs Swiss Franc"], ["GBP/CHF", "British Pound vs Swiss Franc"], ["CAD/JPY", "Canadian Dollar vs Japanese Yen"], ["XAU/USD", "Gold vs US Dollar"], ["XAG/USD", "Silver vs US Dollar"]];
+function descOf(p) { for (var i = 0; i < CAT.length; i++) if (CAT[i][0] === p) return CAT[i][1]; return "Custom symbol"; }
+function dpOf(p) { return p.indexOf("XAU/") === 0 ? 2 : p.indexOf("XAG/") === 0 ? 3 : /\/JPY$/.test(p) ? 3 : 5; }
+
 function boot() {
-  var FX = window.FX_BOOT, el = function (id) { return document.getElementById(id); };
+  var FX = window.FX_BOOT, doc = document, el = function (id) { return doc.getElementById(id); };
   var canvas = el("fxc");
   if (!FX || !canvas) return;
   function theme() {
-    var s = getComputedStyle(document.documentElement);
+    var s = getComputedStyle(doc.documentElement);
     function v(n, d) { return (s.getPropertyValue(n) || "").trim() || d; }
-    return {bg: v("--card", "#17181a"), fg: v("--fg", "#f2f2f2"), mute: v("--mute", "#9a9aa0"), line: v("--line", "#2a2c30"), up: v("--ok", "#3ecf8e"), down: v("--bad", "#ff6b6b"), blue: "#4da3ff"};
+    return {bg: v("--chartbg", "#0b0e13"), fg: v("--text", "#f2f2f2"), mute: v("--mute", "#9a9aa0"), line: v("--line", "#2a2c30"), up: v("--green", "#3ecf8e"), down: v("--red", "#ff6b6b"), blue: "#4da3ff"};
   }
-  var store = { get: function (k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }, set: function (k, v) { try { sessionStorage.setItem(k, v); } catch (e) { /* ignore */ } } };
+  function mkStore(kind) {
+    return {get: function (k) { try { return window[kind].getItem(k); } catch (e) { return null; } }, set: function (k, v) { try { window[kind].setItem(k, v); } catch (e) { /* ignore */ } }, del: function (k) { try { window[kind].removeItem(k); } catch (e) { /* ignore */ } }};
+  }
+  var ss = mkStore("sessionStorage"), ls = mkStore("localStorage");
   var chart = createChart(canvas, theme);
-  var pair = store.get("fxpair"), tf = parseInt(store.get("fxtf") || "15", 10), emaOn = store.get("fxema") !== "0";
-  if (FX.pairs.indexOf(pair) < 0) pair = FX.first;
+  var wl = FX.pairs.slice(), quotes = {}, mode = "starting", prevStates = null, dirty = false, busy = false, actx = null;
+  var pair = ss.get("fxpair"), tf = parseInt(ss.get("fxtf") || "15", 10), emaOn = ss.get("fxema") !== "0";
+  if (wl.indexOf(pair) < 0) pair = FX.first;
   if ([15, 60, 240].indexOf(tf) < 0) tf = 15;
   chart.setTf(tf); chart.setEma(emaOn);
 
-  function chips(box, items, isOn, onPick) {
-    box.innerHTML = "";
-    items.forEach(function (it) {
-      var b = document.createElement("button");
-      b.type = "button"; b.className = "chip" + (isOn(it[0]) ? " on" : ""); b.textContent = it[1];
-      b.addEventListener("click", function () { onPick(it[0]); });
-      box.appendChild(b);
-    });
+  function mk(tag, cls, text) { var n = doc.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
+
+  // ---- alerts: banner, beep, vibration
+  function unlock() { try { var A = window.AudioContext || window.webkitAudioContext; if (A && !actx) actx = new A(); if (actx && actx.state === "suspended") actx.resume(); } catch (e) { /* ignore */ } }
+  doc.addEventListener("pointerdown", unlock, {passive: true});
+  function beep() {
+    if (!actx) return;
+    try { [0, 0.22].forEach(function (d) { var o = actx.createOscillator(), g = actx.createGain(); o.frequency.value = 880; g.gain.value = 0.15; o.connect(g); g.connect(actx.destination); o.start(actx.currentTime + d); o.stop(actx.currentTime + d + 0.16); }); } catch (e) { /* ignore */ }
   }
+  function showToast(text, p, st) {
+    var t = el("fxtoast");
+    t.textContent = text + "  (tap to view)"; t.className = "toast show " + (st.indexOf("SELL") >= 0 ? "sell" : "buy");
+    t.onclick = function () { t.className = "toast"; pick(p, true); };
+    setTimeout(function () { t.className = "toast"; }, 90000);
+  }
+  function newSignal(p, st) {
+    var text = st + " " + p;
+    showToast(text, p, st); beep();
+    if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200]); } catch (e) { /* ignore */ } }
+    doc.title = "(1) " + text;
+    ss.set("fxtoast", JSON.stringify({text: text, p: p, st: st, t: Date.now()}));   // survives the page reload that follows a new check
+  }
+  try { var st0 = JSON.parse(ss.get("fxtoast") || "null"); if (st0 && Date.now() - st0.t < 600000) { showToast(st0.text, st0.p, st0.st); doc.title = "(1) " + st0.text; } else ss.del("fxtoast"); } catch (e) { /* ignore */ }
+
+  // ---- live badge
+  function badge() {
+    var b = el("fxlive"), txt = "Starting", cls = "live";
+    if (mode === "stream") { txt = "LIVE"; cls = "live on"; }
+    else if (mode === "poll") { txt = "Live (every minute)"; cls = "live mid"; }
+    else if (mode === "closed") { txt = "Market closed"; }
+    else if (mode === "delayed") { txt = "Delayed (15 min)"; }
+    b.className = cls; b.textContent = "\u25CF " + txt;
+    var pd = el("fxpdot"), pt = el("fxptxt");   // the pill in the top bar
+    if (pd && pt) {
+      pd.className = "dot " + (mode === "stream" ? "ok" : mode === "poll" || mode === "delayed" ? "warn" : "");
+      pt.textContent = mode === "stream" ? "Live" : mode === "poll" ? "Live 1m" : mode === "delayed" ? "Delayed" : mode === "closed" ? "Closed" : "Forex";
+    }
+  }
+
+  // ---- toolbar
   function paint() {
-    chips(el("fxpairs"), FX.pairs.map(function (p) { return [p, p]; }), function (p) { return p === pair; }, function (p) { pick(p); });
-    chips(el("fxtfs"), [[15, "M15"], [60, "H1"], [240, "H4"]], function (m) { return m === tf; }, function (m) { tf = m; store.set("fxtf", String(m)); chart.setTf(m); paint(); });
-    var e = document.createElement("button");
-    e.type = "button"; e.className = "chip" + (emaOn ? " on" : ""); e.textContent = "EMA";
-    e.addEventListener("click", function () { emaOn = !emaOn; store.set("fxema", emaOn ? "1" : "0"); chart.setEma(emaOn); paint(); });
-    el("fxtfs").appendChild(e);
-    var r = document.createElement("button");
-    r.type = "button"; r.className = "chip"; r.textContent = "Reset view";
-    r.addEventListener("click", function () { chart.reset(); });
-    el("fxtfs").appendChild(r);
+    var bar = el("fxbar"); bar.innerHTML = "";
+    var s = mk("button", "chip big", pair + " \u25BE"); s.type = "button"; s.addEventListener("click", openDrawer); bar.appendChild(s);
+    var lb = mk("span", "live", ""); lb.id = "fxlive"; bar.appendChild(lb);
+    var tfs = el("fxtfs"); tfs.innerHTML = "";
+    [[15, "M15"], [60, "H1"], [240, "H4"]].forEach(function (it) {
+      var b = mk("button", "chip" + (it[0] === tf ? " on" : ""), it[1]); b.type = "button";
+      b.addEventListener("click", function () { tf = it[0]; ss.set("fxtf", String(tf)); chart.setTf(tf); paint(); });
+      tfs.appendChild(b);
+    });
+    var e = mk("button", "chip" + (emaOn ? " on" : ""), "EMA"); e.type = "button";
+    e.addEventListener("click", function () { emaOn = !emaOn; ss.set("fxema", emaOn ? "1" : "0"); chart.setEma(emaOn); paint(); });
+    tfs.appendChild(e);
+    var r = mk("button", "chip", "Reset view"); r.type = "button"; r.addEventListener("click", function () { chart.reset(); });
+    tfs.appendChild(r);
+    badge();
   }
+
+  // ---- symbols drawer (like MT5 Quotes)
+  var drawer = mk("div", "drawer"), dim = mk("div", "dim");
+  drawer.innerHTML = '<div class="grab"></div><div class="dh"><b>Symbols</b><button type="button" class="chip on" id="fxdone">Done</button></div>' +
+    '<input id="fxq" type="text" autocomplete="off" autocapitalize="characters" placeholder="Search, or type a symbol like GBP/JPY"><div id="fxlist"></div>';
+  doc.body.appendChild(dim); doc.body.appendChild(drawer);
+  function openDrawer() { unlock(); drawer.className = "drawer open"; dim.className = "dim open"; renderDrawer(); }
+  function closeDrawer() { drawer.className = "drawer"; dim.className = "dim"; if (dirty) location.reload(); }
+  dim.addEventListener("click", closeDrawer);
+  drawer.querySelector("#fxdone").addEventListener("click", closeDrawer);
+  drawer.querySelector("#fxq").addEventListener("input", renderDrawer);
+
+  function saveList(list) {
+    wl = list; ls.set("fxwl", JSON.stringify(list)); dirty = true;
+    postWatch(list).then(function (res) { if (res) { wl = res; ls.set("fxwl", JSON.stringify(res)); } renderDrawer(); });
+  }
+  function postWatch(list) {
+    return fetch("/forex/watch", {method: "POST", credentials: "same-origin", headers: {"Content-Type": "application/json", "X-Fx": "1"}, body: JSON.stringify({pairs: list})})
+      .then(function (r) { return r.ok ? r.json() : null; }).then(function (j) { return j ? j.pairs : null; }).catch(function () { return null; });
+  }
+  function fmt(p, x) { return x === null || x === undefined ? "-" : x.toFixed(dpOf(p)); }
+  function renderDrawer() {
+    var box = drawer.querySelector("#fxlist"), q = (drawer.querySelector("#fxq").value || "").trim().toUpperCase(), top = box.scrollTop;
+    box.innerHTML = "";
+    box.appendChild(mk("div", "sec", "Watching " + wl.length + " of " + FX.max));
+    wl.forEach(function (p) {
+      var qd = quotes[p] || {}, row = mk("div", "qrow"), left = mk("div", "ql"), right = mk("div", "qr");
+      left.appendChild(mk("b", "", p)); left.appendChild(mk("div", "sub", descOf(p)));
+      right.appendChild(mk("b", "", fmt(p, qd.p)));
+      right.appendChild(mk("div", "chg " + (qd.chg > 0 ? "buy" : qd.chg < 0 ? "sell" : ""), qd.chg === null || qd.chg === undefined ? "" : (qd.chg > 0 ? "+" : "") + qd.chg.toFixed(2) + "% 24h"));
+      var pill = mk("div", "pill" + (qd.state === "ENTER BUY" ? " buy" : qd.state === "ENTER SELL" ? " sell" : ""), qd.state === "ENTER BUY" || qd.state === "ENTER SELL" ? qd.state : "");
+      row.appendChild(left); row.appendChild(right); if (pill.textContent) row.appendChild(pill);
+      row.addEventListener("click", function () { closeDrawerKeep(); pick(p, false); });
+      if (wl.length > 1) {
+        var x = mk("button", "x", "\u00D7"); x.type = "button"; x.setAttribute("aria-label", "Remove " + p);
+        x.addEventListener("click", function (ev) { ev.stopPropagation(); if (pair === p) { /* keep chart on a pair that stays */ } saveList(wl.filter(function (w) { return w !== p; })); if (pair === p) { pair = wl[0]; ss.set("fxpair", pair); } });
+        row.appendChild(x);
+      }
+      box.appendChild(row);
+    });
+    box.appendChild(mk("div", "sec", "Add a symbol"));
+    var shown = 0;
+    CAT.forEach(function (c) {
+      if (wl.indexOf(c[0]) >= 0) return;
+      if (q && c[0].indexOf(q) < 0 && c[1].toUpperCase().indexOf(q) < 0) return;
+      shown++; box.appendChild(addRow(c[0], c[1]));
+    });
+    if (/^[A-Z]{3}\/[A-Z]{3}$/.test(q) && wl.indexOf(q) < 0 && !CAT.some(function (c) { return c[0] === q; })) box.appendChild(addRow(q, "Custom symbol (the data provider must support it)"));
+    else if (!shown) box.appendChild(mk("div", "sub", "Nothing matches. Type a symbol like GBP/JPY."));
+    box.appendChild(mk("div", "sub", wl.length + " symbols use about " + wl.length * 96 + " data requests a day. The free plan allows roughly 800, so keep it to " + FX.max + " or fewer."));
+    box.scrollTop = top;
+  }
+  function addRow(p, d) {
+    var row = mk("div", "qrow"), left = mk("div", "ql");
+    left.appendChild(mk("b", "", p)); left.appendChild(mk("div", "sub", d));
+    var b = mk("button", "chip", wl.length >= FX.max ? "Full" : "+ Add"); b.type = "button"; b.disabled = wl.length >= FX.max;
+    b.addEventListener("click", function () { saveList(wl.concat([p])); });
+    row.appendChild(left); row.appendChild(b); return row;
+  }
+  function closeDrawerKeep() { drawer.className = "drawer"; dim.className = "dim"; if (dirty) setTimeout(function () { location.reload(); }, 50); }
+
+  // ---- chart data (candles) + live loop
   function load() {
     fetch("/forex/data?pair=" + encodeURIComponent(pair), {cache: "no-store", credentials: "same-origin"}).then(function (r) {
       if (r.status === 401 || r.status === 303) { location.reload(); return null; }
-      return r.json();
+      return r.ok ? r.json() : null;
     }).then(function (d) {
       if (!d) return;
-      if (d.version !== FX.version) { location.reload(); return; }   // a new 15-minute check finished: reload the signal cards too
-      el("fxmsg").textContent = "Drag to move, pinch or scroll to zoom, tap for a crosshair, double-tap to reset. Times are UTC. Updates when each 15-minute candle closes.";
+      if (d.version !== FX.version) { location.reload(); return; }
+      el("fxmsg").textContent = "Drag to move, pinch or scroll to zoom, tap for a crosshair, double-tap to reset. Times are UTC. The last candle moves live.";
       chart.setData(d);
+      tick();
     }).catch(function () { el("fxmsg").textContent = "Chart data is not available right now. It will retry."; });
   }
   function pick(p, scroll) {
-    pair = p; store.set("fxpair", p); paint(); load();
+    pair = p; ss.set("fxpair", p); paint(); load();
     if (scroll) el("fxchart").scrollIntoView({behavior: "smooth", block: "start"});
   }
-  Array.prototype.forEach.call(document.querySelectorAll("[data-pair]"), function (n) {
+  function onLive(d) {
+    quotes = d.quotes || {}; mode = d.mode; badge();
+    chart.setLive(d.candle || null);
+    var states = {}, p;
+    for (p in quotes) states[p] = quotes[p].state;
+    if (prevStates) for (p in states) { if (/^ENTER/.test(states[p]) && prevStates[p] !== states[p]) newSignal(p, states[p]); }
+    prevStates = states;
+    if (drawer.className.indexOf("open") >= 0) renderDrawer();
+    if (d.rev !== FX.version) location.reload();   // a new check finished: refresh the cards and candles
+  }
+  function tick() {
+    if (doc.hidden || busy) return;
+    busy = true;
+    fetch("/forex/live?pair=" + encodeURIComponent(pair), {cache: "no-store", credentials: "same-origin"}).then(function (r) {
+      if (r.status === 401 || r.status === 303) { location.reload(); return null; }
+      return r.ok ? r.json() : null;
+    }).then(function (d) { busy = false; if (d) onLive(d); }).catch(function () { busy = false; mode = "delayed"; badge(); });
+  }
+
+  Array.prototype.forEach.call(doc.querySelectorAll("[data-pair]"), function (n) {
     n.addEventListener("click", function () { pick(n.getAttribute("data-pair"), true); });
   });
+
+  // the browser remembers your list and tells the server (the server forgets it when it restarts)
+  var saved = null; try { saved = JSON.parse(ls.get("fxwl") || "null"); } catch (e) { saved = null; }
+  if (saved && saved.length && saved.join() !== wl.join()) {
+    postWatch(saved).then(function (res) { if (res && res.join() !== wl.join()) location.reload(); else if (!res) ls.del("fxwl"); });
+  }
   paint(); chart.resize(); load();
-  setInterval(load, 30000);
+  setInterval(tick, 1500);
+  doc.addEventListener("visibilitychange", function () { if (!doc.hidden) tick(); });
+  window.addEventListener("fxtheme", function () { chart.draw(); });
 }
 if (typeof document !== "undefined") {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
 }
 })();
 '''
+
+
+
+CHROME_JS = r'''(function () {
+  var SUN = '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
+  var MOON = '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg>';
+  var b = document.getElementById("themebtn");
+  if (!b) return;
+  function paint() { b.innerHTML = document.documentElement.getAttribute("data-theme") === "light" ? MOON : SUN; }
+  b.addEventListener("click", function () {
+    var next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("tosh-theme", next); } catch (e) { /* ignore */ }
+    paint();
+    window.dispatchEvent(new Event("fxtheme"));
+  });
+  paint();
+})();'''
+
+THEME_HEAD_JS = '(function(){var t=null;try{t=localStorage.getItem("tosh-theme");}catch(e){}if(!t)t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";document.documentElement.setAttribute("data-theme",t);})();'
+
+_ICONS = {
+    "pulse": '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+    "logout": '<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4"/><path d="m16 8 4 4-4 4M20 12H9"/>',
+}
+
+
+def _svg(name: str, size: int = 19) -> str:
+    return (f'<svg viewBox="0 0 24 24" width="{size}" height="{size}" fill="none" stroke="currentColor" stroke-width="1.9" '
+            f'stroke-linecap="round" stroke-linejoin="round">{_ICONS[name]}</svg>')
 
 
 # ============================================================================
@@ -758,7 +1207,7 @@ def mode_switch(active: str) -> str:
     return f'<div class="modesw"><a{cls("meme")} href="/dashboard">Memecoin</a><a{cls("forex")} href="/forex">Forex</a></div>'
 
 
-def render_page(snap: dict | None, has_key: bool) -> str:
+def render_page(snap: dict | None, has_key: bool, logo: str = "") -> str:
     e = html.escape
     body = []
     boot = None
@@ -767,7 +1216,7 @@ def render_page(snap: dict | None, has_key: bool) -> str:
                     '2) Copy your API key.<br>3) In Render open your service, go to Environment, add FOREX_API_KEY with that key, save. It redeploys by itself.</div></div>')
     elif snap:
         live = [p for p in snap["pairs"] if p["signal"] and p["signal"].state.startswith("ENTER")]
-        boot = {"pairs": [p["pair"] for p in snap["pairs"]], "first": (live[0]["pair"] if live else snap["pairs"][0]["pair"]), "version": int(snap["last_cycle"] or 0)}
+        boot = {"pairs": [p["pair"] for p in snap["pairs"]], "first": (live[0]["pair"] if live else snap["pairs"][0]["pair"]), "version": snap["rev"], "max": snap["max"]}
         for p in live:
             s = p["signal"]
             cls = "buy" if s.side == "BUY" else "sell"
@@ -779,7 +1228,7 @@ def render_page(snap: dict | None, has_key: bool) -> str:
                         f'<div style="margin-top:10px"><button type="button" class="chip on" data-pair="{e(s.pair)}">Show on chart</button></div></div>')
         if not live:
             body.append('<div class="card"><b>No entry right now.</b><div class="sub">Nothing to do. This page checks again by itself when the next 15-minute candle closes.</div></div>')
-        body.append('<div class="card" id="fxchart"><div class="chips" id="fxpairs"></div><div class="chips" id="fxtfs"></div><canvas id="fxc"></canvas>'
+        body.append('<div class="card" id="fxchart"><div class="chips bar" id="fxbar"></div><div class="chips" id="fxtfs"></div><canvas id="fxc"></canvas>'
                     '<div class="sub" id="fxmsg">Loading chart...</div>'
                     '<div class="sub"><span style="color:#f5c542">EMA 20</span> &middot; <span style="color:#4da3ff">EMA 50</span> &middot; <span style="color:#c77dff">EMA 200</span> &middot; triangles = past signals</div></div>')
         rows = []
@@ -802,37 +1251,68 @@ def render_page(snap: dict | None, has_key: bool) -> str:
     script = ""
     if boot:
         script = "<script>window.FX_BOOT=" + json.dumps(boot).replace("</", "<\\/") + ";</script><script>" + CHART_JS + "</script>"
+    brand_img = f'<img src="{html.escape(logo, quote=True)}" alt="" width="30" height="30" style="display:block;object-fit:cover;border-radius:9px">' if logo else ""
+    icon_link = f'<link rel="icon" href="{html.escape(logo, quote=True)}"><link rel="apple-touch-icon" href="{html.escape(logo, quote=True)}">' if logo else ""
+    pill = "Forex" if has_key else "Setup needed"
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta http-equiv="refresh" content="900">
-<title>Tosh Bot - Forex</title><style>
-:root{{--bg:#0b0b0c;--card:#17181a;--fg:#f2f2f2;--mute:#9a9aa0;--ok:#3ecf8e;--bad:#ff6b6b;--warn:#e9b44c;--line:#2a2c30}}
-@media(prefers-color-scheme:light){{:root{{--bg:#f4f4f6;--card:#fff;--fg:#111;--mute:#666;--line:#e3e3e7}}}}
-body{{margin:0;padding:16px 16px calc(40px + env(safe-area-inset-bottom));padding-top:calc(16px + env(safe-area-inset-top));font:16px -apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg)}}
-.modesw{{display:flex;gap:4px;background:var(--card);border-radius:999px;padding:4px;margin:0 0 14px}}.modesw a{{flex:1;text-align:center;padding:10px;border-radius:999px;color:var(--mute);text-decoration:none;font-weight:700}}.modesw a.on{{background:var(--fg);color:var(--bg)}}
-.card{{background:var(--card);border-radius:18px;padding:16px;margin:12px 0}}.warn{{border:1px solid var(--warn)}}
+{icon_link}<title>Tosh Bot - Forex</title><script>{THEME_HEAD_JS}</script><style>
+:root{{color-scheme:dark;--bg:#000;--text:#f5f7fb;--mute:rgba(235,240,250,.68);--dim:rgba(235,240,250,.45);--green:#34d399;--amber:#ffb340;--red:#ff5d73;--gray:#8b97aa;--g-bg:rgba(255,255,255,.075);--g-line:rgba(255,255,255,.16);--line:rgba(255,255,255,.10);--chartbg:#0b0e13;--font:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif}}
+[data-theme="light"]{{color-scheme:light;--bg:#eaf0fb;--text:#0a0f1a;--mute:rgba(10,15,26,.66);--dim:rgba(10,15,26,.42);--green:#12a979;--amber:#f08c00;--red:#ec3b55;--g-bg:rgba(255,255,255,.72);--g-line:rgba(255,255,255,.9);--line:rgba(10,15,26,.08);--chartbg:#fff}}
+:root{{--fg:var(--text);--card:var(--g-bg);--ok:var(--green);--bad:var(--red);--warn:var(--amber)}}
+*{{box-sizing:border-box;-webkit-tap-highlight-color:transparent}}html{{background:var(--bg);-webkit-text-size-adjust:100%}}
+body{{margin:0;padding:0 16px calc(40px + env(safe-area-inset-bottom));font:16px var(--font);background:var(--bg);color:var(--text);max-width:1080px;margin:0 auto}}
+.topbar{{position:sticky;top:0;z-index:20;padding-top:env(safe-area-inset-top);margin:0 -16px;padding-left:16px;padding-right:16px;background:linear-gradient(var(--bg) 72%,transparent)}}
+.topin{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 0 12px}}
+.brand{{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;letter-spacing:-.025em;color:var(--text);text-decoration:none;min-width:0}}
+.tools{{display:flex;align-items:center;gap:6px}}
+.ibtn{{display:grid;place-items:center;width:40px;height:40px;border-radius:50%;color:var(--text);background:var(--g-bg);border:1px solid var(--g-line);padding:0;cursor:pointer;text-decoration:none;font:inherit}}.ibtn:active{{transform:scale(.92)}}
+.feed{{display:inline-flex;align-items:center;gap:7px;height:40px;padding:0 13px;border-radius:999px;font-size:13px;font-weight:600;background:var(--g-bg);border:1px solid var(--g-line);white-space:nowrap}}
+.dot{{width:8px;height:8px;border-radius:50%;background:var(--gray);display:inline-block;flex:none}}.dot.ok{{background:var(--green)}}.dot.warn{{background:var(--amber)}}.dot.bad{{background:var(--red)}}
+@media(max-width:430px){{#fxptxt{{display:none}}.feed{{padding:0;width:40px;justify-content:center}}}}@media(max-width:340px){{.bt{{display:none}}}}
+.modesw{{display:flex;gap:4px;background:var(--g-bg);border:1px solid var(--g-line);border-radius:999px;padding:4px;margin:0 0 14px}}.modesw a{{flex:1;text-align:center;padding:10px;border-radius:999px;color:var(--mute);text-decoration:none;font-weight:700}}.modesw a.on{{background:var(--text);color:var(--bg)}}
+.card{{background:var(--card);border:1px solid var(--g-line);border-radius:24px;padding:16px;margin:12px 0;-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px)}}#fxchart.card{{background:var(--chartbg)}}.warn{{border-color:var(--warn)}}
 .sig.buy{{border:2px solid var(--ok)}}.sig.sell{{border:2px solid var(--bad)}}.big{{font-size:24px;font-weight:800;margin-bottom:6px}}
 .sub{{color:var(--mute);font-size:13px;margin-top:6px;line-height:1.45}}table{{width:100%;border-collapse:collapse;margin-top:6px}}td,th{{text-align:left;padding:7px 2px;font-size:15px}}th{{color:var(--mute);font-size:12px}}
 .buy{{color:var(--ok)}}.sell{{color:var(--bad)}}.row{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--line)}}
 .pill{{font-size:12px;font-weight:700;color:var(--mute);background:rgba(128,128,128,.16);border-radius:999px;padding:4px 10px;white-space:nowrap}}.pill.buy,.pill.sell{{color:#fff;background:var(--ok)}}.pill.sell{{background:var(--bad)}}
-.chips{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}}.chip{{font:inherit;font-size:13px;font-weight:700;color:var(--mute);background:rgba(128,128,128,.16);border:0;border-radius:999px;padding:8px 13px}}.chip.on{{background:var(--fg);color:var(--bg)}}
+.chips{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}}.chip{{font:inherit;font-size:13px;font-weight:700;color:var(--mute);background:rgba(128,128,128,.16);border:0;border-radius:999px;padding:8px 13px}}.chip.on{{background:var(--text);color:var(--bg)}}
 #fxc{{width:100%;height:440px;display:block;touch-action:none;border-radius:12px;margin-top:4px}}
+.chip.big{{font-size:16px;color:var(--text)}}.live{{font-size:12px;font-weight:700;color:var(--mute);margin-left:4px;align-self:center}}.live.on{{color:var(--ok)}}.live.mid{{color:var(--warn)}}.bar{{align-items:center}}
+.dim{{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .2s;z-index:40}}.dim.open{{opacity:1;pointer-events:auto}}
+.drawer{{position:fixed;left:0;right:0;bottom:0;max-height:82vh;background:var(--chartbg);border:1px solid var(--g-line);border-radius:22px 22px 0 0;padding:10px 16px calc(16px + env(safe-area-inset-bottom));transform:translateY(105%);transition:transform .25s;z-index:41;display:flex;flex-direction:column;box-shadow:0 -10px 40px rgba(0,0,0,.4)}}.drawer.open{{transform:none}}
+.grab{{width:44px;height:5px;border-radius:3px;background:rgba(128,128,128,.4);margin:0 auto 10px}}.dh{{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}}
+.drawer input{{width:100%;box-sizing:border-box;font:inherit;font-size:16px;color:var(--text);background:rgba(128,128,128,.16);border:0;border-radius:12px;padding:11px 14px;margin-bottom:8px}}#fxlist{{overflow:auto;flex:1}}
+.sec{{color:var(--mute);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin:12px 0 4px}}.qrow{{display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid var(--line);cursor:pointer}}.ql{{flex:1;min-width:0}}.qr{{text-align:right}}.chg{{font-size:12px}}
+.x{{font:inherit;font-size:22px;line-height:1;color:var(--mute);background:none;border:0;padding:4px 8px}}.chip:disabled{{opacity:.5}}
+.toast{{position:fixed;left:12px;right:12px;top:calc(10px + env(safe-area-inset-top));padding:14px 16px;border-radius:16px;font-weight:800;color:#fff;z-index:60;transform:translateY(-140%);transition:transform .3s;box-shadow:0 8px 30px rgba(0,0,0,.4)}}.toast.show{{transform:none}}.toast.buy{{background:var(--ok)}}.toast.sell{{background:var(--bad)}}
 h2{{margin:4px 0 12px}}
-</style></head><body>{mode_switch("forex")}<h2>Forex signals</h2>{"".join(body)}
-<div class="sub">Signals only. You place the trade yourself. Nothing here is financial advice; most retail forex traders lose money.</div>{script}</body></html>"""
+</style></head><body><div id="fxtoast" class="toast"></div>
+<header class="topbar"><div class="topin">
+<a href="/dashboard" class="brand">{brand_img}<span class="bt">Tosh Bot</span></a>
+<div class="tools"><span class="feed"><span id="fxpdot" class="dot{'' if has_key else ' bad'}"></span><span id="fxptxt">{pill}</span></span>
+<button class="ibtn" id="themebtn" type="button" aria-label="Switch theme"></button>
+<a class="ibtn" href="/dashboard#/system" aria-label="System health">{_svg("pulse")}</a>
+<a class="ibtn" href="/logout" aria-label="Sign out">{_svg("logout")}</a></div></div></header>
+{mode_switch("forex")}<h2>Forex signals</h2>{"".join(body)}
+<div class="sub">Signals only. You place the trade yourself. Nothing here is financial advice; most retail forex traders lose money.</div><script>{CHROME_JS}</script>{script}</body></html>"""
 
 
 # ============================================================================
 # WIRING
 # ============================================================================
-def register_forex_routes(app, auth) -> None:
+def register_forex_routes(app, auth, logo_uri: str = "") -> None:
     from contextlib import asynccontextmanager
-    from fastapi import Depends, Query
+    from fastapi import Depends, Query, Request
     from fastapi.responses import HTMLResponse, JSONResponse
 
     if os.getenv("FOREX_ENABLED", "true").lower() in ("0", "false", "no", "off"):
         return
     key = os.getenv("FOREX_API_KEY", "").strip()
-    pairs = [p.strip().upper() for p in os.getenv("FOREX_PAIRS", DEFAULT_PAIRS).split(",") if p.strip()]
-    tracker = ForexTracker(pairs, key, float(os.getenv("FOREX_ACCOUNT_USD", "100")), float(os.getenv("FOREX_RISK_PCT", "1"))) if key else None
+    max_pairs = int(os.getenv("FOREX_MAX_PAIRS", str(MAX_PAIRS_DEFAULT)))
+    pairs = clean_pairs(os.getenv("FOREX_PAIRS", DEFAULT_PAIRS).split(","), max_pairs) or clean_pairs(DEFAULT_PAIRS.split(","), max_pairs)
+    tracker = ForexTracker(pairs, key, float(os.getenv("FOREX_ACCOUNT_USD", "100")), float(os.getenv("FOREX_RISK_PCT", "1")),
+                           max_pairs, float(os.getenv("FOREX_POLL_SECONDS", "60"))) if key else None
+    app.state.forex = ForexHealth(tracker, bool(key))      # lets the System health screen report on forex
     if tracker:
         inner = app.router.lifespan_context
 
@@ -847,15 +1327,36 @@ def register_forex_routes(app, auth) -> None:
                     await asyncio.gather(task, return_exceptions=True)
         app.router.lifespan_context = with_forex
 
+    nocache = {"Cache-Control": "no-store"}
+
     @app.get("/forex", include_in_schema=False, dependencies=[Depends(auth)])
     async def forex_page():
-        return HTMLResponse(render_page(tracker.snapshot() if tracker else None, bool(key)), headers={"Cache-Control": "no-store"})
+        return HTMLResponse(render_page(tracker.snapshot() if tracker else None, bool(key), logo_uri), headers=nocache)
 
     @app.get("/forex/data", include_in_schema=False, dependencies=[Depends(auth)])
     async def forex_data(pair: str = Query("")):
         if not tracker or pair not in tracker.pairs:
-            return JSONResponse({"error": "unknown pair"}, status_code=404, headers={"Cache-Control": "no-store"})
-        return JSONResponse(tracker.chart_payload(pair), headers={"Cache-Control": "no-store"})
+            return JSONResponse({"error": "unknown pair"}, status_code=404, headers=nocache)
+        return JSONResponse(tracker.chart_payload(pair), headers=nocache)
+
+    @app.get("/forex/live", include_in_schema=False, dependencies=[Depends(auth)])
+    async def forex_live(pair: str = Query("")):
+        if not tracker:
+            return JSONResponse({"error": "not running"}, status_code=404, headers=nocache)
+        return JSONResponse(tracker.live_payload(pair), headers=nocache)
+
+    @app.post("/forex/watch", include_in_schema=False, dependencies=[Depends(auth)])
+    async def forex_watch(request: Request):
+        if not tracker or request.headers.get("x-fx") != "1":      # the custom header keeps other websites from calling this
+            return JSONResponse({"error": "not allowed"}, status_code=400, headers=nocache)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad request"}, status_code=400, headers=nocache)
+        items = body.get("pairs") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            return JSONResponse({"error": "bad request"}, status_code=400, headers=nocache)
+        return JSONResponse({"pairs": tracker.set_pairs([str(x) for x in items[:20]])}, headers=nocache)
 
 
 # ============================================================================
@@ -869,6 +1370,14 @@ def _series(n: int, fn, start: datetime | None = None) -> list[Candle]:
         out.append(Candle(t0 + timedelta(minutes=INTERVAL_MIN * i), prev, max(prev, c) + 0.0002, min(prev, c) - 0.0002, c))
         prev = c
     return out
+
+
+def _fresh(n: int, price=lambda i: 1.1) -> tuple[list[Candle], datetime]:
+    """n closed candles ending at the latest candle that has just closed by the real clock, and a 'now' 10 seconds after that close."""
+    now = datetime.now(UTC)
+    end_open = floor_candle(now) - timedelta(minutes=INTERVAL_MIN)
+    start = end_open - timedelta(minutes=INTERVAL_MIN * (n - 1))
+    return _series(n, price, start), floor_candle(now) + timedelta(seconds=1)
 
 
 class ForexTests(unittest.TestCase):
@@ -1032,7 +1541,7 @@ L.pointerdown(ev(100,200)); L.pointermove(ev(160,200)); L.pointerup(ev(160,200))
 L.pointerdown(ev(100,200,1)); L.pointerdown(ev(200,200,2)); L.pointermove(ev(60,200,1)); L.pointerup(ev(60,200,1)); L.pointerup(ev(200,200,2));   // pinch
 L.pointerdown(ev(120,220)); L.pointerup(ev(120,220));                                         // tap -> crosshair
 L.wheel(ev(0,0,1,'mouse')); L.dblclick();
-ch.setTf(240); ch.setEma(false); ch.reset(); ch.setData({pair:'EUR/USD',dp:5,state:'WAIT',candles:cs.slice(0,40),signal:null,trades:[]});   // short history must not crash
+ch.setLive([cs[499][0]+900, 1.1, 1.101, 1.099, 1.1005]); ch.setLive(null); ch.setTf(240); ch.setEma(false); ch.reset(); ch.setData({pair:'EUR/USD',dp:5,state:'WAIT',candles:cs.slice(0,40),signal:null,trades:[]});   // short history must not crash
 ch.setData({pair:'EUR/USD',dp:5,state:'WAIT',candles:[],signal:null,trades:[]});
 const agg = api.aggregate(cs, 60); if (agg.length < 100 || agg.length > 140) throw new Error('aggregate '+agg.length);
 const h = cs.filter(c=>Math.floor(c[0]/3600)===Math.floor(cs[10][0]/3600)); const a1 = agg.find(c=>c[0]===Math.floor(cs[10][0]/3600)*3600);
@@ -1043,9 +1552,120 @@ console.log('ok');
             r = subprocess.run([node, d + "/t.js"], capture_output=True, text=True, timeout=30)
             self.assertEqual(r.stdout.strip(), "ok", r.stderr[-800:])
 
+    def test_clean_pairs_and_watchlist(self):
+        self.assertEqual(clean_pairs([" eur/usd", "EUR/USD", "bad", "GBP/JPY", "TOOLONG/USD", "XAU/USD"], 3), ["EUR/USD", "GBP/JPY", "XAU/USD"])
+        tr = ForexTracker(["EUR/USD", "GBP/USD"], "K", max_pairs=3)
+        r0 = tr.rev
+        self.assertEqual(tr.set_pairs(["EUR/USD", "AUD/USD", "NZD/USD", "USD/CAD"]), ["EUR/USD", "AUD/USD", "NZD/USD"])   # limited to max
+        self.assertGreater(tr.rev, r0); self.assertTrue(tr.wake.is_set())
+        self.assertTrue(any(m["action"] == "subscribe" and "AUD/USD" in m["params"]["symbols"] for m in tr.outbox))
+        self.assertTrue(any(m["action"] == "unsubscribe" and "GBP/USD" in m["params"]["symbols"] for m in tr.outbox))
+        self.assertEqual(tr.set_pairs(["junk"]), ["EUR/USD", "AUD/USD", "NZD/USD"])                                          # nothing valid: unchanged
+
+    def test_live_ticks_build_the_forming_candle(self):
+        tr = ForexTracker(["EUR/USD"], "K")
+        cs, now = _fresh(260, lambda i: 1.1 + 0.00002 * i)
+        tr.process("EUR/USD", cs, now)
+        for px in (1.1060, 1.1066, 1.1055, 1.1062):
+            tr.on_tick("EUR/USD", px)
+        fc = tr.forming["EUR/USD"]
+        self.assertEqual(fc[1], cs[-1].c)                                        # opens at the previous close (no gap)
+        self.assertEqual((fc[2], fc[3], fc[4]), (max(cs[-1].c, 1.1066), min(cs[-1].c, 1.1055), 1.1062))
+        p = tr.live_payload("EUR/USD")
+        self.assertEqual(p["candle"][0], fc[0]); self.assertEqual(p["quotes"]["EUR/USD"]["p"], 1.1062)
+        self.assertIn(tr.live_mode(), ("stream", "closed"))
+        tr.on_tick("EUR/USD", 1.2, time.time() + 905)                            # a tick stamped in the next candle: starts it from the last price
+        self.assertEqual(tr.forming["EUR/USD"][1], 1.1062)
+        tr.on_tick("GBP/USD", 1.3); self.assertNotIn("GBP/USD", tr.ticks)       # not on the watch list: ignored
+        tr.on_tick("EUR/USD", 0); tr.on_tick("EUR/USD", -1.0); self.assertEqual(tr.ticks["EUR/USD"][0], 1.2)
+
+    def test_forming_candle_hidden_once_the_real_one_arrives(self):
+        tr = ForexTracker(["EUR/USD"], "K")
+        cs, now = _fresh(260)
+        tr.process("EUR/USD", cs, now)
+        tr.on_tick("EUR/USD", 1.1)
+        self.assertIsNotNone(tr.live_payload("EUR/USD")["candle"])
+        nxt = cs + [Candle(floor_candle(now), 1.1, 1.1, 1.1, 1.1)]               # the provider publishes the candle we were building
+        tr.process("EUR/USD", nxt, floor_candle(now) + timedelta(minutes=INTERVAL_MIN, seconds=1))
+        self.assertIsNone(tr.live_payload("EUR/USD")["candle"])
+
+    def test_stream_messages(self):
+        tr = ForexTracker(["EUR/USD"], "SECRET")
+        tr.on_message('{"event":"price","symbol":"EUR/USD","price":1.1234,"timestamp":%d}' % int(time.time()))
+        self.assertEqual(tr.ticks["EUR/USD"][0], 1.1234); self.assertTrue(tr.stream_alive())
+        tr.on_message('{"event":"subscribe-status","success":[],"fails":[{"symbol":"EUR/USD"}]}')
+        self.assertIn("EUR/USD", tr.stream_error)
+        tr.on_message('{"event":"error","message":"bad key SECRET"}'); self.assertNotIn("SECRET", tr.stream_error)
+        tr.on_message("not json"); tr.on_message("[1,2]"); tr.on_message('{"event":"price","symbol":"EUR/USD","price":"x"}')   # junk is ignored
+
+    def test_stale_candle_detection_and_retry(self):
+        cs = _series(260, lambda i: 1.1)
+        last_open = cs[-1].t
+        now = last_open + timedelta(minutes=30, seconds=5)               # candle after `last` has closed but is missing: stale
+        self.assertTrue(is_stale(cs, now))
+        self.assertFalse(is_stale(cs, last_open + timedelta(minutes=15, seconds=5)))    # up to date
+        self.assertFalse(is_stale(cs, last_open + timedelta(hours=5)))   # old data = market break, not a late candle
+        tr = ForexTracker(["EUR/USD"], "K")
+        calls = []
+
+        async def fake(pair):
+            calls.append(1)
+            return cs
+        tr.fetch = fake
+        import unittest.mock as um
+        real_sleep = asyncio.sleep
+        with um.patch(__name__ + ".market_closed", return_value=False), um.patch(__name__ + ".is_stale", return_value=True), um.patch(__name__ + ".asyncio.sleep", new=lambda s: real_sleep(0)):
+            self.assertEqual(asyncio.run(tr.cycle(["EUR/USD"])), ["EUR/USD"])
+            self.assertEqual(asyncio.run(tr.cycle([])), [])
+        self.assertEqual(len(calls), 1)
+
+    def test_weekend_cycle_marks_closed_once(self):
+        import unittest.mock as um
+        tr = ForexTracker(["EUR/USD"], "K")
+        with um.patch(__name__ + ".market_closed", return_value=True):
+            asyncio.run(tr.cycle()); r = tr.rev
+            asyncio.run(tr.cycle())
+        self.assertEqual(tr.signals["EUR/USD"].state, "CLOSED"); self.assertEqual(tr.rev, r)      # no page reload every 15 minutes
+
+    def test_watch_reason_texts_and_silver_sizing(self):
+        n = 260
+        ind = Indicators([1.0] * n, [1.01] * n, [1.0] * n, [50.0] * n, [0.001] * n)
+        ind.e200 = [0.9 + 0.0001 * k for k in range(n)]
+        ind.e50 = [v + 0.01 for v in ind.e200]
+        self.assertIn("Waiting for a pullback", watch_reason(ind, 250))
+        ind.rsi[248] = 33.0
+        self.assertIn("pulled back", watch_reason(ind, 250))
+        ind.e50 = [v - 0.02 for v in ind.e200]; ind.e200 = [1.1 - 0.0001 * k for k in range(n)]; ind.e50 = [v - 0.01 for v in ind.e200]
+        self.assertIn("Downtrend", watch_reason(ind, 250))
+        ind.e50 = [1.0] * n; ind.e200 = [1.0] * n
+        self.assertIn("No clear trend", watch_reason(ind, 250))
+        self.assertAlmostEqual(lots_for_risk("XAG/USD", 30.0, 0.5, 10), 10 / (0.5 * 5000)); self.assertEqual(decimals("XAG/USD"), 3)
+
+    def test_page_has_dashboard_top_bar_and_theme(self):
+        tr = ForexTracker(["EUR/USD"], "K")
+        cs, now = _fresh(260)
+        tr.process("EUR/USD", cs, now)
+        page = render_page(tr.snapshot(), True, "data:image/jpeg;base64,AAAA")
+        for needle in ('class="topbar"', 'href="/dashboard#/system"', 'href="/logout"', 'id="themebtn"', 'tosh-theme', 'data:image/jpeg;base64,AAAA', 'data-theme="light"', 'id="fxptxt"'):
+            self.assertIn(needle, page)
+        nokey = render_page(None, False)
+        self.assertIn("Setup needed", nokey); self.assertIn('class="topbar"', nokey); self.assertIn("One step left", nokey)
+        self.assertNotIn("<script>window.FX_BOOT", nokey)
+
+    def test_health_for_system_screen(self):
+        tr = ForexTracker(["EUR/USD", "GBP/USD"], "K")
+        cs, now = _fresh(260)
+        tr.process("EUR/USD", cs, now)
+        tr.errors["GBP/USD"] = "HTTPStatusError (HTTP 429): limit"
+        h = ForexHealth(tr, True).health()
+        self.assertTrue(h["enabled"] and h["key_set"]); self.assertEqual(h["pairs"], ["EUR/USD", "GBP/USD"])
+        self.assertIn("GBP/USD", h["errors"]); self.assertEqual(h["candles"]["EUR/USD"], 260); self.assertIn(h["mode"], ("delayed", "closed", "stream", "poll"))
+        json.dumps(h)
+        self.assertEqual(ForexHealth(None, False).health(), {"enabled": True, "key_set": False})
+
     def test_next_candle_timer(self):
         s = ForexTracker.seconds_to_next_candle(datetime(2026, 11, 9, 10, 14, 50, tzinfo=UTC))
-        self.assertAlmostEqual(s, 30.0, places=0)
+        self.assertAlmostEqual(s, 16.0, places=0)
 
 
 if __name__ == "__main__":

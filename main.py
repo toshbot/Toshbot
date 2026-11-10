@@ -2887,9 +2887,22 @@ function listView(o) {
 }
 
 function systemView() {
-  const tiles = h("div", {class: "grid3"}), provs = h("div"), counters = h("div");
+  const tiles = h("div", {class: "grid3"}), provs = h("div"), counters = h("div"), fxbox = h("div");
   const root = h("div", {}, h("h1", {class: "large"}, "System health"), h("p", {class: "sub"}, "Connections, queues and counters since the backend last started."), tiles,
-    sec("Providers"), h("div", {class: "card pad"}, provs), sec("Counters"), h("div", {class: "card pad"}, counters));
+    sec("Providers"), h("div", {class: "card pad"}, provs), sec("Forex signals", "Open Forex", "/forex"), h("div", {class: "card pad"}, fxbox), sec("Counters"), h("div", {class: "card pad"}, counters));
+  const fxRow = (state, title, status, line, err) => h("div", {class: "prow", style: "align-items:flex-start"}, h("span", {class: "dot " + state, style: "margin-top:7px"}),
+    h("div", {style: "flex:1;min-width:0"}, h("div", {style: "display:flex;justify-content:space-between;font-weight:650"}, title, h("span", {class: "mute", style: "font-weight:500"}, status)),
+      h("div", {class: "dim", style: "font-size:12.5px"}, line), err ? h("pre", {style: "color:var(--red);max-height:80px;margin:8px 0 0"}, err) : null));
+  function fxRows(f) {
+    const errs = Object.entries(f.errors || {}).map(([k, v]) => k + ": " + v).join("\n"), p = f.paper || {};
+    const MODE = {stream: ["ok", "streaming"], poll: ["warn", "every minute"], delayed: ["warn", "delayed 15 min"], closed: ["ok", "market closed"]}[f.mode] || ["warn", f.mode];
+    return [
+      fxRow(errs ? "bad" : f.last_check_at ? "ok" : "warn", "Candles and signals", errs ? "problem" : f.last_check_at ? "ok" : "starting",
+        "Last check " + ago(f.last_check_at) + " · " + f.pairs.length + " pairs (" + f.pairs.join(", ") + ")", errs || null),
+      fxRow(MODE[0], "Live prices", MODE[1], "Last price " + ago(f.last_price_at), f.stream_error || null),
+      fxRow("ok", "Signals", f.entries_now.length ? f.entries_now.length + " entry now" : "no entry now",
+        (f.entries_now.length ? f.entries_now.join(", ") + " · " : "") + (p.total || 0) + " paper signals · " + (p.done || 0) + " finished · win rate " + (p.win_rate == null ? "n/a" : Math.round(p.win_rate) + "%") + " · " + (p.total_r || 0) + " R (resets when the server restarts)")];
+  }
   const NAMES = {received:"Messages received",parsed:"Launches parsed",ignored:"Ignored (non-launch)",parse_errors:"Parse errors",dropped_queue_full:"Dropped (queue full)",stored:"New tokens stored",duplicates:"Duplicates skipped",failed_jobs:"Failed storage jobs",analyses:"Analyses run",failed_analyses:"Failed analyses",throttled:"Skipped (daily limit)"};
   const BAD = new Set(["parse_errors", "dropped_queue_full", "failed_jobs", "failed_analyses"]);
   const tile = (l, v, hint, color) => h("div", {class: "tile"}, h("div", {class: "l"}, l), h("div", {class: "v", style: color ? "color:" + color : null}, v), hint ? h("div", {class: "h"}, hint) : null);
@@ -2897,6 +2910,9 @@ function systemView() {
     const d = await api("/system/health");
     tiles.replaceChildren(tile("Database", d.database_reachable ? "Online" : "Down", null, d.database_reachable ? "#2ebd85" : "#f6465d"),
       tile("Event queue", d.queue_depth, "waiting to store"), tile("Analysis queue", d.analysis_queue_depth, d.analysis_enabled ? "waiting for analysis" : "analysis off"));
+    const f = d.forex;
+    fxbox.replaceChildren(...(!f ? [h("span", {class: "dim"}, "The forex add-on is not installed.")] : !f.key_set
+      ? [fxRow("warn", "Forex data", "not set up", "Add FOREX_API_KEY in Render (free key from twelvedata.com), then open the Forex page.")] : fxRows(f)));
     const ps = Object.values(d.providers);
     provs.replaceChildren(...(ps.length ? ps.map((p) => h("div", {class: "prow", style: "align-items:flex-start"}, h("span", {class: "dot " + dotState(p.effective_status), style: "margin-top:7px"}),
       h("div", {style: "flex:1;min-width:0"}, h("div", {style: "display:flex;justify-content:space-between;font-weight:650"}, p.name, h("span", {class: "mute", style: "font-weight:500"}, p.effective_status)),
@@ -3999,6 +4015,7 @@ def build_api_router(auth) -> APIRouter:
             "analysis_enabled": st.settings.analysis_enabled,
             "metrics": st.metrics.as_dict(),
             "token_images": st.images.stats() if getattr(st, "images", None) else None,
+            "forex": st.forex.health() if getattr(st, "forex", None) else None,
         }
 
     return router
@@ -4170,7 +4187,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     # Forex signals add-on (forex.py). Optional: if the file is missing or fails, the rest of the app is unaffected.
     try:
         from forex import register_forex_routes
-        register_forex_routes(app, require_dashboard_auth)
+        register_forex_routes(app, require_dashboard_auth, LOGO_ICON_URI)
     except ModuleNotFoundError as exc:
         if exc.name != "forex":
             raise
