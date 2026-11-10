@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -172,6 +173,33 @@ class Signal:
     formed: datetime | None = None    # when the setup candle CLOSED
     lots: float | None = None
     risk_usd: float | None = None
+    account_usd: float | None = None
+    valid_until: datetime | None = None   # ENTER: last moment the entry is still good. GET READY: when the idea expires
+    chase_limit: float | None = None      # do not enter beyond this price
+    breakeven: float | None = None        # when price gets here, move the stop to the entry
+    trigger: float | None = None          # GET READY: price must close beyond this level to fire the entry
+    next_check: datetime | None = None    # GET READY: when the next candle closes
+    rsi: float | None = None
+
+
+def pip_size(pair: str) -> float:
+    return 0.01 if pair.endswith("/JPY") else 0.0001
+
+
+def dist_text(pair: str, d: float) -> str:
+    """A price distance in words a trader reads: pips for currency pairs, dollars for gold and silver."""
+    d = abs(d)
+    if pair.startswith("XAU/"):
+        return f"${d:.2f}"
+    if pair.startswith("XAG/"):
+        return f"${d:.3f}"
+    return f"{d / pip_size(pair):.1f} pips"
+
+
+def min_lot_risk(pair: str, price: float, stop_distance: float, lot: float = 0.01) -> float | None:
+    """Dollars lost at the stop if you trade the smallest lot most brokers allow."""
+    one = lots_for_risk(pair, price, stop_distance, 1.0)
+    return None if not one else lot / one
 
 
 def market_closed(now: datetime) -> bool:
@@ -232,7 +260,8 @@ def evaluate(pair: str, cs: list[Candle], now: datetime, account_usd: float = 10
     live = [f for f in found if f[5] >= n - MAX_SIGNAL_AGE]
     records = [(f[0], f[1], f[2], f[3], f[4]) for f in found]
     if not live:
-        return base, records
+        ready = ready_signal(pair, cs, ind, n, found, account_usd, risk_pct)
+        return (ready or base), records
     side, formed, e, stop, tgt, i, a = live[0]
     why = None
     if not in_session(formed - timedelta(minutes=INTERVAL_MIN)):
@@ -246,9 +275,53 @@ def evaluate(pair: str, cs: list[Candle], now: datetime, account_usd: float = 10
         return base, records
     risk_usd = account_usd * risk_pct / 100.0
     lots = lots_for_risk(pair, e, abs(e - stop), risk_usd)
+    risk_dist = abs(e - stop)
+    word = "Uptrend" if side == "BUY" else "Downtrend"
+    cand = "green" if side == "BUY" else "red"
+    rel = "above" if side == "BUY" else "below"
+    why_text = (f"{word}: price pulled back, then a {cand} candle closed {rel} the 20 average with RSI at {ind.rsi[i]:.0f}, so the trend is resuming. "
+                f"Enter now at market.")
+    return Signal(pair, f"ENTER {side}", why_text, price=price, side=side, entry=e, stop=stop, target=tgt, atr=a, formed=formed, lots=lots, risk_usd=risk_usd,
+                  account_usd=account_usd, valid_until=formed + timedelta(minutes=INTERVAL_MIN * MAX_SIGNAL_AGE),
+                  chase_limit=e + CHASE_ATR * a if side == "BUY" else e - CHASE_ATR * a,
+                  breakeven=e + risk_dist if side == "BUY" else e - risk_dist, rsi=ind.rsi[i]), records
+
+
+def ready_signal(pair: str, cs: list[Candle], ind: Indicators, n: int, found: list, account_usd: float, risk_pct: float) -> Signal | None:
+    """Advance warning: the trend is there and the pullback has happened, so the entry may fire on one of the next few candle closes."""
+    i = n - 1
+    vals = (ind.e20[i], ind.e50[i], ind.e200[i], ind.e200[i - 10], ind.rsi[i], ind.atr[i])
+    if any(v is None for v in vals):
+        return None
+    e20, e50, e200, e200p, r, a = vals
+    win = [(j, ind.rsi[j]) for j in range(i - 5, i + 1) if ind.rsi[j] is not None]
+    if e50 > e200 and e200 > e200p:
+        side, hits = "BUY", [j for j, v in win if v <= 40]
+    elif e50 < e200 and e200 < e200p:
+        side, hits = "SELL", [j for j, v in win if v >= 60]
+    else:
+        return None
+    if not hits or any(f[0] == side for f in found):      # no pullback yet, or the entry already fired for this pullback
+        return None
+    left = max(hits) + 6 - i                              # how many more candle closes can still trigger it
+    if left <= 0:
+        return None
+    last_close = cs[i].t + timedelta(minutes=INTERVAL_MIN)
+    if not in_session(last_close):
+        return None
+    entry = max(cs[i].c, e20) if side == "BUY" else min(cs[i].c, e20)
+    d = STOP_ATR * a
+    stop, tgt = (entry - d, entry + TARGET_R * d) if side == "BUY" else (entry + d, entry - TARGET_R * d)
+    risk_usd = account_usd * risk_pct / 100.0
+    extreme = min(v for _, v in win) if side == "BUY" else max(v for _, v in win)
     word = "uptrend" if side == "BUY" else "downtrend"
-    return Signal(pair, f"ENTER {side}", f"{word}, pulled back, then resumed. Enter near {e:.{decimals(pair)}f} now; the setup is only valid for about 30 minutes.",
-                  price=price, side=side, entry=e, stop=stop, target=tgt, atr=a, formed=formed, lots=lots, risk_usd=risk_usd), records
+    mv = "pulled back" if side == "BUY" else "bounced up"
+    why_text = (f"{word.capitalize()} and price {mv} (RSI reached {extreme:.0f}). The entry fires when a candle closes "
+                f"{'green above' if side == 'BUY' else 'red below'} the 20 average and RSI turns {'above 45' if side == 'BUY' else 'below 55'}.")
+    return Signal(pair, f"GET READY {side}", why_text, price=cs[i].c, side=side, entry=entry, stop=stop, target=tgt, atr=a,
+                  lots=lots_for_risk(pair, entry, d, risk_usd), risk_usd=risk_usd, account_usd=account_usd,
+                  valid_until=last_close + timedelta(minutes=INTERVAL_MIN * left), trigger=e20,
+                  next_check=last_close + timedelta(minutes=INTERVAL_MIN), rsi=r)
 
 
 # ============================================================================
@@ -663,10 +736,13 @@ class ForexTracker:
         live = None
         if sig and sig.state.startswith("ENTER") and sig.formed:
             live = {"side": sig.side, "entry": sig.entry, "stop": sig.stop, "target": sig.target, "formed": int(sig.formed.timestamp())}
+        ready = None
+        if sig and sig.state.startswith("GET READY") and sig.trigger:
+            ready = {"side": sig.side, "trigger": sig.trigger}
         trades = [{"side": t.side, "t": int(t.opened.timestamp()), "entry": t.entry, "stop": t.stop, "target": t.target, "status": t.status}
                   for t in self.book.trades if t.pair == pair][-40:]
         return {"pair": pair, "dp": decimals(pair), "state": sig.state if sig else "starting", "version": self.rev,
-                "candles": [[int(c.t.timestamp()), c.o, c.h, c.l, c.c] for c in cs], "signal": live, "trades": trades}
+                "candles": [[int(c.t.timestamp()), c.o, c.h, c.l, c.c] for c in cs], "signal": live, "ready": ready, "trades": trades}
 
 
     def health(self) -> dict:
@@ -674,7 +750,7 @@ class ForexTracker:
         iso = lambda ts: datetime.fromtimestamp(ts, UTC).isoformat() if ts else None
         return {"mode": self.live_mode(), "pairs": list(self.pairs), "last_check_at": iso(self.last_cycle), "started_at": iso(self.started),
                 "last_price_at": iso(max(self.last_stream_tick, self.last_poll_tick)), "stream_error": self.stream_error,
-                "errors": dict(self.errors), "credits_today": self.credits_used, "entries_now": [p for p in self.pairs if self.signals.get(p) and self.signals[p].state.startswith("ENTER")],
+                "errors": dict(self.errors), "credits_today": self.credits_used, "ready_now": [p for p in self.pairs if self.signals.get(p) and self.signals[p].state.startswith("GET READY")], "entries_now": [p for p in self.pairs if self.signals.get(p) and self.signals[p].state.startswith("ENTER")],
                 "paper": self.book.stats(), "candles": {p: len(self.candles.get(p, [])) for p in self.pairs}}
 
     def snapshot(self) -> dict:
@@ -787,6 +863,8 @@ function createChart(canvas, theme) {
     for (i = i0; i <= i1; i++) { if (cs[i][3] < lo) lo = cs[i][3]; if (cs[i][2] > hi) hi = cs[i][2]; }
     var sg = S.data.signal;
     if (sg) [sg.entry, sg.stop, sg.target].forEach(function (p) { if (p < lo) lo = p; if (p > hi) hi = p; });
+    var rd = S.data.ready;
+    if (rd) { if (rd.trigger < lo) lo = rd.trigger; if (rd.trigger > hi) hi = rd.trigger; }
     if (!(hi > lo)) hi = lo + 1e-6;
     var pv = (hi - lo) * 0.08; lo -= pv; hi += pv;
     function Y(p) { return g.y1 - (p - lo) / (hi - lo) * g.ph; }
@@ -873,6 +951,7 @@ function createChart(canvas, theme) {
       level(sg.stop, T.down, "STOP LOSS", [6, 4]);
       level(sg.entry, T.blue, "ENTER " + sg.side, [2, 3]);
     }
+    if (rd) level(rd.trigger, T.amber, "TRIGGER: a candle must close " + (rd.side === "BUY" ? "above" : "below") + " here", [3, 3]);
 
     // last price
     var last = cs[g.len - 1], lc = last[4] >= last[1] ? T.up : T.down, ly = Math.round(Y(last[4])) + 0.5;
@@ -919,7 +998,7 @@ function createChart(canvas, theme) {
     ctx.fillText(S.data.pair + "  " + (TFNAME[S.tf] || S.tf + "m"), 8, 18);
     var stx = S.data.state || "";
     ctx.textAlign = "right"; ctx.font = "bold 12px -apple-system, sans-serif";
-    ctx.fillStyle = stx === "ENTER BUY" ? T.up : stx === "ENTER SELL" ? T.down : T.mute;
+    ctx.fillStyle = stx === "ENTER BUY" ? T.up : stx === "ENTER SELL" ? T.down : stx.indexOf("GET READY") === 0 ? T.amber : T.mute;
     ctx.fillText(stx, S.W - 8, 18);
     ctx.textAlign = "left"; ctx.font = "11px -apple-system, sans-serif"; ctx.fillStyle = T.mute;
     ctx.fillText("O " + fp(shown[1]) + "  H " + fp(shown[2]) + "  L " + fp(shown[3]) + "  C " + fp(shown[4]), 8, 36);
@@ -1001,7 +1080,7 @@ function boot() {
   function theme() {
     var s = getComputedStyle(doc.documentElement);
     function v(n, d) { return (s.getPropertyValue(n) || "").trim() || d; }
-    return {bg: v("--chartbg", "#0b0e13"), fg: v("--text", "#f2f2f2"), mute: v("--mute", "#9a9aa0"), line: v("--line", "#2a2c30"), up: v("--green", "#3ecf8e"), down: v("--red", "#ff6b6b"), blue: "#4da3ff"};
+    return {bg: v("--chartbg", "#0b0e13"), fg: v("--text", "#f2f2f2"), mute: v("--mute", "#9a9aa0"), line: v("--line", "#2a2c30"), up: v("--green", "#3ecf8e"), down: v("--red", "#ff6b6b"), amber: v("--amber", "#ffb340"), blue: "#4da3ff"};
   }
   function mkStore(kind) {
     return {get: function (k) { try { return window[kind].getItem(k); } catch (e) { return null; } }, set: function (k, v) { try { window[kind].setItem(k, v); } catch (e) { /* ignore */ } }, del: function (k) { try { window[kind].removeItem(k); } catch (e) { /* ignore */ } }};
@@ -1025,14 +1104,14 @@ function boot() {
   }
   function showToast(text, p, st) {
     var t = el("fxtoast");
-    t.textContent = text + "  (tap to view)"; t.className = "toast show " + (st.indexOf("SELL") >= 0 ? "sell" : "buy");
+    t.textContent = text + "  (tap to view)"; t.className = "toast show " + (st.indexOf("GET READY") === 0 ? "ready" : st.indexOf("SELL") >= 0 ? "sell" : "buy");
     t.onclick = function () { t.className = "toast"; pick(p, true); };
     setTimeout(function () { t.className = "toast"; }, 90000);
   }
   function newSignal(p, st) {
-    var text = st + " " + p;
+    var soon = st.indexOf("GET READY") === 0, text = soon ? st + " " + p + " - heads-up, do not enter yet" : st + " " + p + " - enter now";
     showToast(text, p, st); beep();
-    if (navigator.vibrate) { try { navigator.vibrate([200, 100, 200]); } catch (e) { /* ignore */ } }
+    if (navigator.vibrate) { try { navigator.vibrate(soon ? [120] : [200, 100, 200]); } catch (e) { /* ignore */ } }
     doc.title = "(1) " + text;
     ss.set("fxtoast", JSON.stringify({text: text, p: p, st: st, t: Date.now()}));   // survives the page reload that follows a new check
   }
@@ -1101,7 +1180,8 @@ function boot() {
       left.appendChild(mk("b", "", p)); left.appendChild(mk("div", "sub", descOf(p)));
       right.appendChild(mk("b", "", fmt(p, qd.p)));
       right.appendChild(mk("div", "chg " + (qd.chg > 0 ? "buy" : qd.chg < 0 ? "sell" : ""), qd.chg === null || qd.chg === undefined ? "" : (qd.chg > 0 ? "+" : "") + qd.chg.toFixed(2) + "% 24h"));
-      var pill = mk("div", "pill" + (qd.state === "ENTER BUY" ? " buy" : qd.state === "ENTER SELL" ? " sell" : ""), qd.state === "ENTER BUY" || qd.state === "ENTER SELL" ? qd.state : "");
+      var isE = qd.state === "ENTER BUY" || qd.state === "ENTER SELL", isR = (qd.state || "").indexOf("GET READY") === 0;
+      var pill = mk("div", "pill" + (qd.state === "ENTER BUY" ? " buy" : qd.state === "ENTER SELL" ? " sell" : isR ? " ready" : ""), isE || isR ? qd.state : "");
       row.appendChild(left); row.appendChild(right); if (pill.textContent) row.appendChild(pill);
       row.addEventListener("click", function () { closeDrawerKeep(); pick(p, false); });
       if (wl.length > 1) {
@@ -1154,7 +1234,13 @@ function boot() {
     chart.setLive(d.candle || null);
     var states = {}, p;
     for (p in quotes) states[p] = quotes[p].state;
-    if (prevStates) for (p in states) { if (/^ENTER/.test(states[p]) && prevStates[p] !== states[p]) newSignal(p, states[p]); }
+    if (prevStates) for (p in states) { if (/^(ENTER|GET READY)/.test(states[p]) && prevStates[p] !== states[p]) newSignal(p, states[p]); }
+    Array.prototype.forEach.call(doc.querySelectorAll(".fxready"), function (n) {      // live price against the trigger on the GET READY cards
+      var q = quotes[n.getAttribute("data-pair")], lp = n.querySelector(".fxlp");
+      if (!q || q.p === null || q.p === undefined || !lp) return;
+      var trig = parseFloat(n.getAttribute("data-trigger")), buy = n.getAttribute("data-side") === "BUY", ok = buy ? q.p > trig : q.p < trig;
+      lp.textContent = q.p.toFixed(dpOf(n.getAttribute("data-pair"))) + (ok ? (buy ? " (above" : " (below") + " the trigger now; if a candle closes like this, the entry fires)" : " (not past the trigger yet)");
+    });
     prevStates = states;
     if (drawer.className.indexOf("open") >= 0) renderDrawer();
     if (d.rev !== FX.version) location.reload();   // a new check finished: refresh the cards and candles
@@ -1194,16 +1280,35 @@ CHROME_JS = r'''(function () {
   var SUN = '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
   var MOON = '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></svg>';
   var b = document.getElementById("themebtn");
-  if (!b) return;
-  function paint() { b.innerHTML = document.documentElement.getAttribute("data-theme") === "light" ? MOON : SUN; }
-  b.addEventListener("click", function () {
-    var next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
-    document.documentElement.setAttribute("data-theme", next);
-    try { localStorage.setItem("tosh-theme", next); } catch (e) { /* ignore */ }
+  if (b) {
+    var paint = function () { b.innerHTML = document.documentElement.getAttribute("data-theme") === "light" ? MOON : SUN; };
+    b.addEventListener("click", function () {
+      var next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("tosh-theme", next); } catch (e) { /* ignore */ }
+      paint();
+      window.dispatchEvent(new Event("fxtheme"));
+    });
     paint();
-    window.dispatchEvent(new Event("fxtheme"));
-  });
-  paint();
+  }
+  // times on signal cards: show them in the phone's own time zone, and count down to the deadline
+  function clock() {
+    var i, n, t, s, list = document.querySelectorAll ? document.querySelectorAll(".lt, .cd") : [], now = Date.now() / 1000;
+    for (i = 0; i < list.length; i++) {
+      n = list[i];
+      if (n.className.indexOf("lt") >= 0) {
+        if (n.getAttribute("data-done")) continue;
+        t = new Date(parseFloat(n.getAttribute("data-t")) * 1000);
+        n.textContent = t.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) + " your time (" + n.getAttribute("data-utc") + " UTC)";
+        n.setAttribute("data-done", "1");
+      } else {
+        s = parseFloat(n.getAttribute("data-until")) - now;
+        n.textContent = s <= 0 ? "expired" : s < 90 ? "in " + Math.round(s) + " sec" : "in " + Math.ceil(s / 60) + " min";
+      }
+    }
+  }
+  clock();
+  setInterval(clock, 1000);
 })();'''
 
 THEME_HEAD_JS = '(function(){var t=null;try{t=localStorage.getItem("tosh-theme");}catch(e){}if(!t)t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";document.documentElement.setAttribute("data-theme",t);})();'
@@ -1238,6 +1343,75 @@ def mode_switch(active: str) -> str:
     return f'<div class="modesw"><a{cls("meme")} href="/dashboard">Memecoin</a><a{cls("forex")} href="/forex">Forex</a></div>'
 
 
+
+def _t(dt: datetime) -> str:
+    return f'<span class="lt" data-t="{int(dt.timestamp())}" data-utc="{dt:%H:%M}">{dt:%H:%M} UTC</span>'
+
+
+def _cd(dt: datetime) -> str:
+    sec = (dt - datetime.now(UTC)).total_seconds()      # the page script keeps this counting down; this is the text before it starts
+    txt = "expired" if sec <= 0 else f"in {round(sec)} sec" if sec < 90 else f"in {math.ceil(sec / 60)} min"
+    return f'<span class="cd" data-until="{int(dt.timestamp())}">{txt}</span>'
+
+
+def _min_lot_note(s: Signal) -> str:
+    if not s.lots or s.lots >= 0.0095 or not s.account_usd or s.entry is None or s.stop is None:
+        return ""
+    mr = min_lot_risk(s.pair, s.entry, abs(s.entry - s.stop))
+    if mr is None:
+        return ""
+    return (f'<div class="sub">That size is below the usual 0.01 lot minimum. At 0.01 lot a stop-out would lose about ${mr:.2f} '
+            f'({mr / s.account_usd * 100:.0f}% of your ${s.account_usd:.0f}). Skip it, or accept the bigger risk on purpose.</div>')
+
+
+def enter_card(s: Signal) -> str:
+    e, p = html.escape, s.pair
+    buy = s.side == "BUY"
+    f = lambda x: _fmt(p, x)
+    risk_d, reward_d = abs(s.entry - s.stop), abs(s.target - s.entry)
+    sym = e(p.replace("/", ""))
+    rows = [("Order", f"<b>Market {s.side}</b> (instant execution, not a pending order)"),
+            ("Enter at", f"<b>{f(s.entry)}</b><div class=\"sub\">Do not enter {'above' if buy else 'below'} {f(s.chase_limit)}</div>"),
+            ("Stop loss", f"<b>{f(s.stop)}</b> ({dist_text(p, risk_d)} away)"),
+            ("Take profit", f"<b>{f(s.target)}</b> ({dist_text(p, reward_d)} away)"),
+            ("Move stop to entry", f"once price reaches <b>{f(s.breakeven)}</b> (then you cannot lose on it)")]
+    if s.lots:
+        rows += [("Size", f"<b>{s.lots:.3f} lots</b>"),
+                 ("If it works / fails", f'<span class="buy">+${s.risk_usd * TARGET_R:.2f}</span> / <span class="sell">-${s.risk_usd:.2f}</span> (risking {s.risk_usd / s.account_usd * 100:.0f}% of ${s.account_usd:.0f})')]
+    else:
+        rows.append(("Size", "not calculated for this pair"))
+    rows += [("Valid until", f"{_t(s.valid_until)} &middot; {_cd(s.valid_until)}"), ("Signal formed", _t(s.formed))]
+    table = "".join(f"<tr><td class=\"k\">{k}</td><td>{v}</td></tr>" for k, v in rows)
+    lots_txt = "your size" if not s.lots else f"{s.lots:.2f}" if s.lots >= 0.0095 else "0.01 (the smallest size, see the risk note above)"
+    steps = (f"<ol><li>Open MT5, go to <b>Trade</b>, tap <b>+</b> (new order).</li><li>Pick <b>{sym}</b> (your broker may add a letter, like {sym}m).</li>"
+             f"<li>Leave it on <b>Market Execution</b>.</li><li>Volume: <b>{lots_txt}</b> (round to your broker's step).</li>"
+             f"<li>Set <b>Stop Loss {f(s.stop)}</b> and <b>Take Profit {f(s.target)}</b>.</li><li>Tap <b>{s.side}</b>.</li>"
+             f"<li>When price reaches {f(s.breakeven)}, edit the trade and move the stop to {f(s.entry)}.</li></ol>")
+    return (f'<div class="card sig {"buy" if buy else "sell"}"><div class="kick">ENTER NOW</div><div class="big">{s.side} {e(p)}</div>'
+            f'<table>{table}</table>{_min_lot_note(s)}<div class="sub"><b>Why:</b> {e(s.reason)}</div>'
+            f'<div class="sub"><b>Skip it if:</b> the time above has passed, or price is already {"above" if buy else "below"} {f(s.chase_limit)}, or the stop price was touched before you got in. '
+            f'Your broker adds a spread, so your fill will be a little different.</div>'
+            f'<details><summary>How to place it in MT5</summary>{steps}</details>'
+            f'<div style="margin-top:10px"><button type="button" class="chip on" data-pair="{e(p)}">Show on chart</button></div></div>')
+
+
+def ready_card(s: Signal) -> str:
+    e, p = html.escape, s.pair
+    buy = s.side == "BUY"
+    f = lambda x: _fmt(p, x)
+    lots = f"about {s.lots:.3f} lots" if s.lots else "size not calculated for this pair"
+    rows = [("Fires when", f"a 15-minute candle closes <b>{'green above' if buy else 'red below'} {f(s.trigger)}</b> and RSI turns {'above 45' if buy else 'below 55'}"),
+            ("Next check", f"{_t(s.next_check)} &middot; {_cd(s.next_check)}"),
+            ("Idea expires", f"{_t(s.valid_until)} (if it has not fired by then, it is dropped)"),
+            ("Live price", f'<span class="fxlp">{f(s.price)} (last candle close)</span>'),
+            ("If it fires (estimate)", f"{s.side} near <b>{f(s.entry)}</b>, stop <b>{f(s.stop)}</b>, target <b>{f(s.target)}</b>, {lots}")]
+    table = "".join(f"<tr><td class=\"k\">{k}</td><td>{v}</td></tr>" for k, v in rows)
+    return (f'<div class="card ready fxready" data-pair="{e(p)}" data-side="{s.side}" data-trigger="{s.trigger}"><div class="kick">GET READY &middot; POSSIBLE {s.side}</div>'
+            f'<div class="big">{e(p)}</div><table>{table}</table><div class="sub"><b>What is happening:</b> {e(s.reason)}</div>'
+            f'<div class="sub"><b>This is only a heads-up. Do not enter yet.</b> Wait for the green or red <b>ENTER</b> card; it will beep and show the exact levels.</div>'
+            f'<div style="margin-top:10px"><button type="button" class="chip on" data-pair="{e(p)}">Show on chart</button></div></div>')
+
+
 def render_page(snap: dict | None, has_key: bool, logo: str = "") -> str:
     e = html.escape
     body = []
@@ -1247,18 +1421,14 @@ def render_page(snap: dict | None, has_key: bool, logo: str = "") -> str:
                     '2) Copy your API key.<br>3) In Render open your service, go to Environment, add FOREX_API_KEY with that key, save. It redeploys by itself.</div></div>')
     elif snap:
         live = [p for p in snap["pairs"] if p["signal"] and p["signal"].state.startswith("ENTER")]
-        boot = {"pairs": [p["pair"] for p in snap["pairs"]], "first": (live[0]["pair"] if live else snap["pairs"][0]["pair"]), "version": snap["rev"], "max": snap["max"]}
+        soon = [p for p in snap["pairs"] if p["signal"] and p["signal"].state.startswith("GET READY")]
+        boot = {"pairs": [p["pair"] for p in snap["pairs"]], "first": (live or soon or snap["pairs"])[0]["pair"], "version": snap["rev"], "max": snap["max"]}
         for p in live:
-            s = p["signal"]
-            cls = "buy" if s.side == "BUY" else "sell"
-            lots = f"{s.lots:.3f} lots" if s.lots else "size: n/a for this pair"
-            body.append(f'<div class="card sig {cls}"><div class="big">{e(s.state)} {e(s.pair)}</div>'
-                        f'<table><tr><td>Enter near</td><td><b>{_fmt(s.pair, s.entry)}</b></td></tr><tr><td>Stop loss</td><td><b>{_fmt(s.pair, s.stop)}</b></td></tr>'
-                        f'<tr><td>Take profit</td><td><b>{_fmt(s.pair, s.target)}</b></td></tr><tr><td>Size</td><td><b>{e(lots)}</b> (risks about ${s.risk_usd:.2f})</td></tr></table>'
-                        f'<div class="sub">{e(s.reason)} Set the stop and target in your broker when you enter.</div>'
-                        f'<div style="margin-top:10px"><button type="button" class="chip on" data-pair="{e(s.pair)}">Show on chart</button></div></div>')
-        if not live:
-            body.append('<div class="card"><b>No entry right now.</b><div class="sub">Nothing to do. This page checks again by itself when the next 15-minute candle closes.</div></div>')
+            body.append(enter_card(p["signal"]))
+        for p in soon:
+            body.append(ready_card(p["signal"]))
+        if not live and not soon:
+            body.append('<div class="card"><b>No entry right now.</b><div class="sub">Nothing to do. You get a heads-up (GET READY) before an entry, and an ENTER card with every detail when it fires. This page checks again by itself when the next 15-minute candle closes.</div></div>')
         body.append('<div class="card" id="fxchart"><div class="chips bar" id="fxbar"></div><div class="chips" id="fxtfs"></div><canvas id="fxc"></canvas>'
                     '<div class="sub" id="fxmsg">Loading chart...</div>'
                     '<div class="sub"><span style="color:#f5c542">EMA 20</span> &middot; <span style="color:#4da3ff">EMA 50</span> &middot; <span style="color:#c77dff">EMA 200</span> &middot; triangles = past signals</div></div>')
@@ -1266,7 +1436,7 @@ def render_page(snap: dict | None, has_key: bool, logo: str = "") -> str:
         for p in snap["pairs"]:
             s = p["signal"]
             state = s.state if s else "starting"
-            cls = "buy" if state == "ENTER BUY" else "sell" if state == "ENTER SELL" else ""
+            cls = "buy" if state == "ENTER BUY" else "sell" if state == "ENTER SELL" else "ready" if state.startswith("GET READY") else ""
             note = e(p["error"]) if p["error"] else e(s.reason) if s else "first reading in a few seconds."
             rows.append(f'<div class="row" data-pair="{e(p["pair"])}" style="cursor:pointer"><div><b>{e(p["pair"])}</b><div class="sub">{note}</div></div><div class="pill {cls}">{e(state)}</div></div>')
         body.append('<div class="card"><b>Pairs</b> <span class="sub">(tap one to open its chart)</span>' + "".join(rows) + f'<div class="sub">Last full check {e(_ago(snap["last_cycle"]))}. Candles: 15 minutes.</div></div>')
@@ -1305,7 +1475,9 @@ body{{margin:0;padding:0 16px calc(40px + env(safe-area-inset-bottom));font:16px
 .sig.buy{{border:2px solid var(--ok)}}.sig.sell{{border:2px solid var(--bad)}}.big{{font-size:24px;font-weight:800;margin-bottom:6px}}
 .sub{{color:var(--mute);font-size:13px;margin-top:6px;line-height:1.45}}table{{width:100%;border-collapse:collapse;margin-top:6px}}td,th{{text-align:left;padding:7px 2px;font-size:15px}}th{{color:var(--mute);font-size:12px}}
 .buy{{color:var(--ok)}}.sell{{color:var(--bad)}}.row{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--line)}}
-.pill{{font-size:12px;font-weight:700;color:var(--mute);background:rgba(128,128,128,.16);border-radius:999px;padding:4px 10px;white-space:nowrap}}.pill.buy,.pill.sell{{color:#fff;background:var(--ok)}}.pill.sell{{background:var(--bad)}}
+.pill{{font-size:12px;font-weight:700;color:var(--mute);background:rgba(128,128,128,.16);border-radius:999px;padding:4px 10px;white-space:nowrap}}.pill.buy,.pill.sell{{color:#fff;background:var(--ok)}}.pill.sell{{background:var(--bad)}}.pill.ready{{color:#000;background:var(--amber)}}
+.card.ready{{border:2px solid var(--amber)}}.kick{{font-size:12px;font-weight:800;letter-spacing:.07em;color:var(--mute)}}.sig.buy .kick{{color:var(--ok)}}.sig.sell .kick{{color:var(--bad)}}.ready .kick{{color:var(--amber)}}
+td.k{{color:var(--mute);font-size:13px;width:36%;vertical-align:top}}td{{vertical-align:top}}details{{margin-top:10px}}summary{{font-weight:700;cursor:pointer}}ol{{margin:8px 0 0;padding-left:20px;line-height:1.5;font-size:14px}}
 .chips{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}}.chip{{font:inherit;font-size:13px;font-weight:700;color:var(--mute);background:rgba(128,128,128,.16);border:0;border-radius:999px;padding:8px 13px}}.chip.on{{background:var(--text);color:var(--bg)}}
 #fxc{{width:100%;height:440px;display:block;touch-action:none;border-radius:12px;margin-top:4px}}
 .chip.big{{font-size:16px;color:var(--text)}}.live{{font-size:12px;font-weight:700;color:var(--mute);margin-left:4px;align-self:center}}.live.on{{color:var(--ok)}}.live.mid{{color:var(--warn)}}.bar{{align-items:center}}
@@ -1315,7 +1487,7 @@ body{{margin:0;padding:0 16px calc(40px + env(safe-area-inset-bottom));font:16px
 .drawer input{{width:100%;box-sizing:border-box;font:inherit;font-size:16px;color:var(--text);background:rgba(128,128,128,.16);border:0;border-radius:12px;padding:11px 14px;margin-bottom:8px}}#fxlist{{overflow:auto;flex:1}}
 .sec{{color:var(--mute);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin:12px 0 4px}}.qrow{{display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid var(--line);cursor:pointer}}.ql{{flex:1;min-width:0}}.qr{{text-align:right}}.chg{{font-size:12px}}
 .x{{font:inherit;font-size:22px;line-height:1;color:var(--mute);background:none;border:0;padding:4px 8px}}.chip:disabled{{opacity:.5}}
-.toast{{position:fixed;left:12px;right:12px;top:calc(10px + env(safe-area-inset-top));padding:14px 16px;border-radius:16px;font-weight:800;color:#fff;z-index:60;transform:translateY(-140%);transition:transform .3s;box-shadow:0 8px 30px rgba(0,0,0,.4)}}.toast.show{{transform:none}}.toast.buy{{background:var(--ok)}}.toast.sell{{background:var(--bad)}}
+.toast{{position:fixed;left:12px;right:12px;top:calc(10px + env(safe-area-inset-top));padding:14px 16px;border-radius:16px;font-weight:800;color:#fff;z-index:60;transform:translateY(-140%);transition:transform .3s;box-shadow:0 8px 30px rgba(0,0,0,.4)}}.toast.show{{transform:none}}.toast.buy{{background:var(--ok)}}.toast.sell{{background:var(--bad)}}.toast.ready{{background:var(--amber);color:#000}}
 h2{{margin:4px 0 12px}}
 </style></head><body><div id="fxtoast" class="toast"></div>
 <header class="topbar"><div class="topin">
@@ -1467,7 +1639,7 @@ class ForexTests(unittest.TestCase):
         for end in range(240, 1200):
             now = cs[end - 1].t + timedelta(minutes=INTERVAL_MIN, seconds=30)
             sig, recs = evaluate("EUR/USD", cs[:end], now)
-            self.assertIn(sig.state, ("WAIT", "ENTER BUY", "ENTER SELL"))
+            self.assertTrue(sig.state in ("WAIT", "ENTER BUY", "ENTER SELL") or sig.state.startswith("GET READY"))
             if sig.state.startswith("ENTER"):
                 seen += 1
                 risk = abs(sig.entry - sig.stop)
@@ -1527,7 +1699,7 @@ class ForexTests(unittest.TestCase):
         self.assertIn("EUR/USD", page); self.assertIn("Paper record", page); self.assertNotIn("SECRETKEY", page)
         self.assertIn("One step left", render_page(None, False))
         self.assertIn('href="/dashboard"', page)
-        self.assertIn(sig.state, ("WAIT", "ENTER BUY", "ENTER SELL"))
+        self.assertTrue(sig.state in ("WAIT", "ENTER BUY", "ENTER SELL") or sig.state.startswith("GET READY"))
 
     def test_chart_payload_and_page(self):
         tr = ForexTracker(["EUR/USD", "XAU/USD"], "SECRETKEY")
@@ -1572,7 +1744,7 @@ L.pointerdown(ev(100,200)); L.pointermove(ev(160,200)); L.pointerup(ev(160,200))
 L.pointerdown(ev(100,200,1)); L.pointerdown(ev(200,200,2)); L.pointermove(ev(60,200,1)); L.pointerup(ev(60,200,1)); L.pointerup(ev(200,200,2));   // pinch
 L.pointerdown(ev(120,220)); L.pointerup(ev(120,220));                                         // tap -> crosshair
 L.wheel(ev(0,0,1,'mouse')); L.dblclick();
-ch.setLive([cs[499][0]+900, 1.1, 1.101, 1.099, 1.1005]); ch.setLive(null); ch.setTf(240); ch.setEma(false); ch.reset(); ch.setData({pair:'EUR/USD',dp:5,state:'WAIT',candles:cs.slice(0,40),signal:null,trades:[]});   // short history must not crash
+ch.setData({pair:'EUR/USD',dp:5,state:'GET READY BUY',candles:cs,signal:null,ready:{side:'BUY',trigger:1.1},trades:[]}); ch.setLive([cs[499][0]+900, 1.1, 1.101, 1.099, 1.1005]); ch.setLive(null); ch.setTf(240); ch.setEma(false); ch.reset(); ch.setData({pair:'EUR/USD',dp:5,state:'WAIT',candles:cs.slice(0,40),signal:null,trades:[]});   // short history must not crash
 ch.setData({pair:'EUR/USD',dp:5,state:'WAIT',candles:[],signal:null,trades:[]});
 const agg = api.aggregate(cs, 60); if (agg.length < 100 || agg.length > 140) throw new Error('aggregate '+agg.length);
 const h = cs.filter(c=>Math.floor(c[0]/3600)===Math.floor(cs[10][0]/3600)); const a1 = agg.find(c=>c[0]===Math.floor(cs[10][0]/3600)*3600);
@@ -1731,6 +1903,73 @@ console.log('ok');
             self.assertFalse(asyncio.run(tr.poll_once()))
         tr.credits_day = datetime.now(UTC).date() - timedelta(days=1)    # a new UTC day resets the count
         self.assertEqual(tr.spend(0), 0)
+
+    def _cards_tracker(self):
+        tr = ForexTracker(["EUR/USD", "XAU/USD", "GBP/USD"], "K")
+        now = datetime.now(UTC)
+        formed = floor_candle(now)
+        tr.signals["EUR/USD"] = Signal("EUR/USD", "ENTER BUY", "Uptrend: test reason.", price=1.1, side="BUY", entry=1.1000, stop=1.0980, target=1.1040, atr=0.0013, formed=formed,
+                                       lots=0.05, risk_usd=1.0, account_usd=100.0, valid_until=formed + timedelta(minutes=30), chase_limit=1.1007, breakeven=1.1020, rsi=55.0)
+        tr.signals["XAU/USD"] = Signal("XAU/USD", "ENTER SELL", "Downtrend: test.", price=2650.0, side="SELL", entry=2650.0, stop=2654.0, target=2642.0, atr=2.6, formed=formed,
+                                       lots=0.0025, risk_usd=1.0, account_usd=100.0, valid_until=formed + timedelta(minutes=30), chase_limit=2648.7, breakeven=2646.0)
+        tr.signals["GBP/USD"] = Signal("GBP/USD", "GET READY SELL", "Downtrend and bounce.", price=1.3, side="SELL", entry=1.2990, stop=1.3010, target=1.2950, atr=0.0013,
+                                       lots=0.05, risk_usd=1.0, account_usd=100.0, valid_until=formed + timedelta(minutes=45), trigger=1.2995, next_check=formed + timedelta(minutes=15), rsi=50.0)
+        tr.last_cycle = time.time()
+        return tr
+
+    def test_enter_card_has_every_detail(self):
+        page = render_page(self._cards_tracker().snapshot(), True)
+        for needle in ("ENTER NOW", "Market BUY", "Do not enter above 1.10070", "Stop loss", "20.0 pips away", "40.0 pips away", "Move stop to entry", "1.10200",
+                       "0.050 lots", "+$2.00", "-$1.00", "Valid until", "Signal formed", "Skip it if", "How to place it in MT5", "Stop Loss 1.09800", "EURUSDm",
+                       "Do not enter below 2648.70", "$4.00 away", "$8.00 away"):
+            self.assertIn(needle, page, needle)
+        self.assertIn("below the usual 0.01 lot minimum", page)               # gold at $100: the smallest lot risks more than 1%
+        self.assertIn("0.01 (the smallest size", page)
+        self.assertIn('class="lt"', page); self.assertIn('class="cd"', page); self.assertIn(" min", page.split('class="cd"')[1][:80])
+
+    def test_get_ready_card_and_pills(self):
+        page = render_page(self._cards_tracker().snapshot(), True)
+        for needle in ("GET READY", "POSSIBLE SELL", "Fires when", "red below 1.29950", "Next check", "Idea expires", "If it fires (estimate)", "Do not enter yet",
+                       'data-trigger="1.2995"', 'class="pill ready"', 'data-side="SELL"'):
+            self.assertIn(needle, page, needle)
+        nothing = ForexTracker(["EUR/USD"], "K"); nothing.last_cycle = time.time()
+        self.assertIn("heads-up (GET READY)", render_page(nothing.snapshot(), True))
+
+    def test_distance_and_min_lot_helpers(self):
+        self.assertEqual(dist_text("EUR/USD", 0.0020), "20.0 pips"); self.assertEqual(dist_text("USD/JPY", 0.30), "30.0 pips")
+        self.assertEqual(dist_text("XAU/USD", -4.0), "$4.00"); self.assertEqual(dist_text("XAG/USD", 0.5), "$0.500")
+        self.assertAlmostEqual(min_lot_risk("XAU/USD", 2650.0, 4.0), 0.01 * 4.0 * 100); self.assertIsNone(min_lot_risk("EUR/GBP", 0.86, 0.001))
+
+    def test_enter_signal_fields_and_get_ready_come_first(self):
+        import random
+        rnd = random.Random(7); px = 1.1; walk = []
+        for _ in range(2500):
+            px += rnd.gauss(0.00003, 0.0004); walk.append(px)
+        cs = _series(2500, lambda i: walk[i], datetime(2026, 11, 2, 0, 0, tzinfo=UTC))
+        seen_ready = seen_enter = 0
+        ready_before_enter = False; prev = None
+        for end in range(260, 2500):
+            sig, _ = evaluate("EUR/USD", cs[:end], cs[end - 1].t + timedelta(minutes=15, seconds=10), 100.0, 1.0)
+            if sig.state.startswith("GET READY"):
+                seen_ready += 1
+                self.assertIsNotNone(sig.trigger); self.assertGreater(sig.valid_until, sig.next_check - timedelta(minutes=15)); self.assertGreaterEqual(sig.valid_until, sig.next_check)
+                self.assertTrue(sig.stop < sig.entry < sig.target if sig.side == "BUY" else sig.target < sig.entry < sig.stop)
+            if sig.state.startswith("ENTER"):
+                seen_enter += 1
+                self.assertEqual(sig.valid_until, sig.formed + timedelta(minutes=30))
+                risk = abs(sig.entry - sig.stop)
+                if sig.side == "BUY":
+                    self.assertTrue(sig.entry < sig.chase_limit and abs(sig.breakeven - (sig.entry + risk)) < 1e-12)
+                else:
+                    self.assertTrue(sig.entry > sig.chase_limit and abs(sig.breakeven - (sig.entry - risk)) < 1e-12)
+                if prev and prev.startswith("GET READY"):
+                    ready_before_enter = True
+            prev = sig.state
+        self.assertGreater(seen_ready, 0); self.assertGreater(seen_enter, 0); self.assertTrue(ready_before_enter)    # the heads-up really arrives before an entry
+
+    def test_health_lists_pairs_getting_ready(self):
+        h = ForexHealth(self._cards_tracker(), True).health()
+        self.assertEqual(h["ready_now"], ["GBP/USD"]); self.assertEqual(h["entries_now"], ["EUR/USD", "XAU/USD"])
 
     def test_next_candle_timer(self):
         s = ForexTracker.seconds_to_next_candle(datetime(2026, 11, 9, 10, 14, 50, tzinfo=UTC))

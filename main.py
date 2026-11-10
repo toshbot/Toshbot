@@ -2900,8 +2900,8 @@ function systemView() {
       fxRow(errs ? "bad" : f.last_check_at ? "ok" : "warn", "Candles and signals", errs ? "problem" : f.last_check_at ? "ok" : "starting",
         "Last check " + ago(f.last_check_at) + " · " + f.pairs.length + " pairs (" + f.pairs.join(", ") + ") · " + (f.credits_today || 0) + " data requests today (free plan: about 800 a day)", errs || null),
       fxRow(MODE[0], "Live prices", MODE[1], "Last price " + ago(f.last_price_at), f.stream_error || null),
-      fxRow("ok", "Signals", f.entries_now.length ? f.entries_now.length + " entry now" : "no entry now",
-        (f.entries_now.length ? f.entries_now.join(", ") + " · " : "") + (p.total || 0) + " paper signals · " + (p.done || 0) + " finished · win rate " + (p.win_rate == null ? "n/a" : Math.round(p.win_rate) + "%") + " · " + (p.total_r || 0) + " R (resets when the server restarts)")];
+      fxRow("ok", "Signals", f.entries_now.length ? f.entries_now.length + " entry now" : (f.ready_now || []).length ? (f.ready_now || []).length + " getting ready" : "no entry now",
+        (f.entries_now.length ? "Enter now: " + f.entries_now.join(", ") + " · " : "") + ((f.ready_now || []).length ? "Getting ready: " + f.ready_now.join(", ") + " · " : "") + (p.total || 0) + " paper signals · " + (p.done || 0) + " finished · win rate " + (p.win_rate == null ? "n/a" : Math.round(p.win_rate) + "%") + " · " + (p.total_r || 0) + " R (resets when the server restarts)")];
   }
   const NAMES = {received:"Messages received",parsed:"Launches parsed",ignored:"Ignored (non-launch)",parse_errors:"Parse errors",dropped_queue_full:"Dropped (queue full)",stored:"New tokens stored",duplicates:"Duplicates skipped",failed_jobs:"Failed storage jobs",analyses:"Analyses run",failed_analyses:"Failed analyses",throttled:"Skipped (daily limit)"};
   const BAD = new Set(["parse_errors", "dropped_queue_full", "failed_jobs", "failed_analyses"]);
