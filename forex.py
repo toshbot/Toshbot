@@ -329,6 +329,7 @@ def parse_twelvedata(payload: dict) -> list[Candle]:
 
 PAIR_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}$")
 STREAM_FRESH = 45.0        # seconds: no price for this long and the stream counts as down
+CREDIT_SOFT_CAP = 700      # the free plan allows about 800 requests a day; stop the optional price polling before the candles run out
 MAX_PAIRS_DEFAULT = 6
 
 
@@ -374,6 +375,9 @@ class ForexTracker:
         self.wake = asyncio.Event()                    # set when new pairs need their first download
         self.ticks: dict[str, tuple[float, float]] = {}   # pair -> (price, time received)
         self.forming: dict[str, list] = {}             # pair -> [candle open epoch, o, h, l, c] built from live prices
+        self.tick_src: dict[str, str] = {}             # pair -> 'stream' or 'poll' (where its latest price came from)
+        self.credits_day = datetime.now(UTC).date()
+        self.credits_used = 0                          # data requests made today (UTC)
         self.last_stream_tick = 0.0
         self.last_poll_tick = 0.0
         self.stream_error = ""
@@ -396,7 +400,15 @@ class ForexTracker:
             self.rev += 1
         return sig
 
+    def spend(self, n: int = 1) -> int:
+        today = datetime.now(UTC).date()
+        if today != self.credits_day:
+            self.credits_day, self.credits_used = today, 0
+        self.credits_used += n
+        return self.credits_used
+
     async def fetch(self, pair: str) -> list[Candle]:
+        self.spend()
         r = await self.client.get("https://api.twelvedata.com/time_series", params={
             "symbol": pair, "interval": f"{INTERVAL_MIN}min", "outputsize": CANDLES_WANTED, "timezone": "UTC", "apikey": self.api_key})
         r.raise_for_status()
@@ -448,7 +460,7 @@ class ForexTracker:
         removed = [p for p in self.pairs if p not in new]
         self.pairs = new
         for p in removed:
-            for d in (self.signals, self.candles, self.errors, self.ticks, self.forming, self._keys):
+            for d in (self.signals, self.candles, self.errors, self.ticks, self.forming, self._keys, self.tick_src):
                 d.pop(p, None)
         if removed:
             self.outbox.append({"action": "unsubscribe", "params": {"symbols": ",".join(removed)}})
@@ -466,6 +478,7 @@ class ForexTracker:
         if pair not in self.pairs or not price or price <= 0:
             return
         self.ticks[pair] = (price, now)
+        self.tick_src[pair] = source
         if source == "stream":
             self.last_stream_tick = now
         else:
@@ -509,9 +522,18 @@ class ForexTracker:
     def stream_alive(self) -> bool:
         return time.time() - self.last_stream_tick < STREAM_FRESH
 
-    def live_mode(self) -> str:
+    def pair_fresh(self, pair: str, within: float) -> bool:
+        t = self.ticks.get(pair)
+        return bool(t and time.time() - t[1] < within)
+
+    def live_mode(self, pair: str | None = None) -> str:
+        """How live the price for this pair is. On the free plan only a few symbols can stream, so this is decided per pair."""
         if market_closed(datetime.now(UTC)):
             return "closed"
+        if pair:
+            if self.pair_fresh(pair, STREAM_FRESH if self.tick_src.get(pair) == "stream" else self.poll_seconds * 3):
+                return "stream" if self.tick_src.get(pair) == "stream" else "poll"
+            return "delayed"
         if self.stream_alive():
             return "stream"
         if time.time() - self.last_poll_tick < self.poll_seconds * 3:
@@ -555,18 +577,27 @@ class ForexTracker:
             streak += 1
             await asyncio.sleep(min(60.0, 4.0 * streak))
 
+    async def poll_once(self) -> bool:
+        """Ask for the latest price of the pair being viewed, if the stream is not already giving it and the daily allowance has room."""
+        if (self.client is None or market_closed(datetime.now(UTC)) or time.time() - self.viewer_ts > 90 or self.viewer_pair not in self.pairs
+                or self.pair_fresh(self.viewer_pair, STREAM_FRESH) and self.tick_src.get(self.viewer_pair) == "stream"):
+            return False
+        if self.spend(0) >= CREDIT_SOFT_CAP:      # protect the candle downloads that the signals depend on
+            return False
+        self.spend()
+        r = await self.client.get("https://api.twelvedata.com/price", params={"symbol": self.viewer_pair, "apikey": self.api_key})
+        data = r.json()
+        if isinstance(data, dict) and "price" in data:
+            self.on_tick(self.viewer_pair, float(data["price"]), source="poll")
+            return True
+        return False
+
     async def run_poll(self) -> None:
-        """Fallback when the stream is down: ask for the price of the pair you are looking at, about once a minute, only while the page is open."""
+        """Fallback for symbols that cannot stream on your plan: about once a minute, only for the pair you are looking at."""
         while True:
             await asyncio.sleep(self.poll_seconds)
             try:
-                if (self.client is None or market_closed(datetime.now(UTC)) or self.stream_alive()
-                        or time.time() - self.viewer_ts > 90 or self.viewer_pair not in self.pairs):
-                    continue
-                r = await self.client.get("https://api.twelvedata.com/price", params={"symbol": self.viewer_pair, "apikey": self.api_key})
-                data = r.json()
-                if isinstance(data, dict) and "price" in data:
-                    self.on_tick(self.viewer_pair, float(data["price"]), source="poll")
+                await self.poll_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -623,7 +654,7 @@ class ForexTracker:
             last_open = int(cs[-1].t.timestamp()) if cs else 0
             if fc[0] > last_open and fc[0] >= int(now // (INTERVAL_MIN * 60) * (INTERVAL_MIN * 60)) - INTERVAL_MIN * 60:
                 candle = list(fc)
-        return {"now": int(now), "rev": self.rev, "mode": self.live_mode(), "quotes": quotes, "candle": candle, "stream_error": self.stream_error}
+        return {"now": int(now), "rev": self.rev, "mode": self.live_mode(pair if pair in self.pairs else None), "quotes": quotes, "candle": candle, "stream_error": self.stream_error}
 
     def chart_payload(self, pair: str) -> dict:
         """Everything the chart needs for one pair, as plain JSON (times are epoch seconds, UTC)."""
@@ -643,7 +674,7 @@ class ForexTracker:
         iso = lambda ts: datetime.fromtimestamp(ts, UTC).isoformat() if ts else None
         return {"mode": self.live_mode(), "pairs": list(self.pairs), "last_check_at": iso(self.last_cycle), "started_at": iso(self.started),
                 "last_price_at": iso(max(self.last_stream_tick, self.last_poll_tick)), "stream_error": self.stream_error,
-                "errors": dict(self.errors), "entries_now": [p for p in self.pairs if self.signals.get(p) and self.signals[p].state.startswith("ENTER")],
+                "errors": dict(self.errors), "credits_today": self.credits_used, "entries_now": [p for p in self.pairs if self.signals.get(p) and self.signals[p].state.startswith("ENTER")],
                 "paper": self.book.stats(), "candles": {p: len(self.candles.get(p, [])) for p in self.pairs}}
 
     def snapshot(self) -> dict:
@@ -1662,6 +1693,44 @@ console.log('ok');
         self.assertIn("GBP/USD", h["errors"]); self.assertEqual(h["candles"]["EUR/USD"], 260); self.assertIn(h["mode"], ("delayed", "closed", "stream", "poll"))
         json.dumps(h)
         self.assertEqual(ForexHealth(None, False).health(), {"enabled": True, "key_set": False})
+
+    def test_free_plan_only_some_symbols_stream_so_the_viewed_pair_is_polled(self):
+        import unittest.mock as um
+        tr = ForexTracker(["EUR/USD", "XAU/USD"], "K", poll_seconds=15)
+        cs, now = _fresh(260)
+        tr.process("XAU/USD", cs, now)
+        tr.on_tick("EUR/USD", 1.1, source="stream")                   # EUR/USD streams, gold does not (not in the free trial list)
+        with um.patch(__name__ + ".market_closed", return_value=False):
+            self.assertEqual(tr.live_mode("EUR/USD"), "stream"); self.assertEqual(tr.live_mode("XAU/USD"), "delayed")
+            tr.live_payload("XAU/USD")                                 # you open the gold chart
+
+            class R:
+                def json(self): return {"price": "2650.50"}
+
+            class C:
+                calls = 0
+                async def get(self, url, params=None):
+                    C.calls += 1; return R()
+            tr.client = C()
+            self.assertTrue(asyncio.run(tr.poll_once()))
+            self.assertEqual(tr.ticks["XAU/USD"][0], 2650.5); self.assertEqual(tr.live_mode("XAU/USD"), "poll")
+            tr.live_payload("EUR/USD")                                 # a streaming pair is never polled
+            self.assertFalse(asyncio.run(tr.poll_once())); self.assertEqual(C.calls, 1)
+
+    def test_polling_stops_before_the_daily_allowance_runs_out(self):
+        import unittest.mock as um
+        tr = ForexTracker(["EUR/USD"], "K")
+        tr.live_payload("EUR/USD")
+
+        class C:
+            async def get(self, url, params=None):
+                raise AssertionError("must not call the provider")
+        tr.client = C()
+        tr.credits_used = CREDIT_SOFT_CAP
+        with um.patch(__name__ + ".market_closed", return_value=False):
+            self.assertFalse(asyncio.run(tr.poll_once()))
+        tr.credits_day = datetime.now(UTC).date() - timedelta(days=1)    # a new UTC day resets the count
+        self.assertEqual(tr.spend(0), 0)
 
     def test_next_candle_timer(self):
         s = ForexTracker.seconds_to_next_candle(datetime(2026, 11, 9, 10, 14, 50, tzinfo=UTC))

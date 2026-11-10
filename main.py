@@ -2898,7 +2898,7 @@ function systemView() {
     const MODE = {stream: ["ok", "streaming"], poll: ["warn", "every minute"], delayed: ["warn", "delayed 15 min"], closed: ["ok", "market closed"]}[f.mode] || ["warn", f.mode];
     return [
       fxRow(errs ? "bad" : f.last_check_at ? "ok" : "warn", "Candles and signals", errs ? "problem" : f.last_check_at ? "ok" : "starting",
-        "Last check " + ago(f.last_check_at) + " · " + f.pairs.length + " pairs (" + f.pairs.join(", ") + ")", errs || null),
+        "Last check " + ago(f.last_check_at) + " · " + f.pairs.length + " pairs (" + f.pairs.join(", ") + ") · " + (f.credits_today || 0) + " data requests today (free plan: about 800 a day)", errs || null),
       fxRow(MODE[0], "Live prices", MODE[1], "Last price " + ago(f.last_price_at), f.stream_error || null),
       fxRow("ok", "Signals", f.entries_now.length ? f.entries_now.length + " entry now" : "no entry now",
         (f.entries_now.length ? f.entries_now.join(", ") + " · " : "") + (p.total || 0) + " paper signals · " + (p.done || 0) + " finished · win rate " + (p.win_rate == null ? "n/a" : Math.round(p.win_rate) + "%") + " · " + (p.total_r || 0) + " R (resets when the server restarts)")];
