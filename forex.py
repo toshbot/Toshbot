@@ -1087,7 +1087,7 @@ function boot() {
   }
   var ss = mkStore("sessionStorage"), ls = mkStore("localStorage");
   var chart = createChart(canvas, theme);
-  var wl = FX.pairs.slice(), quotes = {}, mode = "starting", prevStates = null, dirty = false, busy = false, actx = null;
+  var wl = FX.pairs.slice(), quotes = {}, mode = "starting", prevStates = null, dirty = false, busy = false, actx = null, full = false;
   var pair = ss.get("fxpair"), tf = parseInt(ss.get("fxtf") || "15", 10), emaOn = ss.get("fxema") !== "0";
   if (wl.indexOf(pair) < 0) pair = FX.first;
   if ([15, 60, 240].indexOf(tf) < 0) tf = 15;
@@ -1137,6 +1137,8 @@ function boot() {
     var bar = el("fxbar"); bar.innerHTML = "";
     var s = mk("button", "chip big", pair + " \u25BE"); s.type = "button"; s.addEventListener("click", openDrawer); bar.appendChild(s);
     var lb = mk("span", "live", ""); lb.id = "fxlive"; bar.appendChild(lb);
+    var xb = mk("button", "chip" + (full ? " on" : ""), full ? "Close \u00D7" : "Expand"); xb.type = "button"; xb.style.marginLeft = "auto";
+    xb.addEventListener("click", function () { setFull(!full); }); bar.appendChild(xb);
     var tfs = el("fxtfs"); tfs.innerHTML = "";
     [[15, "M15"], [60, "H1"], [240, "H4"]].forEach(function (it) {
       var b = mk("button", "chip" + (it[0] === tf ? " on" : ""), it[1]); b.type = "button";
@@ -1150,6 +1152,16 @@ function boot() {
     tfs.appendChild(r);
     badge();
   }
+
+  // ---- full-screen chart (the page stays put underneath)
+  function setFull(on) {
+    full = on;
+    el("fxchart").className = "card" + (on ? " full" : "");
+    doc.body.style.overflow = on ? "hidden" : "";
+    ss.set("fxfull", on ? "1" : "0");
+    paint(); chart.resize();
+  }
+  doc.addEventListener("keydown", function (e) { if (full && e.key === "Escape") setFull(false); });
 
   // ---- symbols drawer (like MT5 Quotes)
   var drawer = mk("div", "drawer"), dim = mk("div", "dim");
@@ -1264,6 +1276,7 @@ function boot() {
     postWatch(saved).then(function (res) { if (res && res.join() !== wl.join()) location.reload(); else if (!res) ls.del("fxwl"); });
   }
   paint(); chart.resize(); load();
+  if (ss.get("fxfull") === "1") setFull(true);   // a refresh (new candle) keeps you in full screen
   setInterval(tick, 1500);
   doc.addEventListener("visibilitychange", function () { if (!doc.hidden) tick(); });
   window.addEventListener("fxtheme", function () { chart.draw(); });
@@ -1488,6 +1501,8 @@ td.k{{color:var(--mute);font-size:13px;width:36%;vertical-align:top}}td{{vertica
 .sec{{color:var(--mute);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;margin:12px 0 4px}}.qrow{{display:flex;align-items:center;gap:10px;padding:11px 0;border-top:1px solid var(--line);cursor:pointer}}.ql{{flex:1;min-width:0}}.qr{{text-align:right}}.chg{{font-size:12px}}
 .x{{font:inherit;font-size:22px;line-height:1;color:var(--mute);background:none;border:0;padding:4px 8px}}.chip:disabled{{opacity:.5}}
 .toast{{position:fixed;left:12px;right:12px;top:calc(10px + env(safe-area-inset-top));padding:14px 16px;border-radius:16px;font-weight:800;color:#fff;z-index:60;transform:translateY(-140%);transition:transform .3s;box-shadow:0 8px 30px rgba(0,0,0,.4)}}.toast.show{{transform:none}}.toast.buy{{background:var(--ok)}}.toast.sell{{background:var(--bad)}}.toast.ready{{background:var(--amber);color:#000}}
+#fxchart.full{{position:fixed;inset:0;z-index:30;margin:0;border-radius:0;border:0;display:flex;flex-direction:column;padding:calc(10px + env(safe-area-inset-top)) 12px calc(10px + env(safe-area-inset-bottom))}}
+#fxchart.full #fxc{{flex:1;height:auto;min-height:0;margin-top:2px}}#fxchart.full .sub{{display:none}}#fxchart.full .chips{{margin-bottom:6px;flex:none}}
 h2{{margin:4px 0 12px}}
 </style></head><body><div id="fxtoast" class="toast"></div>
 <header class="topbar"><div class="topin">
@@ -1970,6 +1985,14 @@ console.log('ok');
     def test_health_lists_pairs_getting_ready(self):
         h = ForexHealth(self._cards_tracker(), True).health()
         self.assertEqual(h["ready_now"], ["GBP/USD"]); self.assertEqual(h["entries_now"], ["EUR/USD", "XAU/USD"])
+
+    def test_chart_can_expand_full_screen(self):
+        tr = ForexTracker(["EUR/USD"], "K")
+        cs, now = _fresh(260)
+        tr.process("EUR/USD", cs, now); tr.last_cycle = time.time()
+        page = render_page(tr.snapshot(), True)
+        for needle in ("#fxchart.full{", "setFull", "Expand", "fxfull", "Escape"):
+            self.assertIn(needle, page, needle)
 
     def test_next_candle_timer(self):
         s = ForexTracker.seconds_to_next_candle(datetime(2026, 11, 9, 10, 14, 50, tzinfo=UTC))
