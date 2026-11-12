@@ -2,7 +2,9 @@
 
 HOW IT WORKS (plain words)
   * Every 15 minutes (when each 15-minute candle closes) it downloads fresh candles for each pair.
-  * It looks for ONE simple setup: the market is trending, price pulled back, then the trend resumed.
+  * It looks for three kinds of setup: a trend PULLBACK (trend, dip, then the trend resumes), a BREAKOUT (price pushes past the
+    last 20 candles' high or low with the trend) and a RANGE BOUNCE (sideways market, RSI stretched then turning back).
+    Each one is tracked separately in the paper record so you can see which ones really work.
   * When the setup appears the page shows ENTER BUY or ENTER SELL with the price to enter, where to put the stop loss,
     where to take profit, and a position size that risks only a small % of your account.
   * Every signal is also tracked on paper (did it hit the target or the stop?) so you can see if it really works
@@ -39,6 +41,7 @@ TARGET_R = 2.0              # take profit = 2 x the stop distance
 CHASE_ATR = 0.5             # if price already ran 0.5 x ATR past the entry, do not chase it
 SESSION_HOURS = (7, 20)     # only signal during London + New York hours (UTC)
 EXPIRE_HOURS = 24           # a paper trade that hits neither level in 24h is closed at market
+BREAKOUT_LOOKBACK = 20      # a breakout = a close beyond the highest high / lowest low of the last 20 candles
 DEFAULT_PAIRS = "EUR/USD,GBP/USD,USD/JPY,XAU/USD"
 
 UTC = timezone.utc
@@ -111,8 +114,15 @@ def indicators(cs: list[Candle]) -> Indicators:
     return Indicators(ema(closes, 20), ema(closes, 50), ema(closes, 200), rsi(closes), atr([c.h for c in cs], [c.l for c in cs], closes))
 
 
+SETUPS = {   # three ways to find an entry, so the bot has something to say in trending AND in sideways markets
+    "pullback": {"label": "Trend pullback", "stop": STOP_ATR, "rr": TARGET_R},
+    "breakout": {"label": "Breakout", "stop": 1.5, "rr": 2.0},
+    "range": {"label": "Range bounce", "stop": 1.5, "rr": 1.5},
+}
+
+
 # ============================================================================
-# THE SETUP: trend + pullback + resume
+# THE SETUPS: trend pullback, breakout, range bounce
 # ============================================================================
 def trigger(cs: list[Candle], ind: Indicators, i: int) -> str | None:
     """'BUY' / 'SELL' if candle i completed the setup, else None. Only looks at candle i and earlier."""
@@ -129,6 +139,52 @@ def trigger(cs: list[Candle], ind: Indicators, i: int) -> str | None:
         return "BUY"
     if down and max(recent) >= 60 and c.c < c.o and c.c < ind.e20[i] and ind.rsi[i] < 55:
         return "SELL"
+    return None
+
+
+def trigger_breakout(cs: list[Candle], ind: Indicators, i: int) -> str | None:
+    """Trend-following: price closes beyond the last 20 candles' high (or low) in the direction of the trend, with momentum."""
+    if i < 210:
+        return None
+    if any(x is None for x in (ind.e50[i], ind.e200[i], ind.rsi[i], ind.atr[i])):
+        return None
+    c, a, r = cs[i], ind.atr[i], ind.rsi[i]
+    if c.h - c.l > 2.5 * a:        # a spike candle: the move already happened
+        return None
+    prior = cs[i - BREAKOUT_LOOKBACK:i]
+    before = cs[i - 1 - BREAKOUT_LOOKBACK:i - 1]            # what the previous candle was compared with
+    body = abs(c.c - c.o)
+    if ind.e50[i] > ind.e200[i] and c.c > max(x.h for x in prior) and c.c > c.o and body >= 0.4 * a and 55 <= r <= 80:
+        if cs[i - 1].c <= max(x.h for x in before):         # a FRESH breakout, not the 3rd candle of the same run
+            return "BUY"
+    if ind.e50[i] < ind.e200[i] and c.c < min(x.l for x in prior) and c.c < c.o and body >= 0.4 * a and 20 <= r <= 45:
+        if cs[i - 1].c >= min(x.l for x in before):
+            return "SELL"
+    return None
+
+
+def is_flat(ind: Indicators, i: int) -> bool:
+    e50, e200, e200p, a = ind.e50[i], ind.e200[i], ind.e200[i - 10], ind.atr[i]
+    return None not in (e50, e200, e200p, a) and abs(e50 - e200) < 1.2 * a and abs(e200 - e200p) < 0.5 * a
+
+
+def trigger_range(cs: list[Candle], ind: Indicators, i: int) -> str | None:
+    """Sideways market: RSI was stretched (30 or 70) and has just turned back, so bet on a snap back toward the middle."""
+    if i < 210 or ind.rsi[i] is None or ind.rsi[i - 1] is None or not is_flat(ind, i):
+        return None
+    c = cs[i]
+    if ind.rsi[i - 1] <= 30 < ind.rsi[i] and c.c > c.o:
+        return "BUY"
+    if ind.rsi[i - 1] >= 70 > ind.rsi[i] and c.c < c.o:
+        return "SELL"
+    return None
+
+
+def trigger_any(cs: list[Candle], ind: Indicators, i: int) -> tuple[str, str] | None:
+    for name, fn in (("pullback", trigger), ("breakout", trigger_breakout), ("range", trigger_range)):
+        side = fn(cs, ind, i)
+        if side:
+            return name, side
     return None
 
 
@@ -180,6 +236,9 @@ class Signal:
     trigger: float | None = None          # GET READY: price must close beyond this level to fire the entry
     next_check: datetime | None = None    # GET READY: when the next candle closes
     rsi: float | None = None
+    setup: str = ""                       # which of the setups produced it
+    rr: float = TARGET_R                  # reward as a multiple of the risk
+    fires_text: str = ""                  # GET READY: plain-words trigger
 
 
 def pip_size(pair: str) -> float:
@@ -249,20 +308,20 @@ def evaluate(pair: str, cs: list[Candle], now: datetime, account_usd: float = 10
     a_now = ind.atr[n - 1]
     found = []
     for i in range(n - 1, max(n - 1 - 8, 209), -1):     # look back 8 candles for the paper record
-        side = trigger(cs, ind, i)
-        if side:
-            a = ind.atr[i]
-            d = STOP_ATR * a
-            e = cs[i].c
-            stop, tgt = (e - d, e + TARGET_R * d) if side == "BUY" else (e + d, e - TARGET_R * d)
-            found.append((side, cs[i].t + timedelta(minutes=INTERVAL_MIN), e, stop, tgt, i, a))
+        hit = trigger_any(cs, ind, i)
+        if hit:
+            setup, side = hit
+            a, par, e = ind.atr[i], SETUPS[hit[0]], cs[i].c
+            d = par["stop"] * a
+            stop, tgt = (e - d, e + par["rr"] * d) if side == "BUY" else (e + d, e - par["rr"] * d)
+            found.append((side, cs[i].t + timedelta(minutes=INTERVAL_MIN), e, stop, tgt, i, a, setup))
     base = Signal(pair, "WAIT", watch_reason(ind, n - 1), price=price, atr=a_now)
     live = [f for f in found if f[5] >= n - MAX_SIGNAL_AGE]
-    records = [(f[0], f[1], f[2], f[3], f[4]) for f in found]
+    records = [(f[0], f[1], f[2], f[3], f[4], f[7]) for f in found]
     if not live:
-        ready = ready_signal(pair, cs, ind, n, found, account_usd, risk_pct)
+        ready = ready_signal(pair, cs, ind, n, found, account_usd, risk_pct) or ready_breakout(pair, cs, ind, n, found, account_usd, risk_pct)
         return (ready or base), records
-    side, formed, e, stop, tgt, i, a = live[0]
+    side, formed, e, stop, tgt, i, a, setup = live[0]
     why = None
     if not in_session(formed - timedelta(minutes=INTERVAL_MIN)):
         why = "a setup formed but outside London/New York hours, so it is skipped (thin, spiky market)."
@@ -276,15 +335,27 @@ def evaluate(pair: str, cs: list[Candle], now: datetime, account_usd: float = 10
     risk_usd = account_usd * risk_pct / 100.0
     lots = lots_for_risk(pair, e, abs(e - stop), risk_usd)
     risk_dist = abs(e - stop)
-    word = "Uptrend" if side == "BUY" else "Downtrend"
-    cand = "green" if side == "BUY" else "red"
-    rel = "above" if side == "BUY" else "below"
-    why_text = (f"{word}: price pulled back, then a {cand} candle closed {rel} the 20 average with RSI at {ind.rsi[i]:.0f}, so the trend is resuming. "
-                f"Enter now at market.")
+    rr = SETUPS[setup]["rr"]
+    why_text = enter_reason(pair, setup, side, cs, ind, i)
     return Signal(pair, f"ENTER {side}", why_text, price=price, side=side, entry=e, stop=stop, target=tgt, atr=a, formed=formed, lots=lots, risk_usd=risk_usd,
                   account_usd=account_usd, valid_until=formed + timedelta(minutes=INTERVAL_MIN * MAX_SIGNAL_AGE),
                   chase_limit=e + CHASE_ATR * a if side == "BUY" else e - CHASE_ATR * a,
-                  breakeven=e + risk_dist if side == "BUY" else e - risk_dist, rsi=ind.rsi[i]), records
+                  breakeven=e + risk_dist if side == "BUY" else e - risk_dist, rsi=ind.rsi[i], setup=setup, rr=rr), records
+
+
+def enter_reason(pair: str, setup: str, side: str, cs: list[Candle], ind: Indicators, i: int) -> str:
+    buy, r, dp = side == "BUY", ind.rsi[i], decimals(pair)
+    word = "Uptrend" if buy else "Downtrend"
+    if setup == "breakout":
+        prior = cs[i - BREAKOUT_LOOKBACK:i]
+        lvl = max(x.h for x in prior) if buy else min(x.l for x in prior)
+        return (f"{word}: price broke {'above the highest' if buy else 'below the lowest'} point of the last {BREAKOUT_LOOKBACK} candles ({lvl:.{dp}f}) "
+                f"with strong momentum (RSI {r:.0f}). A breakout in the trend direction. Enter now at market.")
+    if setup == "range":
+        return (f"The market is moving sideways (no strong trend) and RSI just turned back from an extreme ({ind.rsi[i - 1]:.0f} to {r:.0f}). "
+                f"This bets on a snap back toward the middle, so the target is smaller ({SETUPS['range']['rr']:g} times the risk). Enter now at market.")
+    return (f"{word}: price {'pulled back' if buy else 'bounced up'}, then a {'green' if buy else 'red'} candle closed {'above' if buy else 'below'} "
+            f"the 20 average with RSI at {r:.0f}, so the trend is resuming. Enter now at market.")
 
 
 def ready_signal(pair: str, cs: list[Candle], ind: Indicators, n: int, found: list, account_usd: float, risk_pct: float) -> Signal | None:
@@ -301,7 +372,7 @@ def ready_signal(pair: str, cs: list[Candle], ind: Indicators, n: int, found: li
         side, hits = "SELL", [j for j, v in win if v >= 60]
     else:
         return None
-    if not hits or any(f[0] == side for f in found):      # no pullback yet, or the entry already fired for this pullback
+    if not hits or any(f[0] == side and f[7] == "pullback" for f in found):      # no pullback yet, or the entry already fired for this pullback
         return None
     left = max(hits) + 6 - i                              # how many more candle closes can still trigger it
     if left <= 0:
@@ -321,7 +392,38 @@ def ready_signal(pair: str, cs: list[Candle], ind: Indicators, n: int, found: li
     return Signal(pair, f"GET READY {side}", why_text, price=cs[i].c, side=side, entry=entry, stop=stop, target=tgt, atr=a,
                   lots=lots_for_risk(pair, entry, d, risk_usd), risk_usd=risk_usd, account_usd=account_usd,
                   valid_until=last_close + timedelta(minutes=INTERVAL_MIN * left), trigger=e20,
-                  next_check=last_close + timedelta(minutes=INTERVAL_MIN), rsi=r)
+                  next_check=last_close + timedelta(minutes=INTERVAL_MIN), rsi=r, setup="pullback", rr=TARGET_R,
+                  fires_text=f"a 15-minute candle closes {'green above' if side == 'BUY' else 'red below'} {e20:.{decimals(pair)}f} and RSI turns {'above 45' if side == 'BUY' else 'below 55'}")
+
+
+def ready_breakout(pair: str, cs: list[Candle], ind: Indicators, n: int, found: list, account_usd: float, risk_pct: float) -> Signal | None:
+    """Advance warning for a breakout: price is pressing right under the 20-candle high (or above the low) in the trend direction."""
+    i = n - 1
+    if i < 210 or any(x is None for x in (ind.e50[i], ind.e200[i], ind.rsi[i], ind.atr[i])):
+        return None
+    c, a, r = cs[i], ind.atr[i], ind.rsi[i]
+    last_close = c.t + timedelta(minutes=INTERVAL_MIN)
+    if not in_session(last_close):
+        return None
+    window = cs[n - BREAKOUT_LOOKBACK:n]            # the 20 candles the NEXT candle will be compared with
+    if ind.e50[i] > ind.e200[i] and 45 <= r <= 75 and max(x.h for x in window) - c.c <= 0.4 * a:
+        side, level = "BUY", max(x.h for x in window)
+    elif ind.e50[i] < ind.e200[i] and 25 <= r <= 55 and c.c - min(x.l for x in window) <= 0.4 * a:
+        side, level = "SELL", min(x.l for x in window)
+    else:
+        return None
+    if any(f[0] == side and f[7] == "breakout" for f in found):
+        return None
+    par = SETUPS["breakout"]
+    d = par["stop"] * a
+    stop, tgt = (level - d, level + par["rr"] * d) if side == "BUY" else (level + d, level - par["rr"] * d)
+    risk_usd = account_usd * risk_pct / 100.0
+    dp = decimals(pair)
+    return Signal(pair, f"GET READY {side}", f"{'Uptrend' if side == 'BUY' else 'Downtrend'} and price is pressing against the {BREAKOUT_LOOKBACK}-candle {'high' if side == 'BUY' else 'low'}. "
+                  f"If a candle closes beyond it with momentum, that is a breakout entry.", price=c.c, side=side, entry=level, stop=stop, target=tgt, atr=a,
+                  lots=lots_for_risk(pair, level, d, risk_usd), risk_usd=risk_usd, account_usd=account_usd, valid_until=last_close + timedelta(minutes=INTERVAL_MIN),
+                  trigger=level, next_check=last_close + timedelta(minutes=INTERVAL_MIN), rsi=r, setup="breakout", rr=par["rr"],
+                  fires_text=f"a 15-minute candle closes {'green above' if side == 'BUY' else 'red below'} {level:.{dp}f} (the {BREAKOUT_LOOKBACK}-candle {'high' if side == 'BUY' else 'low'}) with RSI {'55 to 80' if side == 'BUY' else '20 to 45'}")
 
 
 # ============================================================================
@@ -338,6 +440,8 @@ class PaperTrade:
     status: str = "OPEN"      # OPEN | WIN | LOSS | EXPIRED
     r: float = 0.0
     closed: datetime | None = None
+    setup: str = "pullback"
+    rr: float = TARGET_R
 
 
 class PaperBook:
@@ -346,12 +450,14 @@ class PaperBook:
         self._keys: set = set()
 
     def add(self, pair: str, rec: tuple) -> bool:
-        side, formed, e, stop, tgt = rec
-        key = (pair, side, formed)
+        side, formed, e, stop, tgt = rec[:5]
+        setup = rec[5] if len(rec) > 5 else "pullback"
+        key = (pair, side, formed, setup)
         if key in self._keys or not in_session(formed - timedelta(minutes=INTERVAL_MIN)):
             return False
         self._keys.add(key)
-        self.trades.append(PaperTrade(pair, side, formed, e, stop, tgt))
+        risk = abs(e - stop)
+        self.trades.append(PaperTrade(pair, side, formed, e, stop, tgt, setup=setup, rr=(abs(tgt - e) / risk) if risk else TARGET_R))
         return True
 
     def update(self, pair: str, cs: list[Candle], now: datetime) -> None:
@@ -369,18 +475,24 @@ class PaperBook:
                     tr.status, tr.r, tr.closed = "LOSS", -1.0, c.t
                     break
                 if hit_tgt:
-                    tr.status, tr.r, tr.closed = "WIN", TARGET_R, c.t
+                    tr.status, tr.r, tr.closed = "WIN", round(tr.rr, 2), c.t
                     break
             if tr.status == "OPEN" and cs and now - tr.opened > timedelta(hours=EXPIRE_HOURS):
                 move = (cs[-1].c - tr.entry) if tr.side == "BUY" else (tr.entry - cs[-1].c)
                 tr.status, tr.r, tr.closed = "EXPIRED", round(move / risk, 2) if risk else 0.0, cs[-1].t
         del self.trades[:-200]
 
-    def stats(self) -> dict:
-        done = [t for t in self.trades if t.status in ("WIN", "LOSS", "EXPIRED")]
+    @staticmethod
+    def _stat(trades: list) -> dict:
+        done = [t for t in trades if t.status in ("WIN", "LOSS", "EXPIRED")]
         wins = sum(1 for t in done if t.r > 0)
-        return {"total": len(self.trades), "open": sum(1 for t in self.trades if t.status == "OPEN"), "done": len(done), "wins": wins,
+        return {"total": len(trades), "open": sum(1 for t in trades if t.status == "OPEN"), "done": len(done), "wins": wins,
                 "win_rate": (100.0 * wins / len(done)) if done else None, "total_r": round(sum(t.r for t in done), 2)}
+
+    def stats(self) -> dict:
+        out = self._stat(self.trades)
+        out["by_setup"] = {k: {"label": v["label"], **self._stat([t for t in self.trades if t.setup == k])} for k, v in SETUPS.items()}
+        return out
 
 
 # ============================================================================
@@ -1390,17 +1502,20 @@ def enter_card(s: Signal) -> str:
             ("Move stop to entry", f"once price reaches <b>{f(s.breakeven)}</b> (then you cannot lose on it)")]
     if s.lots:
         rows += [("Size", f"<b>{s.lots:.3f} lots</b>"),
-                 ("If it works / fails", f'<span class="buy">+${s.risk_usd * TARGET_R:.2f}</span> / <span class="sell">-${s.risk_usd:.2f}</span> (risking {s.risk_usd / s.account_usd * 100:.0f}% of ${s.account_usd:.0f})')]
+                 ("If it works / fails", f'<span class="buy">+${s.risk_usd * s.rr:.2f}</span> / <span class="sell">-${s.risk_usd:.2f}</span> (risking {s.risk_usd / s.account_usd * 100:.0f}% of ${s.account_usd:.0f})')]
     else:
         rows.append(("Size", "not calculated for this pair"))
+    label = SETUPS.get(s.setup, {}).get("label", "")
     rows += [("Valid until", f"{_t(s.valid_until)} &middot; {_cd(s.valid_until)}"), ("Signal formed", _t(s.formed))]
+    if label:
+        rows.append(("Setup", f"{e(label)} (target is {s.rr:g} times the risk)"))
     table = "".join(f"<tr><td class=\"k\">{k}</td><td>{v}</td></tr>" for k, v in rows)
     lots_txt = "your size" if not s.lots else f"{s.lots:.2f}" if s.lots >= 0.0095 else "0.01 (the smallest size, see the risk note above)"
     steps = (f"<ol><li>Open MT5, go to <b>Trade</b>, tap <b>+</b> (new order).</li><li>Pick <b>{sym}</b> (your broker may add a letter, like {sym}m).</li>"
              f"<li>Leave it on <b>Market Execution</b>.</li><li>Volume: <b>{lots_txt}</b> (round to your broker's step).</li>"
              f"<li>Set <b>Stop Loss {f(s.stop)}</b> and <b>Take Profit {f(s.target)}</b>.</li><li>Tap <b>{s.side}</b>.</li>"
              f"<li>When price reaches {f(s.breakeven)}, edit the trade and move the stop to {f(s.entry)}.</li></ol>")
-    return (f'<div class="card sig {"buy" if buy else "sell"}"><div class="kick">ENTER NOW</div><div class="big">{s.side} {e(p)}</div>'
+    return (f'<div class="card sig {"buy" if buy else "sell"}"><div class="kick">ENTER NOW{(" &middot; " + e(label.upper())) if label else ""}</div><div class="big">{s.side} {e(p)}</div>'
             f'<table>{table}</table>{_min_lot_note(s)}<div class="sub"><b>Why:</b> {e(s.reason)}</div>'
             f'<div class="sub"><b>Skip it if:</b> the time above has passed, or price is already {"above" if buy else "below"} {f(s.chase_limit)}, or the stop price was touched before you got in. '
             f'Your broker adds a spread, so your fill will be a little different.</div>'
@@ -1413,13 +1528,14 @@ def ready_card(s: Signal) -> str:
     buy = s.side == "BUY"
     f = lambda x: _fmt(p, x)
     lots = f"about {s.lots:.3f} lots" if s.lots else "size not calculated for this pair"
-    rows = [("Fires when", f"a 15-minute candle closes <b>{'green above' if buy else 'red below'} {f(s.trigger)}</b> and RSI turns {'above 45' if buy else 'below 55'}"),
+    label = SETUPS.get(s.setup, {}).get("label", "")
+    rows = [("Fires when", e(s.fires_text) if s.fires_text else f"a 15-minute candle closes <b>{'green above' if buy else 'red below'} {f(s.trigger)}</b> and RSI turns {'above 45' if buy else 'below 55'}"),
             ("Next check", f"{_t(s.next_check)} &middot; {_cd(s.next_check)}"),
             ("Idea expires", f"{_t(s.valid_until)} (if it has not fired by then, it is dropped)"),
             ("Live price", f'<span class="fxlp">{f(s.price)} (last candle close)</span>'),
             ("If it fires (estimate)", f"{s.side} near <b>{f(s.entry)}</b>, stop <b>{f(s.stop)}</b>, target <b>{f(s.target)}</b>, {lots}")]
     table = "".join(f"<tr><td class=\"k\">{k}</td><td>{v}</td></tr>" for k, v in rows)
-    return (f'<div class="card ready fxready" data-pair="{e(p)}" data-side="{s.side}" data-trigger="{s.trigger}"><div class="kick">GET READY &middot; POSSIBLE {s.side}</div>'
+    return (f'<div class="card ready fxready" data-pair="{e(p)}" data-side="{s.side}" data-trigger="{s.trigger}"><div class="kick">GET READY &middot; POSSIBLE {s.side}{(" &middot; " + e(label.upper())) if label else ""}</div>'
             f'<div class="big">{e(p)}</div><table>{table}</table><div class="sub"><b>What is happening:</b> {e(s.reason)}</div>'
             f'<div class="sub"><b>This is only a heads-up. Do not enter yet.</b> Wait for the green or red <b>ENTER</b> card; it will beep and show the exact levels.</div>'
             f'<div style="margin-top:10px"><button type="button" class="chip on" data-pair="{e(p)}">Show on chart</button></div></div>')
@@ -1456,6 +1572,10 @@ def render_page(snap: dict | None, has_key: bool, logo: str = "") -> str:
         st = snap["stats"]
         wr = "n/a yet" if st["win_rate"] is None else f'{st["win_rate"]:.0f}%'
         body.append(f'<div class="card"><b>Paper record (since the server last started)</b><div class="sub">{st["total"]} signals &middot; {st["open"]} open &middot; {st["done"]} finished &middot; win rate {wr} &middot; total {st["total_r"]:+.1f} R</div>')
+        lines = "".join(f'<div class="sub">{e(v["label"])}: {v["total"]} signals &middot; {v["done"]} finished &middot; win rate {"n/a yet" if v["win_rate"] is None else str(round(v["win_rate"])) + "%"} &middot; {v["total_r"]:+.1f} R</div>'
+                        for v in st.get("by_setup", {}).values() if v["total"])
+        if lines:
+            body.append(lines)
         if snap["trades"]:
             rr = "".join(f'<tr><td>{e(t.pair)}</td><td class="{"buy" if t.side == "BUY" else "sell"}">{t.side}</td><td>{e(t.status)}</td><td>{t.r:+.1f}R</td></tr>' for t in snap["trades"])
             body.append(f'<table><tr><th>Pair</th><th>Side</th><th>Result</th><th>R</th></tr>{rr}</table>')
@@ -1658,7 +1778,7 @@ class ForexTests(unittest.TestCase):
             if sig.state.startswith("ENTER"):
                 seen += 1
                 risk = abs(sig.entry - sig.stop)
-                self.assertAlmostEqual(abs(sig.target - sig.entry), TARGET_R * risk, places=9)
+                self.assertAlmostEqual(abs(sig.target - sig.entry), sig.rr * risk, places=9)
                 self.assertTrue(sig.stop < sig.entry < sig.target if sig.side == "BUY" else sig.target < sig.entry < sig.stop)
                 self.assertTrue(sig.lots is None or sig.lots > 0)
         self.assertGreater(seen, 0)   # the setup really does fire on this data, so the geometry checks above ran
@@ -1993,6 +2113,88 @@ console.log('ok');
         page = render_page(tr.snapshot(), True)
         for needle in ("#fxchart.full{", "setFull", "Expand", "fxfull", "Escape"):
             self.assertIn(needle, page, needle)
+
+    def _flat_candles(self, n=260):
+        return [Candle(datetime(2026, 11, 2, tzinfo=UTC) + timedelta(minutes=15 * i), 1.0, 1.001, 0.999, 1.0) for i in range(n)]
+
+    def test_breakout_trigger_and_freshness(self):
+        n, i = 260, 250
+        cs = self._flat_candles(n)
+        ind = Indicators([1.0] * n, [1.01] * n, [1.0] * n, [65.0] * n, [0.01] * n)       # uptrend: 50 EMA above 200 EMA, RSI 65, ATR 0.01
+        cs[i] = Candle(cs[i].t, 1.0, 1.011, 0.999, 1.01)                                  # green candle closing above the last 20 highs
+        self.assertEqual(trigger_breakout(cs, ind, i), "BUY")
+        self.assertEqual(trigger_any(cs, ind, i), ("breakout", "BUY"))
+        cs[i - 1] = Candle(cs[i - 1].t, 1.0, 1.0105, 0.999, 1.0102)                       # the candle before also broke out: this is a continuation
+        self.assertIsNone(trigger_breakout(cs, ind, i))
+        cs2 = self._flat_candles(n); cs2[i] = Candle(cs2[i].t, 1.0, 1.05, 0.999, 1.04)    # a spike candle (range over 2.5 ATR): too late
+        self.assertIsNone(trigger_breakout(cs2, ind, i))
+        cs3 = self._flat_candles(n); cs3[i] = Candle(cs3[i].t, 1.0, 1.0011, 0.999, 1.001)  # barely above the highs with no body
+        self.assertIsNone(trigger_breakout(cs3, ind, i))
+        down = Indicators([1.0] * n, [0.99] * n, [1.0] * n, [35.0] * n, [0.01] * n)
+        cs4 = self._flat_candles(n); cs4[i] = Candle(cs4[i].t, 1.0, 1.001, 0.989, 0.99)
+        self.assertEqual(trigger_breakout(cs4, down, i), "SELL")
+
+    def test_range_trigger_only_in_a_sideways_market(self):
+        n, i = 260, 250
+        cs = self._flat_candles(n)
+        ind = Indicators([1.0] * n, [1.0] * n, [1.0] * n, [50.0] * n, [0.001] * n)
+        ind.rsi[i - 1], ind.rsi[i] = 28.0, 33.0
+        cs[i] = Candle(cs[i].t, 1.0, 1.002, 0.999, 1.0015)
+        self.assertEqual(trigger_range(cs, ind, i), "BUY")
+        trending = Indicators([1.0] * n, [1.05] * n, [1.0] * n, [50.0] * n, [0.001] * n)
+        trending.rsi[i - 1], trending.rsi[i] = 28.0, 33.0
+        self.assertIsNone(trigger_range(cs, trending, i))                                  # strong trend: the range idea is switched off
+        ind.rsi[i - 1], ind.rsi[i] = 72.0, 66.0
+        cs[i] = Candle(cs[i].t, 1.0, 1.001, 0.998, 0.9985)
+        self.assertEqual(trigger_range(cs, ind, i), "SELL")
+
+    def test_paper_record_is_kept_per_setup_with_its_own_reward(self):
+        book = PaperBook()
+        t0 = datetime(2026, 11, 9, 9, 0, tzinfo=UTC)
+        self.assertTrue(book.add("EUR/USD", ("BUY", t0, 1.1000, 1.0985, 1.10225, "range")))          # 1.5 R target
+        self.assertTrue(book.add("EUR/USD", ("BUY", t0, 1.1000, 1.0985, 1.1030, "breakout")))        # same candle, different setup: both are tracked
+        self.assertFalse(book.add("EUR/USD", ("BUY", t0, 1.1000, 1.0985, 1.1030, "breakout")))
+        book.update("EUR/USD", [Candle(t0, 1.1, 1.1024, 1.0995, 1.1020)], t0 + timedelta(hours=1))
+        by = {t.setup: t for t in book.trades}
+        self.assertEqual((by["range"].status, by["range"].r), ("WIN", 1.5)); self.assertEqual(by["breakout"].status, "OPEN")
+        st = book.stats()
+        self.assertEqual(st["by_setup"]["range"]["total_r"], 1.5); self.assertEqual(st["by_setup"]["range"]["label"], "Range bounce")
+        self.assertEqual(st["by_setup"]["pullback"]["total"], 0); self.assertEqual(st["total"], 2)
+
+    def test_setups_produce_more_signals_than_pullback_alone(self):
+        import random
+        rnd = random.Random(11); px = 1.1; walk = []
+        for _ in range(3000):
+            px += rnd.gauss(0.0, 0.0004); walk.append(px)
+        cs = _series(3000, lambda i: walk[i], datetime(2026, 11, 2, 0, 0, tzinfo=UTC))
+        ind = indicators(cs)
+        hits = [trigger_any(cs, ind, i) for i in range(210, 3000)]
+        names = {h[0] for h in hits if h}
+        self.assertTrue({"pullback", "breakout"} <= names)
+        self.assertGreater(sum(1 for h in hits if h), 1.5 * sum(1 for i in range(210, 3000) if trigger(cs, ind, i)))
+
+    def test_cards_name_the_setup_and_use_its_reward(self):
+        tr = self._cards_tracker()
+        tr.signals["EUR/USD"].setup, tr.signals["EUR/USD"].rr = "range", 1.5
+        tr.signals["GBP/USD"].setup, tr.signals["GBP/USD"].fires_text = "breakout", "a 15-minute candle closes red below 1.29950 (the 20-candle low) with RSI 20 to 45"
+        page = render_page(tr.snapshot(), True)
+        for needle in ("ENTER NOW &middot; RANGE BOUNCE", "target is 1.5 times the risk", "+$1.50", "POSSIBLE SELL &middot; BREAKOUT", "the 20-candle low"):
+            self.assertIn(needle, page, needle)
+
+    def test_ready_breakout_warns_before_the_close(self):
+        n = 260
+        cs = self._flat_candles(n)
+        end = datetime(2026, 11, 4, 10, 0, tzinfo=UTC)                                           # the newest candle opened at 10:00 UTC on a Wednesday (London hours)
+        cs = [Candle(end - timedelta(minutes=15 * (n - 1 - k)), c.o, c.h, c.l, c.c) for k, c in enumerate(cs)]
+        ind = Indicators([1.0] * n, [1.01] * n, [1.0] * n, [60.0] * n, [0.01] * n)
+        i = n - 1
+        cs[i] = Candle(cs[i].t, 1.0, 1.0009, 0.999, 1.0007)                                      # closing just under the 20-candle high (1.001)
+        sig = ready_breakout("EUR/USD", cs, ind, n, [], 100.0, 1.0)
+        self.assertIsNotNone(sig); self.assertEqual((sig.state, sig.setup), ("GET READY BUY", "breakout")); self.assertAlmostEqual(sig.trigger, 1.001)
+        self.assertIn("1.00100", sig.fires_text); self.assertEqual(sig.rr, 2.0)
+        self.assertIsNone(ready_breakout("EUR/USD", cs, ind, n, [("BUY", cs[i].t, 1, 1, 1, i, 0.01, "breakout")], 100.0, 1.0))   # already fired: no second warning
+        cs[i] = Candle(cs[i].t, 1.0, 1.0001, 0.985, 0.99)                                         # far below the high (over 0.4 ATR): nothing to warn about
+        self.assertIsNone(ready_breakout("EUR/USD", cs, ind, n, [], 100.0, 1.0))
 
     def test_next_candle_timer(self):
         s = ForexTracker.seconds_to_next_candle(datetime(2026, 11, 9, 10, 14, 50, tzinfo=UTC))
